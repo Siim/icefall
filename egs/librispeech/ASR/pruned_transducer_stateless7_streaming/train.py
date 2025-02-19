@@ -49,7 +49,7 @@ import logging
 import warnings
 from pathlib import Path
 from shutil import copyfile
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union, List
 
 import k2
 import optim
@@ -70,6 +70,7 @@ from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from zipformer import Zipformer
+from beam_search import greedy_search_batch
 
 from icefall import diagnostics
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
@@ -83,8 +84,16 @@ from icefall.env import get_env_info
 from icefall.err import raise_grad_scale_is_too_small_error
 from icefall.hooks import register_inf_check_hooks
 from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
+from torch import amp
+import editdistance
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
+
+try:
+    import k2
+    logging.info("Successfully imported k2")
+except Exception as e:
+    logging.warning(f"Could not import k2: {e}")
 
 
 def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
@@ -196,6 +205,27 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         help="The chunk size for decoding (in frames before subsampling)",
     )
 
+    parser.add_argument('--use-xlsr', action='store_true', default=False,
+                        help='Use XLSR encoder instead of the default Zipformer encoder')
+    parser.add_argument('--xlsr-model-name', type=str, default='facebook/wav2vec2-xls-r-300m',
+                        help='Pretrained XLSR model name to use with the XLSR encoder')
+
+    parser.add_argument("--use-accelerate", type=str2bool, default=False, help="Use HF accelerate for multi GPU training")
+
+    parser.add_argument(
+        "--use-fp16",
+        type=str2bool,
+        default=False,
+        help="Whether to use half precision (FP16) training.",
+    )
+
+    parser.add_argument(
+        "--use-bf16",
+        type=str2bool,
+        default=False,
+        help="Whether to use bfloat16 precision training. If both --use-fp16 and --use-bf16 are True, bf16 takes precedence.",
+    )
+
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -262,7 +292,7 @@ def get_parser():
     parser.add_argument(
         "--bpe-model",
         type=str,
-        default="data/lang_bpe_500/bpe.model",
+        default="data/lang_bpe_2500/bpe.model",
         help="Path to the BPE model",
     )
 
@@ -385,10 +415,39 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--use-fp16",
-        type=str2bool,
-        default=False,
-        help="Whether to use half precision training.",
+        "--dataset",
+        type=str,
+        default="librispeech",
+        choices=["librispeech", "estonian"],
+        help="Dataset to use for training (librispeech or estonian)",
+    )
+
+    parser.add_argument(
+        "--train-txt",
+        type=str,
+        default="Data/train.txt",
+        help="Path to training text file for Estonian dataset",
+    )
+
+    parser.add_argument(
+        "--val-txt",
+        type=str,
+        default="Data/val.txt",
+        help="Path to validation text file for Estonian dataset",
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+        help="Batch size for training (used only with Estonian dataset)",
+    )
+
+    parser.add_argument(
+        "--audio-base-path",
+        type=str,
+        default=None,
+        help="Base path for audio files in Estonian dataset",
     )
 
     add_model_arguments(parser)
@@ -463,6 +522,11 @@ def get_params() -> AttributeDict:
 
 
 def get_encoder_model(params: AttributeDict) -> nn.Module:
+    if getattr(params, 'use_xlsr', False):
+        from xlsr_encoder import XLSREncoder
+        encoder = XLSREncoder(model_name=params.xlsr_model_name)
+        return encoder
+
     # TODO: We can add an option to switch between Zipformer and Transformer
     def to_int_tuple(s: str):
         return tuple(map(int, s.split(",")))
@@ -498,11 +562,13 @@ def get_decoder_model(params: AttributeDict) -> nn.Module:
 
 
 def get_joiner_model(params: AttributeDict) -> nn.Module:
+    # Use XLSR encoder output dimension if use_xlsr is enabled
+    encoder_dim = 1024 if getattr(params, "use_xlsr", False) else int(params.encoder_dims.split(",")[-1])
     joiner = Joiner(
-        encoder_dim=int(params.encoder_dims.split(",")[-1]),
+        encoder_dim=encoder_dim,
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
-        vocab_size=params.vocab_size,
+        vocab_size=params.vocab_size
     )
     return joiner
 
@@ -511,16 +577,27 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
     encoder = get_encoder_model(params)
     decoder = get_decoder_model(params)
     joiner = get_joiner_model(params)
-
+    
+    # Set encoder_dim based on whether XLSR is used
+    encoder_dim = 1024 if getattr(params, "use_xlsr", False) else int(params.encoder_dims.split(",")[-1])
+    
     model = Transducer(
         encoder=encoder,
         decoder=decoder,
         joiner=joiner,
-        encoder_dim=int(params.encoder_dims.split(",")[-1]),
+        encoder_dim=encoder_dim,
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
-        vocab_size=params.vocab_size,
+        vocab_size=params.vocab_size
     )
+    
+    if params.use_xlsr:
+        # Initialize decoder with Xavier instead of random
+        torch.nn.init.xavier_uniform_(model.decoder.embedding.weight)
+        # Freeze first N layers of XLSR
+        for layer in model.encoder.model.encoder.layers[:10]:
+            layer.requires_grad_(False)
+
     return model
 
 
@@ -619,17 +696,19 @@ def save_checkpoint(
     if rank != 0:
         return
     filename = params.exp_dir / f"epoch-{params.cur_epoch}.pt"
-    save_checkpoint_impl(
-        filename=filename,
-        model=model,
-        model_avg=model_avg,
-        params=params,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        sampler=sampler,
-        scaler=scaler,
-        rank=rank,
-    )
+    
+    save_data = {
+        "model": model.state_dict() if isinstance(model, DDP) else model.state_dict(),
+        "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "sampler": sampler.state_dict() if (sampler is not None and hasattr(sampler, 'state_dict')) else None,
+        "scaler": scaler.state_dict() if scaler is not None else None,
+        "params": params,
+    }
+    if model_avg is not None:
+        save_data["model_avg"] = model_avg.state_dict()
+        
+    torch.save(save_data, filename)
 
     if params.best_train_epoch == params.cur_epoch:
         best_train_filename = params.exp_dir / "best-train-loss.pt"
@@ -722,6 +801,85 @@ def compute_loss(
     return loss, info
 
 
+def decode_batch(
+    params: AttributeDict,
+    model: Union[nn.Module, DDP],
+    sp: spm.SentencePieceProcessor,
+    batch: dict,
+    max_decode_samples: int = 4,
+) -> List[Tuple[str, str, float]]:
+    """Decode a random subset of the batch and compute WER for monitoring.
+    
+    Args:
+        params: Training parameters
+        model: The model to use for decoding
+        sp: SentencePiece tokenizer
+        batch: Current batch of data
+        max_decode_samples: Maximum number of samples to decode
+        
+    Returns:
+        List of tuples containing (reference, hypothesis, WER)
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    
+    with torch.no_grad():
+        # Select up to max_decode_samples from the batch
+        indices = torch.randperm(len(batch["supervisions"]["text"]))[:max_decode_samples]
+        
+        # Prepare mini-batch for decoding
+        texts = [batch["supervisions"]["text"][i] for i in indices]
+        features = batch["inputs"][indices].to(device)
+        feature_lens = batch["supervisions"]["num_frames"][indices].to(device)
+        
+        encoder_out, encoder_out_lens = model.encoder(x=features, x_lens=feature_lens)
+        
+        # Log encoder output statistics
+        logging.info(f"\nEncoder output stats:")
+        logging.info(f"Shape: {encoder_out.shape}")
+        logging.info(f"Mean: {encoder_out.mean().item():.3f}")
+        logging.info(f"Std: {encoder_out.std().item():.3f}")
+        logging.info(f"Min: {encoder_out.min().item():.3f}")
+        logging.info(f"Max: {encoder_out.max().item():.3f}")
+        
+        hyps = []
+        # Use greedy search for quick monitoring
+        hyp_tokens = greedy_search_batch(
+            model=model,
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens
+        )
+        
+        total_words = 0
+        total_errors = 0
+        
+        for i, tokens in enumerate(hyp_tokens):
+            # Convert token IDs to text - tokens is already a list
+            text = sp.decode(tokens)
+            ref = texts[i]
+            hyp_words = text.split()
+            ref_words = ref.split()
+            # Compute WER for this sample
+            errors = editdistance.eval(ref_words, hyp_words)
+            wer = errors / len(ref_words) * 100 if ref_words else 0
+            
+            total_words += len(ref_words)
+            total_errors += errors
+            
+            logging.info(f"\nReference: {ref}")
+            logging.info(f"Hypothesis: {text}")
+            logging.info(f"Sample WER: {wer:.1f}%")
+            hyps.append((ref, text, wer))
+            
+        # Log overall WER for this batch
+        if total_words > 0:
+            batch_wer = (total_errors / total_words) * 100
+            logging.info(f"\nBatch WER: {batch_wer:.1f}% (Total words: {total_words}, Total errors: {total_errors})")
+    
+    model.train()
+    return hyps
+
+
 def compute_validation_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
@@ -744,6 +902,11 @@ def compute_validation_loss(
         )
         assert loss.requires_grad is False
         tot_loss = tot_loss + loss_info
+        
+        # Decode samples every 500 training iterations or if it's the first batch
+        if (params.batch_idx_train % 500 == 0 and batch_idx < 2) or batch_idx == 0:
+            logging.info(f"\nDecoding samples from validation batch {batch_idx}")
+            decode_batch(params, model, sp, batch)
 
     if world_size > 1:
         tot_loss.reduce(loss.device)
@@ -810,7 +973,13 @@ def train_one_epoch(
         batch_size = len(batch["supervisions"]["text"])
 
         try:
-            with torch.cuda.amp.autocast(enabled=params.use_fp16):
+            mixed_precision = None
+            if params.use_bf16:
+                mixed_precision = "bf16"
+            elif params.use_fp16:
+                mixed_precision = "fp16"
+
+            with amp.autocast('cuda', enabled=mixed_precision is not None, dtype=torch.bfloat16 if mixed_precision == "bf16" else torch.float16):
                 loss, loss_info = compute_loss(
                     params=params,
                     model=model,
@@ -910,8 +1079,9 @@ def train_one_epoch(
                         params.batch_idx_train,
                     )
 
-        if batch_idx % params.valid_interval == 0 and not params.print_diagnostics:
-            logging.info("Computing validation loss")
+        # Run validation and WER evaluation every 500 batches
+        if batch_idx % 500 == 0 and not params.print_diagnostics:
+            logging.info("Computing validation loss and WER")
             valid_info = compute_validation_loss(
                 params=params,
                 model=model,
@@ -930,6 +1100,7 @@ def train_one_epoch(
                 )
 
     loss_value = tot_loss["loss"] / tot_loss["frames"]
+
     params.train_loss = loss_value
     if params.train_loss < params.best_train_loss:
         params.best_train_epoch = params.cur_epoch
@@ -972,8 +1143,6 @@ def run(rank, world_size, args):
 
     sp = spm.SentencePieceProcessor()
     sp.load(params.bpe_model)
-
-    # <blk> is defined in local/train_bpe_model.py
     params.blank_id = sp.piece_to_id("<blk>")
     params.vocab_size = sp.get_piece_size()
 
@@ -1035,85 +1204,70 @@ def run(rank, world_size, args):
     if params.inf_check:
         register_inf_check_hooks(model)
 
-    librispeech = LibriSpeechAsrDataModule(args)
+    if params.dataset == "estonian":
+        from estonian_dataset import EstonianASRDataset, collate_fn
+        logging.info("Using Estonian dataset")
+        
+        train_dataset = EstonianASRDataset(params.train_txt, base_path=params.audio_base_path)
+        train_sampler = torch.utils.data.distributed.DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=params.seed,
+        ) if world_size > 1 else None
+        
+        train_dl = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=params.batch_size,
+            sampler=train_sampler,
+            collate_fn=collate_fn,
+            num_workers=4,
+            persistent_workers=True,
+        )
 
-    assert not (
-        params.mini_libri and params.full_libri
-    ), f"Cannot set both mini-libri and full-libri flags to True, now mini-libri {params.mini_libri} and full-libri {params.full_libri}"
+        valid_dataset = EstonianASRDataset(params.val_txt, base_path=params.audio_base_path)
+        valid_dl = torch.utils.data.DataLoader(
+            valid_dataset,
+            batch_size=params.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=2,
+        )
 
-    if params.mini_libri:
-        train_cuts = librispeech.train_clean_5_cuts()
+        # For Estonian dataset, we use the vocab_size and blank_id from the BPE model
+        logging.info(f"Using vocab_size={params.vocab_size} and blank_id={params.blank_id} from BPE model")
     else:
+        # Original Librispeech data loading code
+        librispeech = LibriSpeechAsrDataModule(args)
+
         if params.full_libri:
             train_cuts = librispeech.train_all_shuf_cuts()
-
-            # previously we used the following code to load all training cuts,
-            # strictly speaking, shuffled training cuts should be used instead,
-            # but we leave the code here to demonstrate that there is an option
-            # like this to combine multiple cutsets
-
-            # train_cuts = librispeech.train_clean_100_cuts()
-            # train_cuts += librispeech.train_clean_360_cuts()
-            # train_cuts += librispeech.train_other_500_cuts()
         else:
             train_cuts = librispeech.train_clean_100_cuts()
 
-    def remove_short_and_long_utt(c: Cut):
-        # Keep only utterances with duration between 1 second and 20 seconds
-        #
-        # Caution: There is a reason to select 20.0 here. Please see
-        # ../local/display_manifest_statistics.py
-        #
-        # You should use ../local/display_manifest_statistics.py to get
-        # an utterance duration distribution for your dataset to select
-        # the threshold
-        if c.duration < 1.0 or c.duration > 20.0:
-            logging.warning(
-                f"Exclude cut with ID {c.id} from training. Duration: {c.duration}"
-            )
-            return False
+        def remove_short_and_long_utt(c: Cut):
+            if c.duration < 1.0 or c.duration > 20.0:
+                logging.warning(
+                    f"Exclude cut with ID {c.id} from training. Duration: {c.duration}"
+                )
+                return False
+            return True
 
-        # In pruned RNN-T, we require that T >= S
-        # where T is the number of feature frames after subsampling
-        # and S is the number of tokens in the utterance
+        train_cuts = train_cuts.filter(remove_short_and_long_utt)
 
-        # In ./zipformer.py, the conv module uses the following expression
-        # for subsampling
-        T = ((c.num_frames - 7) // 2 + 1) // 2
-        tokens = sp.encode(c.supervisions[0].text, out_type=str)
+        if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
+            sampler_state_dict = checkpoints["sampler"]
+        else:
+            sampler_state_dict = None
 
-        if T < len(tokens):
-            logging.warning(
-                f"Exclude cut with ID {c.id} from training. "
-                f"Number of frames (before subsampling): {c.num_frames}. "
-                f"Number of frames (after subsampling): {T}. "
-                f"Text: {c.supervisions[0].text}. "
-                f"Tokens: {tokens}. "
-                f"Number of tokens: {len(tokens)}"
-            )
-            return False
+        train_dl = librispeech.train_dataloaders(
+            train_cuts, sampler_state_dict=sampler_state_dict
+        )
 
-        return True
-
-    # train_cuts = train_cuts.filter(remove_short_and_long_utt)
-
-    if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
-        # We only load the sampler's state dict when it loads a checkpoint
-        # saved in the middle of an epoch
-        sampler_state_dict = checkpoints["sampler"]
-    else:
-        sampler_state_dict = None
-
-    train_dl = librispeech.train_dataloaders(
-        train_cuts, sampler_state_dict=sampler_state_dict
-    )
-
-    if params.mini_libri:
-        valid_cuts = librispeech.dev_clean_2_cuts()
-    else:
         valid_cuts = librispeech.dev_clean_cuts()
         valid_cuts += librispeech.dev_other_cuts()
-    valid_dl = librispeech.valid_dataloaders(valid_cuts)
+        valid_dl = librispeech.valid_dataloaders(valid_cuts)
 
     # if not params.print_diagnostics:
     #     scan_pessimistic_batches_for_oom(
@@ -1124,7 +1278,7 @@ def run(rank, world_size, args):
     #         params=params,
     #     )
 
-    scaler = GradScaler(enabled=params.use_fp16, init_scale=1.0)
+    scaler = amp.GradScaler('cuda', enabled=params.use_fp16, init_scale=1.0)
     if checkpoints and "grad_scaler" in checkpoints:
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
@@ -1132,7 +1286,8 @@ def run(rank, world_size, args):
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         scheduler.step_epoch(epoch - 1)
         fix_random_seed(params.seed + epoch - 1)
-        train_dl.sampler.set_epoch(epoch - 1)
+        if hasattr(train_dl.sampler, 'set_epoch'):
+            train_dl.sampler.set_epoch(epoch - 1)
 
         if tb_writer is not None:
             tb_writer.add_scalar("train/epoch", epoch, params.batch_idx_train)
@@ -1250,22 +1405,156 @@ def scan_pessimistic_batches_for_oom(
         )
 
 
+def run_accelerate(accelerator, args):
+    # This function implements the training loop using HF Accelerate
+    params = get_params()
+    params.update(vars(args))
+    if params.full_libri is False:
+        params.valid_interval = 1600
+
+    fix_random_seed(params.seed)
+    setup_logger(f"{params.exp_dir}/log/log-train")
+    logging.info("Training started (Accelerate Mode)")
+
+    tb_writer = SummaryWriter(log_dir=f"{params.exp_dir}/tensorboard") if (args.tensorboard and accelerator.is_main_process) else None
+
+    # Set device from accelerator
+    device = accelerator.device
+    logging.info(f"Using Accelerator device: {device}")
+
+    sp = spm.SentencePieceProcessor()
+    sp.load(params.bpe_model)
+    params.blank_id = sp.piece_to_id("<blk>")
+    params.vocab_size = sp.get_piece_size()
+    logging.info(params)
+
+    logging.info("About to create model")
+    model = get_transducer_model(params)
+    num_param = sum([p.numel() for p in model.parameters()])
+    logging.info(f"Number of model parameters: {num_param}")
+
+    optimizer = ScaledAdam(
+        model.parameters(),
+        lr=params.base_lr,
+        clipping_scale=2.0,
+        parameters_names=[ [name for name, _ in model.named_parameters()] ]
+    )
+    scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
+
+    # Data loading
+    if params.dataset == "estonian":
+        from estonian_dataset import EstonianASRDataset, collate_fn
+        logging.info("Using Estonian dataset")
+        train_dataset = EstonianASRDataset(params.train_txt, base_path=params.audio_base_path)
+        train_dl = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=params.batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=4,
+            persistent_workers=True,
+        )
+        valid_dataset = EstonianASRDataset(params.val_txt, base_path=params.audio_base_path)
+        valid_dl = torch.utils.data.DataLoader(
+            valid_dataset,
+            batch_size=params.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=2,
+        )
+        logging.info(f"Using vocab_size={params.vocab_size} and blank_id={params.blank_id} from BPE model")
+    else:
+        # Original Librispeech data loading code
+        librispeech = LibriSpeechAsrDataModule(args)
+        if params.full_libri:
+            train_cuts = librispeech.train_all_shuf_cuts()
+        else:
+            train_cuts = librispeech.train_clean_100_cuts()
+        train_dl = librispeech.train_dataloaders(train_cuts)
+        valid_cuts = librispeech.dev_clean_cuts()
+        valid_cuts += librispeech.dev_other_cuts()
+        valid_dl = librispeech.valid_dataloaders(valid_cuts)
+
+    # Prepare with accelerator
+    model, optimizer, scheduler, train_dl, valid_dl = accelerator.prepare(model, optimizer, scheduler, train_dl, valid_dl)
+
+    model.to(device)
+
+    # Optionally load checkpoint if available
+    model_avg = None
+    if accelerator.is_main_process:
+        try:
+            import copy
+            model_avg = copy.deepcopy(model).to(torch.float64)
+        except Exception as e:
+            logging.warning(f"Could not create averaged model: {e}")
+
+    # Main training loop
+    for epoch in range(params.start_epoch, params.num_epochs + 1):
+        scheduler.step_epoch(epoch - 1)
+        fix_random_seed(params.seed + epoch - 1)
+
+        if hasattr(train_dl, 'sampler') and hasattr(train_dl.sampler, 'set_epoch'):
+            train_dl.sampler.set_epoch(epoch - 1)
+
+        if tb_writer is not None:
+            tb_writer.add_scalar("train/epoch", epoch, params.batch_idx_train)
+
+        params.cur_epoch = epoch
+        train_one_epoch(
+            params=params,
+            model=model,
+            model_avg=model_avg,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            sp=sp,
+            train_dl=train_dl,
+            valid_dl=valid_dl,
+            scaler=amp.GradScaler(enabled=params.use_fp16, init_scale=1.0),
+            tb_writer=tb_writer,
+            world_size=1,
+            rank=0,
+        )
+
+        if accelerator.is_main_process:
+            save_checkpoint(
+                params=params,
+                model=model,
+                model_avg=model_avg,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                sampler=train_dl.sampler if hasattr(train_dl, 'sampler') else None,
+                scaler=amp.GradScaler(enabled=params.use_fp16, init_scale=1.0),
+                rank=0,
+            )
+
+    logging.info("Training completed (Accelerate Mode)!")
+
+
 def main():
     parser = get_parser()
     LibriSpeechAsrDataModule.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
 
-    world_size = args.world_size
-    assert world_size >= 1
-    if world_size > 1:
-        mp.spawn(run, args=(world_size, args), nprocs=world_size, join=True)
+    if args.use_accelerate:
+        try:
+            from accelerate import Accelerator
+        except ImportError:
+            raise ImportError("Please install hf accelerate (pip install accelerate) or set --use-accelerate False")
+        accelerator = Accelerator()
+        run_accelerate(accelerator, args)
     else:
-        run(rank=0, world_size=1, args=args)
+        world_size = args.world_size
+        assert world_size >= 1
+        if world_size > 1:
+            mp.spawn(run, args=(world_size, args), nprocs=world_size, join=True)
+        else:
+            run(rank=0, world_size=1, args=args)
 
+    torch.set_num_threads(1)
+    torch.set_interop_threads(1)
 
-torch.set_num_threads(1)
-torch.set_num_interop_threads(1)
 
 if __name__ == "__main__":
     main()

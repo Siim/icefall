@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package asr;
+
+service ASRService {
+  // Bidirectional streaming RPC for real-time ASR
+  rpc StreamingRecognize(stream AudioRequest) returns (stream RecognitionResponse) {}
+}
+
+message AudioRequest {
+  // Raw audio data in 16kHz, 16-bit PCM format
+  bytes audio_content = 1;
+  // Whether this is the last chunk in the stream
+  bool is_last = 2;
+  // Optional sampling rate, defaults to 16000
+  int32 sampling_rate = 3;
+}
+
+message RecognitionResponse {
+  // Recognized text
+  string text = 1;
+  // Whether this is a final result
+  bool is_final = 2;
+  // Confidence score between 0 and 1
+  float confidence = 3;
+  // Current latency in seconds
+  float latency = 4;
+} 

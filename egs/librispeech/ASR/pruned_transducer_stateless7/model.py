@@ -20,7 +20,9 @@ import random
 import k2
 import torch
 import torch.nn as nn
+from torch import amp
 from encoder_interface import EncoderInterface
+from xlsr_encoder import XLSREncoder
 from scaling import penalize_abs_values_gt
 
 from icefall.utils import add_sos
@@ -64,6 +66,12 @@ class Transducer(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.joiner = joiner
+
+        # Add projection layer for XLSR encoder if needed
+        if isinstance(encoder, XLSREncoder):
+            self.encoder_proj = nn.Linear(1024, encoder_dim)
+        else:
+            self.encoder_proj = nn.Identity()
 
         self.simple_am_proj = nn.Linear(
             encoder_dim,
@@ -118,6 +126,10 @@ class Transducer(nn.Module):
         assert x.size(1) == x_lens.max().item(), (x.shape, x_lens, x_lens.max())
 
         encoder_out, x_lens = self.encoder(x, x_lens)
+        
+        # Project XLSR output if needed
+        encoder_out = self.encoder_proj(encoder_out)
+        
         assert torch.all(x_lens > 0)
 
         # Now for the decoder, i.e., the prediction network
@@ -150,7 +162,7 @@ class Transducer(nn.Module):
         # if self.training and random.random() < 0.25:
         #    am = penalize_abs_values_gt(am, 30.0, 1.0e-04)
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with amp.autocast('cuda', enabled=False):
             simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
                 lm=lm.float(),
                 am=am.float(),
@@ -185,7 +197,7 @@ class Transducer(nn.Module):
         # prior to do_rnnt_pruning (this is an optimization for speed).
         logits = self.joiner(am_pruned, lm_pruned, project_input=False)
 
-        with torch.cuda.amp.autocast(enabled=False):
+        with amp.autocast('cuda', enabled=False):
             pruned_loss = k2.rnnt_loss_pruned(
                 logits=logits.float(),
                 symbols=y_padded,

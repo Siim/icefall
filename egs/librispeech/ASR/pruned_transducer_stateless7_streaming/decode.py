@@ -148,6 +148,131 @@ from icefall.utils import (
 LOG_EPS = math.log(1e-10)
 
 
+class StreamingEncoder:
+    """Streaming encoder wrapper for inference"""
+    def __init__(
+        self, 
+        encoder: nn.Module, 
+        chunk_size: int = 8000, 
+        chunk_overlap: int = 4000,
+        adaptive_chunk_size: bool = True,
+        min_chunk_size: int = 4000,
+        max_chunk_size: int = 12000,
+        latency_tolerance: float = 0.1
+    ):
+        """
+        Args:
+            encoder: The XLSR or Zipformer encoder
+            chunk_size: Initial size of each chunk in samples
+            chunk_overlap: Overlap between consecutive chunks in samples
+            adaptive_chunk_size: Whether to use adaptive chunk sizing
+            min_chunk_size: Minimum allowed chunk size
+            max_chunk_size: Maximum allowed chunk size
+            latency_tolerance: Target latency in seconds
+        """
+        self.encoder = encoder
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.adaptive_chunk_size = adaptive_chunk_size
+        self.min_chunk_size = min_chunk_size
+        self.max_chunk_size = max_chunk_size
+        self.latency_tolerance = latency_tolerance
+        self.reset()
+
+    def reset(self):
+        """Reset the streaming state"""
+        if hasattr(self.encoder, 'reset_streaming_state'):
+            self.encoder.reset_streaming_state()
+        else:
+            # Fallback for non-XLSR encoders
+            self.cached_features = None
+            self.cached_len = 0
+            self.current_chunk_size = self.chunk_size
+            self.last_chunk_latency = 0
+            self.streaming_state = None
+
+    def forward(self, x: torch.Tensor, x_lens: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Streaming forward pass with adaptive chunk size
+        Args:
+            x: Input tensor (batch=1, time)
+            x_lens: Length of input (optional in streaming mode)
+        Returns:
+            (output, output_lens)
+        """
+        assert x.size(0) == 1, "Streaming only supports batch size 1"
+        
+        # Handle cached features if any
+        if hasattr(self, 'cached_features') and self.cached_features is not None:
+            x = torch.cat([self.cached_features, x], dim=1)
+            self.cached_features = None
+
+        current_offset = 0
+        outputs_list = []
+        
+        while current_offset < x.size(1):
+            chunk_start_time = time.time()
+            
+            # Use current chunk size (might be adaptive)
+            if hasattr(self.encoder, 'current_chunk_size'):
+                chunk_size = self.encoder.current_chunk_size
+            else:
+                chunk_size = self.chunk_size
+                
+            end_idx = min(current_offset + chunk_size, x.size(1))
+            chunk = x[:, current_offset:end_idx]
+            
+            # Process chunk through encoder
+            if isinstance(self.encoder, XLSREncoder):
+                chunk_len = torch.tensor([chunk.size(1)], dtype=torch.int32)
+                chunk_out, _ = self.encoder(chunk.unsqueeze(-1), chunk_len)
+            else:
+                # Handle Zipformer or other encoders
+                chunk_out = self.encoder(chunk)
+
+            # If not the last chunk, cache overlap portion
+            if end_idx < x.size(1):
+                if hasattr(self, 'cached_features'):
+                    self.cached_features = x[:, end_idx - self.chunk_overlap:end_idx]
+                # Only keep non-overlapping portion of output
+                overlap_frames = self.chunk_overlap // getattr(self.encoder, 'downsample_factor', 320)
+                chunk_out = chunk_out[:, :-overlap_frames]
+            
+            outputs_list.append(chunk_out)
+            current_offset = end_idx - self.chunk_overlap
+            
+            # Measure chunk processing time and adjust if needed
+            chunk_latency = time.time() - chunk_start_time
+            if hasattr(self.encoder, 'adjust_chunk_size'):
+                self.encoder.adjust_chunk_size(chunk_latency)
+
+        # Concatenate all chunks
+        if outputs_list:
+            outputs = torch.cat(outputs_list, dim=1)
+            output_lens = torch.tensor([outputs.size(1)], dtype=torch.int32) if x_lens is not None else None
+            return outputs, output_lens
+        else:
+            return None, None
+
+def get_encoder_model(params: AttributeDict) -> nn.Module:
+    if getattr(params, 'use_xlsr', False):
+        from xlsr_encoder import XLSREncoder
+        # Create XLSR encoder with streaming capabilities built-in
+        encoder = XLSREncoder(
+            model_name=params.xlsr_model_name,
+            decode_chunk_size=params.decode_chunk_len,  # Now using decode_chunk_size consistently
+            chunk_overlap=params.decode_chunk_len // 2,
+            adaptive_chunk_size=getattr(params, 'adaptive_chunk_size', True),
+            min_chunk_size=getattr(params, 'min_chunk_size', 4000),
+            max_chunk_size=getattr(params, 'max_chunk_size', 12000),
+            latency_tolerance=getattr(params, 'latency_tolerance', 0.1)
+        )
+        return encoder
+    else:
+        # Original Zipformer code...
+        pass
+
+
 def get_parser():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -184,7 +309,7 @@ def get_parser():
     parser.add_argument(
         "--use-averaged-model",
         type=str2bool,
-        default=True,
+        default=False,
         help="Whether to load averaged model. Currently it only supports "
         "using --epoch. If True, it would decode with the averaged model "
         "over the epoch range from `epoch-avg` (excluded) to `epoch`."
@@ -351,6 +476,35 @@ def get_parser():
         type=int,
         default=500,
         help="ID of the backoff symbol in the ngram LM",
+    )
+
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="librispeech",
+        choices=["librispeech", "estonian"],
+        help="Dataset to use for decoding (librispeech or estonian)",
+    )
+
+    parser.add_argument(
+        "--test-txt",
+        type=str,
+        default="Data/test.txt",
+        help="Path to test text file for Estonian dataset",
+    )
+
+    parser.add_argument(
+        "--audio-base-path",
+        type=str,
+        default=None,
+        help="Base path for audio files in Estonian dataset",
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=4,
+        help="Batch size for decoding (used only with Estonian dataset)",
     )
 
     add_model_arguments(parser)
@@ -646,7 +800,14 @@ def decode_dataset(
     results = defaultdict(list)
     for batch_idx, batch in enumerate(dl):
         texts = batch["supervisions"]["text"]
-        cut_ids = [cut.id for cut in batch["supervisions"]["cut"]]
+        
+        # Handle different dataset formats
+        if params.dataset == "estonian":
+            # For Estonian dataset, use the audio file paths as IDs
+            cut_ids = [path.split('/')[-1].replace('.wav', '') for path in batch["supervisions"]["audio_paths"]]
+        else:
+            # For Librispeech dataset, use the cut IDs
+            cut_ids = [cut.id for cut in batch["supervisions"]["cut"]]
 
         hyps_dict = decode_one_batch(
             params=params,
@@ -796,10 +957,21 @@ def main():
 
     logging.info("About to create model")
     model = get_transducer_model(params)
-    assert model.encoder.decode_chunk_size == params.decode_chunk_len // 2, (
-        model.encoder.decode_chunk_size,
-        params.decode_chunk_len,
-    )
+    
+    # Check chunk size based on encoder type
+    if getattr(params, 'use_xlsr', False):
+        # For XLSR, chunk size is in samples
+        assert hasattr(model.encoder, 'decode_chunk_size'), "XLSR encoder missing decode_chunk_size attribute"
+        assert model.encoder.decode_chunk_size == params.decode_chunk_len, (
+            f"XLSR chunk size mismatch: encoder={model.encoder.decode_chunk_size}, "
+            f"params={params.decode_chunk_len}"
+        )
+    else:
+        # For Zipformer, chunk size is in frames
+        assert model.encoder.decode_chunk_size == params.decode_chunk_len // 2, (
+            model.encoder.decode_chunk_size,
+            params.decode_chunk_len,
+        )
 
     if not params.use_averaged_model:
         if params.iter > 0:
@@ -951,19 +1123,33 @@ def main():
 
     # we need cut ids to display recognition results.
     args.return_cuts = True
-    librispeech = LibriSpeechAsrDataModule(args)
 
-    test_clean_cuts = librispeech.test_clean_cuts()
-    test_other_cuts = librispeech.test_other_cuts()
+    if params.dataset == "estonian":
+        from estonian_dataset import EstonianASRDataset, collate_fn
+        logging.info("Using Estonian dataset")
+        
+        test_dataset = EstonianASRDataset(params.test_txt, base_path=params.audio_base_path)
+        test_dl = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=params.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=2,
+        )
+        
+        test_sets = ["test"]
+        test_dls = [test_dl]
+    else:
+        librispeech = LibriSpeechAsrDataModule(args)
+        test_clean_cuts = librispeech.test_clean_cuts()
+        test_other_cuts = librispeech.test_other_cuts()
+        test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
+        test_other_dl = librispeech.test_dataloaders(test_other_cuts)
+        test_sets = ["test-clean", "test-other"]
+        test_dls = [test_clean_dl, test_other_dl]
 
-    test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
-    test_other_dl = librispeech.test_dataloaders(test_other_cuts)
-
-    test_sets = ["test-clean", "test-other"]
-    test_dl = [test_clean_dl, test_other_dl]
     import time
-
-    for test_set, test_dl in zip(test_sets, test_dl):
+    for test_set, test_dl in zip(test_sets, test_dls):
         start = time.time()
         results_dict = decode_dataset(
             dl=test_dl,
@@ -976,7 +1162,7 @@ def main():
             ngram_lm=ngram_lm,
             ngram_lm_scale=ngram_lm_scale,
         )
-        logging.info(f"Elasped time for {test_set}: {time.time() - start}")
+        logging.info(f"Elapsed time for {test_set}: {time.time() - start}")
 
         save_results(
             params=params,

@@ -86,6 +86,7 @@ from icefall.hooks import register_inf_check_hooks
 from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
 from torch import amp
 import editdistance
+import random
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -224,6 +225,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         type=str2bool,
         default=False,
         help="Whether to use bfloat16 precision training. If both --use-fp16 and --use-bf16 are True, bf16 takes precedence.",
+    )
+
+    parser.add_argument(
+        "--streaming-regularization",
+        type=float,
+        default=0.1,
+        help="Weight for streaming regularization loss",
     )
 
 
@@ -456,68 +464,67 @@ def get_parser():
 
 
 def get_params() -> AttributeDict:
-    """Return a dict containing training parameters.
-
-    All training related parameters that are not passed from the commandline
-    are saved in the variable `params`.
-
-    Commandline options are merged into `params` after they are parsed, so
-    you can also access them via `params`.
-
-    Explanation of options saved in `params`:
-
-        - best_train_loss: Best training loss so far. It is used to select
-                           the model that has the lowest training loss. It is
-                           updated during the training.
-
-        - best_valid_loss: Best validation loss so far. It is used to select
-                           the model that has the lowest validation loss. It is
-                           updated during the training.
-
-        - best_train_epoch: It is the epoch that has the best training loss.
-
-        - best_valid_epoch: It is the epoch that has the best validation loss.
-
-        - batch_idx_train: Used to writing statistics to tensorboard. It
-                           contains number of batches trained so far across
-                           epochs.
-
-        - log_interval:  Print training loss if batch_idx % log_interval` is 0
-
-        - reset_interval: Reset statistics if batch_idx % reset_interval is 0
-
-        - valid_interval:  Run validation if batch_idx % valid_interval is 0
-
-        - feature_dim: The model input dim. It has to match the one used
-                       in computing features.
-
-        - subsampling_factor:  The subsampling factor for the model.
-
-        - encoder_dim: Hidden dim for multi-head attention model.
-
-        - num_decoder_layers: Number of decoder layer of transformer decoder.
-
-        - warm_step: The warmup period that dictates the decay of the
-              scale on "simple" (un-pruned) loss.
-    """
+    """Return default parameters."""
     params = AttributeDict(
         {
+            # parameters for conformer
+            "subsampling_factor": 4,
+            "vgg_frontend": False,
+            "use_feat_batchnorm": True,
+            "feature_dim": 80,
+            "nhead": 8,
+            "attention_dim": 512,
+            "num_decoder_layers": 6,
+            # parameters for streaming
+            "decode_chunk_size": 16,  # in frames
+            "pad_length": 30,  # in frames
+            # parameters for Noam
+            "model_warm_step": 3000,  # arg given to model, not for lrate
+            "env_info": get_env_info(),
+            "use_xlsr": False,  # Whether to use XLSR encoder
+            "xlsr_model_name": "facebook/wav2vec2-xls-r-300m",  # XLSR model to use
+            "streaming_regularization": 0.1,  # Weight for streaming regularization loss
+            # parameters for loss
+            "simple_loss_scale": 0.5,
+            "prune_range": 5,
+            "lm_scale": 0.1,
+            "am_scale": 0.0,
+            # parameters for decoding
+            "search_beam": 20,
+            "output_beam": 8,
+            "min_active_states": 30,
+            "max_active_states": 10000,
+            "use_double_scores": True,
+            # parameters for training
+            "context_size": 2,
+            "max_duration": 200.0,
+            "random_seed": 42,
+            "batch_size": 4,
+            "num_epochs": 30,
             "best_train_loss": float("inf"),
             "best_valid_loss": float("inf"),
             "best_train_epoch": -1,
             "best_valid_epoch": -1,
-            "batch_idx_train": 0,
-            "log_interval": 50,
-            "reset_interval": 200,
-            "valid_interval": 3000,  # For the 100h subset, use 800
-            # parameters for zipformer
-            "feature_dim": 80,
-            "subsampling_factor": 4,  # not passed in, this is fixed.
+            "exp_dir": Path("pruned_transducer_stateless7_streaming/exp"),
+            "lang_dir": Path("data/lang_bpe_500"),
+            "lr": 1e-3,
+            "weight_decay": 1e-6,
             "warm_step": 2000,
+            "save_every_n": 8000,
+            "keep_last_k": 20,
+            "average_period": 100,
+            "use_fp16": False,
             "env_info": get_env_info(),
+            "epoch": 1,
+            "return_encoder_output": False,  # used only during inference
+            "return_boundaries": False,  # used only during inference
+            "use_averaged_model": False,  # used only during inference
+            "num_decoder_layers": 6,
+            "dataset": "librispeech",  # "librispeech" or "estonian"
+            "train_txt": None,  # Path to train.txt for Estonian dataset
+            "val_txt": None,  # Path to val.txt for Estonian dataset
         }
     )
-
     return params
 
 
@@ -737,32 +744,37 @@ def save_checkpoint(
         copyfile(src=filename, dst=best_valid_filename)
 
 
+def get_random_chunk_size() -> int:
+    """Returns a random chunk size for training.
+    The chunk sizes are sampled from [8, 16, 32] frames.
+    """
+    chunk_sizes = [8, 16, 32]  # in frames
+    return random.choice(chunk_sizes)
+
+
 def compute_loss(
     params: AttributeDict,
-    model: Union[nn.Module, DDP],
+    model: nn.Module,
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute transducer loss given the model and its inputs.
-
     Args:
       params:
-        Parameters for training. See :func:`get_params`.
+        It is returned by :func:`get_params`.
       model:
-        The model for training. It is an instance of Zipformer in our case.
+        The model for training.
+      sp:
+        The BPE model.
       batch:
         A batch of data. See `lhotse.dataset.K2SpeechRecognitionDataset()`
         for the content in it.
       is_training:
-        True for training. False for validation. When it is True, this
-        function enables autograd during computation; when it is False, it
-        disables autograd.
-     warmup: a floating point value which increases throughout training;
-        values >= 1.0 are fully warmed up and have all modules present.
+        True for training, False for validation.
     """
-    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
+    device = next(model.parameters()).device
     feature = batch["inputs"]
     # at entry, feature is (N, T, C)
     assert feature.ndim == 3
@@ -771,46 +783,67 @@ def compute_loss(
     supervisions = batch["supervisions"]
     feature_lens = supervisions["num_frames"].to(device)
 
-    batch_idx_train = params.batch_idx_train
-    warm_step = params.warm_step
-
     texts = batch["supervisions"]["text"]
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
 
     with torch.set_grad_enabled(is_training):
-        encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
-        
-        # Debug: Check encoder outputs
-        if batch_idx_train % 100 == 0:
-            logging.info(f"Encoder mean: {encoder_out.mean().item():.3f}")
-            logging.info(f"Encoder std: {encoder_out.std().item():.3f}")
-            logging.info(f"Encoder NaN: {torch.isnan(encoder_out).any()}")
-        
-        simple_loss, pruned_loss = model(
-            x=feature,
-            x_lens=feature_lens,
-            y=y,
-            prune_range=params.prune_range,
-            am_scale=params.am_scale,
-            lm_scale=params.lm_scale,
-        )
+        simple_loss, pruned_loss = None, None
+        streaming_loss = torch.tensor([0.0], device=device)
 
-        s = params.simple_loss_scale
-        # take down the scale on the simple loss from 1.0 at the start
-        # to params.simple_loss scale by warm_step.
-        simple_loss_scale = (
-            s
-            if batch_idx_train >= warm_step
-            else 1.0 - (batch_idx_train / warm_step) * (1.0 - s)
-        )
-        pruned_loss_scale = (
-            1.0
-            if batch_idx_train >= warm_step
-            else 0.1 + 0.9 * (batch_idx_train / warm_step)
-        )
+        if is_training and params.use_xlsr:
+            # Get random chunk size during training
+            chunk_size = model.encoder.get_random_chunk_size()
+            chunks = model.encoder.prepare_chunks(feature, chunk_size)
+            encoder_out_chunks = []
+            prev_chunk_last = None
 
-        loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
+            # Process each chunk
+            for chunk in chunks:
+                chunk_len = torch.tensor([chunk.shape[1]], dtype=torch.int32, device=device)
+                if prev_chunk_last is None:
+                    # First chunk
+                    chunk_out, _, states = model.encoder.streaming_forward(chunk, chunk_len, None)
+                    prev_chunk_last = chunk_out[:, -1:, :]
+                else:
+                    # Subsequent chunks - compute streaming regularization
+                    chunk_out, _, states = model.encoder.streaming_forward(chunk, chunk_len, states)
+                    curr_chunk_first = chunk_out[:, :1, :]
+                    streaming_loss += F.mse_loss(prev_chunk_last, curr_chunk_first)
+                    prev_chunk_last = chunk_out[:, -1:, :]
+                
+                encoder_out_chunks.append(chunk_out)
+
+            # Concatenate chunks
+            encoder_out = torch.cat(encoder_out_chunks, dim=1)
+            
+            # Scale streaming loss by number of chunks
+            if len(chunks) > 1:
+                streaming_loss = streaming_loss / (len(chunks) - 1)
+        else:
+            # Regular forward pass for validation or non-XLSR
+            encoder_out, _ = model.encoder(feature, feature_lens)
+
+        # Get decoder output
+        decoder_out = model.decoder(y)
+        
+        # Compute joiner output
+        joiner_out = model.joiner(encoder_out, decoder_out)
+
+        # Compute losses
+        simple_loss = model.simple_loss(joiner_out, y)
+        
+        if params.batch_idx_train > params.model_warm_step:
+            pruned_loss = model.pruned_loss(joiner_out, y)
+
+        # Combine losses
+        loss = simple_loss
+        if pruned_loss is not None:
+            loss += pruned_loss
+        
+        # Add streaming regularization if training with XLSR
+        if is_training and params.use_xlsr:
+            loss += params.streaming_regularization * streaming_loss
 
     assert loss.requires_grad == is_training
 
@@ -821,8 +854,12 @@ def compute_loss(
 
     # Note: We use reduction=sum while computing the loss.
     info["loss"] = loss.detach().cpu().item()
-    info["simple_loss"] = simple_loss.detach().cpu().item()
-    info["pruned_loss"] = pruned_loss.detach().cpu().item()
+    if simple_loss is not None:
+        info["simple_loss"] = simple_loss.detach().cpu().item()
+    if pruned_loss is not None:
+        info["pruned_loss"] = pruned_loss.detach().cpu().item()
+    if streaming_loss.item() != 0:
+        info["streaming_loss"] = streaming_loss.detach().cpu().item()
 
     return loss, info
 

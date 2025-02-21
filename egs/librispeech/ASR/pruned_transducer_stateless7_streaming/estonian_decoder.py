@@ -4,6 +4,7 @@ import torch.nn as nn
 from typing import Optional, List, Dict, Tuple
 from pathlib import Path
 import logging
+import copy
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,28 @@ class EstonianDecoder(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(decoder_dim, decoder_dim)
         ])
+        
+        # Initialize FSA objects as None
+        self._decoding_graph = None
+        self._token_table = None
+    
+    def __deepcopy__(self, memo):
+        """Custom deepcopy implementation to handle k2 FSA objects"""
+        # Create a new instance without FSA objects
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        
+        # Copy all attributes except FSA objects
+        for k, v in self.__dict__.items():
+            if k not in ['_decoding_graph', '_token_table']:
+                setattr(result, k, torch.nn.Parameter(v.clone()) if isinstance(v, torch.nn.Parameter) else copy.deepcopy(v, memo))
+        
+        # Set FSA objects to None in the copy
+        result._decoding_graph = None
+        result._token_table = None
+        
+        return result
     
     def forward(
         self,
@@ -108,6 +131,26 @@ class EstonianDecoder(nn.Module):
             decoder_out = layer(decoder_out)
         
         return decoder_out
+
+    @property
+    def decoding_graph(self):
+        """Getter for decoding graph"""
+        return self._decoding_graph
+    
+    @decoding_graph.setter
+    def decoding_graph(self, graph):
+        """Setter for decoding graph"""
+        self._decoding_graph = graph
+    
+    @property
+    def token_table(self):
+        """Getter for token table"""
+        return self._token_table
+    
+    @token_table.setter
+    def token_table(self, table):
+        """Setter for token table"""
+        self._token_table = table
 
 def fast_beam_search_one_best(
     model: nn.Module,

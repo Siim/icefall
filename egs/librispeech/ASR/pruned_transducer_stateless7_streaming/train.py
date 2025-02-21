@@ -619,11 +619,14 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
     if params.dataset == "estonian":
         from estonian_decoder import create_estonian_token_table, create_estonian_decoding_graph
         token_table = create_estonian_token_table(params.vocab_file)
-        model.decoding_graph = create_estonian_decoding_graph(
+        decoding_graph = create_estonian_decoding_graph(
             token_table=token_table,
             num_tokens=params.vocab_size,
             device=torch.device("cpu")  # Will be moved to correct device later
         )
+        # Store FSA objects in decoder
+        model.decoder.token_table = token_table
+        model.decoder.decoding_graph = decoding_graph
     
     return model
 

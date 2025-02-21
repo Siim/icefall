@@ -70,6 +70,12 @@ class EstonianASRDataset(Dataset):
         
         waveform = torch.clamp(waveform, min=-1.0, max=1.0)
         
+        # Validate audio duration vs text length
+        min_chars_per_second = 3  # Estonian ~4.5 chars/sec avg
+        audio_duration = waveform.size(1) / 16000
+        if len(transcript) / audio_duration < min_chars_per_second:
+            print(f"Warning: Suspicious sample {wav_path} - {len(transcript)} chars in {audio_duration:.1f}s")
+        
         # Return a dictionary with raw waveform and supervision
         return {
             'inputs': waveform,  # shape: (1, time)

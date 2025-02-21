@@ -14,30 +14,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 
 class EncoderInterface(nn.Module):
-    def forward(
-        self, x: torch.Tensor, x_lens: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Interface for encoders used in transducer models"""
+    
+    def __init__(self) -> None:
+        super().__init__()
+        self.output_dim = 0  # Must be set by implementing class
+        
+    def forward(self, x: torch.Tensor, x_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-          x:
-            A tensor of shape (batch_size, input_seq_len, num_features)
-            containing the input features.
-          x_lens:
-            A tensor of shape (batch_size,) containing the number of frames
-            in `x` before padding.
+            x: Input tensor (batch, time) or (batch, time, 1)
+            x_lens: Length of each sequence in the batch
         Returns:
-          Return a tuple containing two tensors:
-            - encoder_out, a tensor of (batch_size, out_seq_len, output_dim)
-              containing unnormalized probabilities, i.e., the output of a
-              linear layer.
-            - encoder_out_lens, a tensor of shape (batch_size,) containing
-              the number of frames in `encoder_out` before padding.
+            (output, output_lens)
+            output: (batch, time', output_dim)
+            output_lens: (batch,)
         """
-        raise NotImplementedError("Please implement it in a subclass")
+        raise NotImplementedError
+        
+    def streaming_forward(self, x: torch.Tensor, cache: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Streaming forward pass
+        Args:
+            x: Input tensor (batch=1, time)
+            cache: Optional cached state from previous chunk
+        Returns:
+            (output, new_cache)
+        """
+        raise NotImplementedError
+        
+    def reset_streaming_state(self) -> None:
+        """Reset any cached state for streaming inference"""
+        pass

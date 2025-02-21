@@ -761,6 +761,14 @@ def compute_loss(
     y = k2.RaggedTensor(y).to(device)
 
     with torch.set_grad_enabled(is_training):
+        encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
+        
+        # Debug: Check encoder outputs
+        if batch_idx_train % 100 == 0:
+            logging.info(f"Encoder mean: {encoder_out.mean().item():.3f}")
+            logging.info(f"Encoder std: {encoder_out.std().item():.3f}")
+            logging.info(f"Encoder NaN: {torch.isnan(encoder_out).any()}")
+        
         simple_loss, pruned_loss = model(
             x=feature,
             x_lens=feature_lens,
@@ -1105,6 +1113,22 @@ def train_one_epoch(
     if params.train_loss < params.best_train_loss:
         params.best_train_epoch = params.cur_epoch
         params.best_train_loss = params.train_loss
+
+    # After model initialization
+    if params.use_xlsr:
+        # Gradually unfreeze layers
+        for layer in model.encoder.model.encoder.layers:
+            layer.requires_grad_(False)
+            
+        # Unfreeze last 4 layers initially
+        for layer in model.encoder.model.encoder.layers[-4:]:
+            layer.requires_grad_(True)
+            
+        # Schedule more layers to unfreeze later
+        scheduler.unfreeze_schedule = [
+            (10, 8),  # At epoch 10, unfreeze 8 more layers
+            (20, 12)  # At epoch 20, unfreeze all
+        ]
 
 
 def run(rank, world_size, args):

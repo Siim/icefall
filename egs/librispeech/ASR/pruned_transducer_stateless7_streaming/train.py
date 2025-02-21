@@ -486,7 +486,7 @@ def get_params() -> AttributeDict:
             # parameters for loss
             "simple_loss_scale": 0.5,
             "prune_range": 5,
-            "lm_scale": 0.1,
+            "lm_scale": 0.25,
             "am_scale": 0.0,
             # parameters for decoding
             "search_beam": 20,
@@ -507,6 +507,7 @@ def get_params() -> AttributeDict:
             "batch_idx_train": 0,
             "exp_dir": Path("pruned_transducer_stateless7_streaming/exp"),
             "lang_dir": Path("data/lang_bpe_2500"),
+            "vocab_file": "data/lang_bpe_2500/tokens.txt",  # Path to vocabulary file
             "lr": 1e-3,
             "weight_decay": 1e-6,
             "warm_step": 2000,

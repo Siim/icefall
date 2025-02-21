@@ -464,7 +464,6 @@ def get_parser():
 
 
 def get_params() -> AttributeDict:
-    """Return default parameters."""
     params = AttributeDict(
         {
             # parameters for conformer
@@ -505,21 +504,23 @@ def get_params() -> AttributeDict:
             "best_valid_loss": float("inf"),
             "best_train_epoch": -1,
             "best_valid_epoch": -1,
+            "batch_idx_train": 0,
             "exp_dir": Path("pruned_transducer_stateless7_streaming/exp"),
-            "lang_dir": Path("data/lang_bpe_500"),
+            "lang_dir": Path("data/lang_bpe_2500"),
             "lr": 1e-3,
             "weight_decay": 1e-6,
             "warm_step": 2000,
-            "save_every_n": 8000,
+            "log_interval": 50,
+            "reset_interval": 200,
+            "valid_interval": 2000,  # Match save_every_n for consistent evaluation
+            "save_every_n": 2000,
             "keep_last_k": 20,
             "average_period": 100,
             "use_fp16": False,
-            "env_info": get_env_info(),
             "epoch": 1,
             "return_encoder_output": False,  # used only during inference
             "return_boundaries": False,  # used only during inference
             "use_averaged_model": False,  # used only during inference
-            "num_decoder_layers": 6,
             "dataset": "librispeech",  # "librispeech" or "estonian"
             "train_txt": None,  # Path to train.txt for Estonian dataset
             "val_txt": None,  # Path to val.txt for Estonian dataset
@@ -966,8 +967,8 @@ def compute_validation_loss(
         assert loss.requires_grad is False
         tot_loss = tot_loss + loss_info
         
-        # Decode samples every 500 training iterations or if it's the first batch
-        if (params.batch_idx_train % 500 == 0 and batch_idx < 2) or batch_idx == 0:
+        # Decode samples when we would save a checkpoint
+        if batch_idx == 0:
             logging.info(f"\nDecoding samples from validation batch {batch_idx}")
             decode_batch(params, model, sp, batch)
 

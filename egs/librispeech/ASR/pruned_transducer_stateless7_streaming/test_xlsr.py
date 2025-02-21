@@ -244,5 +244,76 @@ def test_xlsr_encoder():
     for i, size in enumerate(chunk_sizes):
         logger.info(f"Sample {i}: {size/16000:.3f}s")
 
+def test_fsa_decoding():
+    """Test XLSR encoder's integration with k2's FSA-based decoding"""
+    logger.info("Testing FSA-based decoding integration...")
+    
+    # Initialize encoder with paper's specifications
+    encoder = XLSREncoder(
+        model_name="facebook/wav2vec2-xls-r-300m",
+        decode_chunk_size=8000,  # 0.5s at 16kHz
+        chunk_overlap=4000,      # 0.25s overlap
+        use_attention_sink=True,
+        attention_sink_size=4,   # From paper's diagrams
+        frame_duration=0.025,    # 25ms per frame
+        frame_stride=0.020,      # 20ms stride
+    )
+    
+    # Get test audio files
+    data_dir = Path("/Users/siimhaugas/Desktop/Projects/haugasdev/XLSR-Transducer/estonian_corpora/processed/tambet")
+    test_files = list(data_dir.glob("*.wav"))
+    
+    if not test_files:
+        logger.error("No test audio files found!")
+        return
+    
+    # Test on first file
+    test_file = str(test_files[0])
+    logger.info(f"\nTesting file: {test_file}")
+    
+    # Load and preprocess audio
+    waveform, sample_rate = torchaudio.load(test_file)
+    if sample_rate != 16000:
+        resampler = torchaudio.transforms.Resample(sample_rate, 16000)
+        waveform = resampler(waveform)
+    
+    # Convert to mono if stereo and ensure shape is (batch, time)
+    if waveform.shape[0] > 1:  # If multi-channel
+        waveform = torch.mean(waveform, dim=0, keepdim=True)  # Average channels
+    waveform = waveform.transpose(0, 1)  # Change from (channel, time) to (time, channel)
+    waveform = waveform.unsqueeze(0)  # Add batch dimension: (batch, time, channel)
+    waveform = waveform.squeeze(-1)  # Remove channel dim: (batch, time)
+    
+    # Test streaming forward pass with state management
+    logger.info("\nTesting streaming forward pass with state management:")
+    input_length = torch.tensor([waveform.shape[1]], dtype=torch.int32)
+    states = encoder.get_init_state()
+    
+    # Process in chunks
+    chunk_size = encoder.decode_chunk_size
+    chunks = encoder.prepare_chunks(waveform, chunk_size)
+    
+    streaming_outputs = []
+    for i, chunk in enumerate(chunks):
+        chunk_len = torch.tensor([chunk.shape[1]], dtype=torch.int32)
+        chunk_out, chunk_lens, states = encoder.streaming_forward(chunk, chunk_len, states)
+        streaming_outputs.append(chunk_out)
+        logger.info(f"Chunk {i}: input shape {chunk.shape}, output shape {chunk_out.shape}")
+    
+    # Verify output dimensions match joiner expectations
+    concat_output = torch.cat(streaming_outputs, dim=1)
+    logger.info(f"\nFinal output shape: {concat_output.shape}")
+    assert concat_output.shape[-1] == encoder.encoder_dim, \
+        f"Output dimension {concat_output.shape[-1]} doesn't match joiner input dimension {encoder.encoder_dim}"
+    
+    # Verify state management
+    logger.info("\nVerifying state management:")
+    assert len(states) == 1, f"Expected 1 state tensor, got {len(states)}"
+    if states[0] is not None:
+        logger.info(f"State shape: {states[0].shape}")
+    else:
+        logger.info("State is None (expected for first chunk)")
+
 if __name__ == "__main__":
-    test_xlsr_encoder() 
+    test_xlsr_encoder()
+    test_fsa_decoding()

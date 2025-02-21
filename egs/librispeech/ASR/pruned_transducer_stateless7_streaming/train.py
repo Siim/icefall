@@ -552,12 +552,20 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
 
 
 def get_decoder_model(params: AttributeDict) -> nn.Module:
-    decoder = Decoder(
-        vocab_size=params.vocab_size,
-        decoder_dim=params.decoder_dim,
-        blank_id=params.blank_id,
-        context_size=params.context_size,
-    )
+    if params.dataset == "estonian":
+        from estonian_decoder import EstonianDecoder
+        decoder = EstonianDecoder(
+            vocab_size=params.vocab_size,
+            decoder_dim=params.decoder_dim,
+            blank_id=params.blank_id,
+            context_size=2  # From paper
+        )
+    else:
+        decoder = Decoder(
+            vocab_size=params.vocab_size,
+            decoder_dim=params.decoder_dim,
+            blank_id=params.blank_id,
+        )
     return decoder
 
 
@@ -597,7 +605,17 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
         # Freeze first N layers of XLSR
         for layer in model.encoder.model.encoder.layers[:10]:
             layer.requires_grad_(False)
-
+            
+    # Create decoding graph for Estonian if needed
+    if params.dataset == "estonian":
+        from estonian_decoder import create_estonian_token_table, create_estonian_decoding_graph
+        token_table = create_estonian_token_table(params.vocab_file)
+        model.decoding_graph = create_estonian_decoding_graph(
+            token_table=token_table,
+            num_tokens=params.vocab_size,
+            device=torch.device("cpu")  # Will be moved to correct device later
+        )
+    
     return model
 
 

@@ -519,208 +519,90 @@ def decode_one_batch(
     batch: dict,
     word_table: Optional[k2.SymbolTable] = None,
     decoding_graph: Optional[k2.Fsa] = None,
-    LM: Optional[LmScorer] = None,
-    ngram_lm=None,
-    ngram_lm_scale: float = 0.0,
 ) -> Dict[str, List[List[str]]]:
-    """Decode one batch and return the result in a dict. The dict has the
-    following format:
-
-        - key: It indicates the setting used for decoding. For example,
-               if greedy_search is used, it would be "greedy_search"
-               If beam search with a beam size of 7 is used, it would be
-               "beam_7"
-        - value: It contains the decoding result. `len(value)` equals to
-                 batch size. `value[i]` is the decoding result for the i-th
-                 utterance in the given batch.
-    Args:
-      params:
-        It's the return value of :func:`get_params`.
-      model:
-        The neural model.
-      sp:
-        The BPE model.
-      batch:
-        It is the return value from iterating
-        `lhotse.dataset.K2SpeechRecognitionDataset`. See its documentation
-        for the format of the `batch`.
-      word_table:
-        The word symbol table.
-      decoding_graph:
-        The decoding graph. Can be either a `k2.trivial_graph` or HLG, Used
-        only when --decoding_method is fast_beam_search, fast_beam_search_nbest,
-        fast_beam_search_nbest_oracle, and fast_beam_search_nbest_LG.
-      LM:
-        A neural network language model.
-      ngram_lm:
-        A ngram language model
-      ngram_lm_scale:
-        The scale for the ngram language model.
-    Returns:
-      Return the decoding result. See above description for the format of
-      the returned dict.
-    """
-    device = next(model.parameters()).device
-    feature = batch["inputs"]
-    assert feature.ndim == 3
-
-    feature = feature.to(device)
-    # at entry, feature is (N, T, C)
-
-    supervisions = batch["supervisions"]
-    feature_lens = supervisions["num_frames"].to(device)
-
+    """Decode one batch and return the result in a dict."""
+    device = model.device
+    feature = batch["inputs"].to(device)
+    feature_lens = batch["supervisions"]["num_frames"].to(device)
+    
+    # Add right context for streaming
     feature_lens += 30
     feature = torch.nn.functional.pad(
         feature,
         pad=(0, 0, 0, 30),
         value=LOG_EPS,
     )
+    
+    # Get encoder output
     encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
-
+    
     hyps = []
-
-    if params.decoding_method == "fast_beam_search":
+    
+    # Use Estonian FSA-based decoding if available
+    if params.dataset == "estonian" and hasattr(model, "decoding_graph"):
+        from estonian_decoder import fast_beam_search_one_best
         hyp_tokens = fast_beam_search_one_best(
             model=model,
-            decoding_graph=decoding_graph,
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
             beam=params.beam,
-            max_contexts=params.max_contexts,
             max_states=params.max_states,
-        )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
-    elif params.decoding_method == "fast_beam_search_nbest_LG":
-        hyp_tokens = fast_beam_search_nbest_LG(
-            model=model,
-            decoding_graph=decoding_graph,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            beam=params.beam,
             max_contexts=params.max_contexts,
-            max_states=params.max_states,
-            num_paths=params.num_paths,
-            nbest_scale=params.nbest_scale,
+            decoding_graph=model.decoding_graph.to(device)
         )
         for hyp in hyp_tokens:
             hyps.append([word_table[i] for i in hyp])
-    elif params.decoding_method == "fast_beam_search_nbest":
-        hyp_tokens = fast_beam_search_nbest(
-            model=model,
-            decoding_graph=decoding_graph,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            beam=params.beam,
-            max_contexts=params.max_contexts,
-            max_states=params.max_states,
-            num_paths=params.num_paths,
-            nbest_scale=params.nbest_scale,
-        )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
-    elif params.decoding_method == "fast_beam_search_nbest_oracle":
-        hyp_tokens = fast_beam_search_nbest_oracle(
-            model=model,
-            decoding_graph=decoding_graph,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            beam=params.beam,
-            max_contexts=params.max_contexts,
-            max_states=params.max_states,
-            num_paths=params.num_paths,
-            ref_texts=sp.encode(supervisions["text"]),
-            nbest_scale=params.nbest_scale,
-        )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
-    elif params.decoding_method == "greedy_search" and params.max_sym_per_frame == 1:
-        hyp_tokens = greedy_search_batch(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-        )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
-    elif params.decoding_method == "modified_beam_search":
-        hyp_tokens = modified_beam_search(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            beam=params.beam_size,
-        )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
-    elif params.decoding_method == "modified_beam_search_lm_shallow_fusion":
-        hyp_tokens = modified_beam_search_lm_shallow_fusion(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            beam=params.beam_size,
-            LM=LM,
-        )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
-    elif params.decoding_method == "modified_beam_search_LODR":
-        hyp_tokens = modified_beam_search_LODR(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            beam=params.beam_size,
-            LODR_lm=ngram_lm,
-            LODR_lm_scale=ngram_lm_scale,
-            LM=LM,
-        )
-        for hyp in sp.decode(hyp_tokens):
-            hyps.append(hyp.split())
-    elif params.decoding_method == "modified_beam_search_lm_rescore":
-        lm_scale_list = [0.01 * i for i in range(10, 50)]
-        ans_dict = modified_beam_search_lm_rescore(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            beam=params.beam_size,
-            LM=LM,
-            lm_scale_list=lm_scale_list,
-        )
-    elif params.decoding_method == "modified_beam_search_lm_rescore_LODR":
-        lm_scale_list = [0.02 * i for i in range(2, 30)]
-        ans_dict = modified_beam_search_lm_rescore_LODR(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            beam=params.beam_size,
-            LM=LM,
-            LODR_lm=ngram_lm,
-            sp=sp,
-            lm_scale_list=lm_scale_list,
-        )
     else:
-        batch_size = encoder_out.size(0)
-
-        for i in range(batch_size):
-            # fmt: off
-            encoder_out_i = encoder_out[i:i+1, :encoder_out_lens[i]]
-            # fmt: on
-            if params.decoding_method == "greedy_search":
-                hyp = greedy_search(
-                    model=model,
-                    encoder_out=encoder_out_i,
-                    max_sym_per_frame=params.max_sym_per_frame,
-                )
-            elif params.decoding_method == "beam_search":
-                hyp = beam_search(
-                    model=model,
-                    encoder_out=encoder_out_i,
-                    beam=params.beam_size,
-                )
-            else:
-                raise ValueError(
-                    f"Unsupported decoding method: {params.decoding_method}"
-                )
-            hyps.append(sp.decode(hyp).split())
-
+        # Original decoding methods
+        if params.decoding_method == "fast_beam_search":
+            hyp_tokens = fast_beam_search_one_best(
+                model=model,
+                decoding_graph=decoding_graph,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+                beam=params.beam,
+                max_contexts=params.max_contexts,
+                max_states=params.max_states,
+            )
+            for hyp in sp.decode(hyp_tokens):
+                hyps.append(hyp.split())
+        elif params.decoding_method == "greedy_search" and params.max_sym_per_frame == 1:
+            hyp_tokens = greedy_search_batch(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+            )
+            for hyp in sp.decode(hyp_tokens):
+                hyps.append(hyp.split())
+        elif params.decoding_method == "modified_beam_search":
+            hyp_tokens = modified_beam_search(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+                beam=params.beam_size,
+            )
+            for hyp in sp.decode(hyp_tokens):
+                hyps.append(hyp.split())
+        else:
+            batch_size = encoder_out.size(0)
+            for i in range(batch_size):
+                encoder_out_i = encoder_out[i:i+1, :encoder_out_lens[i]]
+                if params.decoding_method == "greedy_search":
+                    hyp = greedy_search(
+                        model=model,
+                        encoder_out=encoder_out_i,
+                        max_sym_per_frame=params.max_sym_per_frame,
+                    )
+                elif params.decoding_method == "beam_search":
+                    hyp = beam_search(
+                        model=model,
+                        encoder_out=encoder_out_i,
+                        beam=params.beam_size,
+                    )
+                else:
+                    raise ValueError(f"Unsupported decoding method: {params.decoding_method}")
+                hyps.append(sp.decode(hyp).split())
+    
     if params.decoding_method == "greedy_search":
         return {"greedy_search": hyps}
     elif "fast_beam_search" in params.decoding_method:
@@ -732,18 +614,7 @@ def decode_one_batch(
             key += f"nbest_scale_{params.nbest_scale}"
             if "LG" in params.decoding_method:
                 key += f"_ngram_lm_scale_{params.ngram_lm_scale}"
-
         return {key: hyps}
-    elif params.decoding_method in (
-        "modified_beam_search_lm_rescore",
-        "modified_beam_search_lm_rescore_LODR",
-    ):
-        ans = dict()
-        assert ans_dict is not None
-        for key, hyps in ans_dict.items():
-            hyps = [sp.decode(hyp).split() for hyp in hyps]
-            ans[f"beam_size_{params.beam_size}_{key}"] = hyps
-        return ans
     else:
         return {f"beam_size_{params.beam_size}": hyps}
 
@@ -816,9 +687,6 @@ def decode_dataset(
             decoding_graph=decoding_graph,
             word_table=word_table,
             batch=batch,
-            LM=LM,
-            ngram_lm=ngram_lm,
-            ngram_lm_scale=ngram_lm_scale,
         )
 
         for name, hyps in hyps_dict.items():

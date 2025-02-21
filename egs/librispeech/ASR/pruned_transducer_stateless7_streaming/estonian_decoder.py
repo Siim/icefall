@@ -13,10 +13,12 @@ def create_estonian_token_table(vocab_file: str) -> k2.SymbolTable:
     if not vocab_path.exists():
         raise FileNotFoundError(f"Vocabulary file not found: {vocab_file}")
     
-    # Create symbol table
+    # Create symbol table - k2 automatically adds <eps> with ID 0
     token_table = k2.SymbolTable()
-    token_table.add("<blk>", 0)  # blank token
-    token_table.add("<sos/eos>", 1)  # start/end of sequence
+    
+    # Add special tokens starting from ID 1
+    token_table.add("<blk>", 1)  # blank token
+    token_table.add("<sos/eos>", 2)  # start/end of sequence
     
     # Add Estonian characters
     with open(vocab_file, 'r', encoding='utf-8') as f:

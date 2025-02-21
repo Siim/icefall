@@ -1224,7 +1224,12 @@ def run(rank, world_size, args):
 
     sp = spm.SentencePieceProcessor()
     sp.load(params.bpe_model)
-    params.blank_id = sp.piece_to_id("<blk>")
+    
+    # For Estonian dataset, blank_id is 1 since k2.SymbolTable reserves 0 for <eps>
+    if params.dataset == "estonian":
+        params.blank_id = 1
+    else:
+        params.blank_id = sp.piece_to_id("<blk>")
     params.vocab_size = sp.get_piece_size()
 
     logging.info(params)

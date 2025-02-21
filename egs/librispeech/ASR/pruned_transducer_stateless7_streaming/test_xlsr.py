@@ -314,6 +314,73 @@ def test_fsa_decoding():
     else:
         logger.info("State is None (expected for first chunk)")
 
+def test_loss_computation():
+    """Test loss computation with variable chunk sizes and streaming regularization"""
+    logger.info("Testing loss computation...")
+    
+    # Initialize encoder with paper's specifications
+    encoder = XLSREncoder(
+        model_name="facebook/wav2vec2-xls-r-300m",
+        decode_chunk_size=8000,  # 0.5s at 16kHz
+        chunk_overlap=4000,      # 0.25s overlap
+        use_attention_sink=True,
+        attention_sink_size=4,   # From paper's diagrams
+        frame_duration=0.025,    # 25ms per frame
+        frame_stride=0.020,      # 20ms stride
+    )
+    
+    # Create dummy batch
+    batch_size = 2
+    seq_len = 32000  # 2s at 16kHz
+    x = torch.randn(batch_size, seq_len)
+    x_lens = torch.tensor([seq_len, seq_len//2], dtype=torch.int32)
+    
+    # Test random chunk size selection
+    encoder.train()
+    chunk_sizes = [encoder.get_random_chunk_size() for _ in range(5)]
+    logger.info("\nRandom chunk sizes:")
+    for i, size in enumerate(chunk_sizes):
+        logger.info(f"Sample {i}: {size/16000:.3f}s")
+    
+    # Process with variable chunks
+    chunk_size = chunk_sizes[0]
+    chunks = encoder.prepare_chunks(x, chunk_size)
+    
+    # Verify streaming regularization
+    streaming_outputs = []
+    streaming_reg_losses = []
+    
+    encoder.reset_streaming_state()
+    with torch.no_grad():
+        prev_output = None
+        for i, chunk in enumerate(chunks):
+            chunk_len = torch.tensor([chunk.shape[1]], dtype=torch.int32)
+            chunk_out = encoder.process_chunk(chunk, encoder.attention_sink_cache)
+            streaming_outputs.append(chunk_out)
+            
+            # Compute streaming regularization loss
+            if prev_output is not None:
+                # Loss between last frame of previous chunk and first frame of current chunk
+                reg_loss = torch.nn.functional.mse_loss(
+                    prev_output[:, -1:], 
+                    chunk_out[:, :1]
+                )
+                streaming_reg_losses.append(reg_loss.item())
+                logger.info(f"Chunk {i} streaming reg loss: {reg_loss.item():.6f}")
+            
+            prev_output = chunk_out
+    
+    # Verify loss components
+    if streaming_reg_losses:
+        mean_reg_loss = sum(streaming_reg_losses) / len(streaming_reg_losses)
+        logger.info(f"\nMean streaming regularization loss: {mean_reg_loss:.6f}")
+        
+        # The loss should be relatively small since we're using the same model
+        assert mean_reg_loss < 1.0, "Streaming regularization loss too high"
+    
+    logger.info("Loss computation test passed!")
+
 if __name__ == "__main__":
     test_xlsr_encoder()
     test_fsa_decoding()
+    test_loss_computation()

@@ -793,7 +793,15 @@ def compute_loss(
     device = next(model.parameters()).device
     feature = batch["inputs"].to(device)
     feature_lens = batch["supervisions"]["num_frames"].to(device)
-    y = batch["supervisions"]["text"]
+    texts = batch["supervisions"]["text"]
+    
+    # Convert text to token IDs using sentencepiece
+    token_ids = sp.encode(texts, out_type=int)
+    # Convert token lists to tensor
+    max_token_len = max(len(ids) for ids in token_ids)
+    y = torch.full((len(texts), max_token_len), params.blank_id, dtype=torch.long, device=device)
+    for i, ids in enumerate(token_ids):
+        y[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
     
     with torch.set_grad_enabled(is_training):
         simple_loss, pruned_loss = None, None

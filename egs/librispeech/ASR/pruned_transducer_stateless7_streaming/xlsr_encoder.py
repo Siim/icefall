@@ -132,15 +132,25 @@ class XLSREncoder(EncoderInterface):
 
     def smooth_transition(self, current_output: torch.Tensor, previous_output: torch.Tensor = None) -> torch.Tensor:
         """Apply smooth transition between chunks using sinusoidal interpolation"""
-        if previous_output is None or self.frames_per_chunk <= 0:
+        if previous_output is None:
+            return current_output
+            
+        # Calculate actual overlap size based on available frames
+        overlap_size = min(
+            previous_output.size(1),  # Previous chunk size
+            current_output.size(1),   # Current chunk size
+            self.frames_per_chunk     # Maximum overlap
+        )
+        
+        if overlap_size <= 0:
             return current_output
             
         # Get transition regions
-        prev_trans = previous_output[:, -self.frames_per_chunk:]
-        curr_trans = current_output[:, :self.frames_per_chunk]
+        prev_trans = previous_output[:, -overlap_size:]
+        curr_trans = current_output[:, :overlap_size]
         
         # Create transition weights using sin for smoother ramp-up
-        weights = torch.sin(torch.linspace(0.0, float(torch.pi/2), steps=self.frames_per_chunk, device=current_output.device))
+        weights = torch.sin(torch.linspace(0.0, float(torch.pi/2), steps=overlap_size, device=current_output.device))
         weights = weights.view(1, -1, 1)  # Shape for broadcasting
         
         # Interpolate
@@ -148,7 +158,7 @@ class XLSREncoder(EncoderInterface):
         
         # Replace transition region in current output
         current_output = current_output.clone()
-        current_output[:, :self.frames_per_chunk] = transition
+        current_output[:, :overlap_size] = transition
         
         return current_output
 
@@ -164,7 +174,7 @@ class XLSREncoder(EncoderInterface):
         if not self.use_attention_sink:
             return chunk, None
             
-        # Calculate sink size in samples
+        # Calculate sink size in samples (16 frames as per paper)
         sink_size = self.attention_sink_size * self.downsample_factor
         
         if sink_cache is None:
@@ -190,7 +200,7 @@ class XLSREncoder(EncoderInterface):
         if not self.left_context_chunks or not self.left_context_buffer:
             return chunk
             
-        # Take up to left_context_chunks previous chunks
+        # Take up to left_context_chunks previous chunks (1 as per paper)
         context = self.left_context_buffer[-self.left_context_chunks:]
         context_tensor = torch.cat(context, dim=1)
         
@@ -220,6 +230,28 @@ class XLSREncoder(EncoderInterface):
         # Clamp values silently since inputs are already normalized
         x = torch.clamp(x, min=-1.0, max=1.0)
         
+        # Calculate expected output length before adding context
+        # Account for overlap and context frames precisely
+        chunk_overlap = self.decode_chunk_size // 2
+        context_frames = self.attention_sink_size if self.use_attention_sink else 0
+        if self.left_context_chunks > 0:
+            context_frames += self.left_context_chunks * (self.decode_chunk_size // self.downsample_factor)
+            
+        # Calculate effective input length considering overlap and context
+        if states is not None:
+            # For subsequent chunks, adjust for overlap
+            effective_input_len = x_lens - chunk_overlap
+            # Add small correction factor for chunk boundary alignment
+            boundary_correction = self.downsample_factor // 16  # 20 samples at 16kHz
+            effective_input_len = effective_input_len + boundary_correction
+        else:
+            # For first chunk, use full length
+            effective_input_len = x_lens
+            
+        # Calculate expected frames precisely
+        expected_frames = ((effective_input_len.float() / self.downsample_factor).ceil()).to(torch.int64)
+        expected_frames = torch.maximum(expected_frames, torch.ones_like(expected_frames))
+        
         # Add left context if available
         x = self.prepare_left_context(x)
         
@@ -240,14 +272,33 @@ class XLSREncoder(EncoderInterface):
         if len(self.left_context_buffer) > self.left_context_chunks:
             self.left_context_buffer.pop(0)
         
-        # Calculate output lengths
-        output_lengths = ((x_lens.float() / self.downsample_factor).floor()).to(torch.int64)
-        output_lengths = torch.maximum(output_lengths, torch.ones_like(output_lengths))
+        # Remove context frames from output
+        if context_frames > 0:
+            outputs = outputs[:, context_frames:]
+        
+        # Ensure outputs match expected length
+        max_len = expected_frames.max().item()
+        if outputs.size(1) > max_len:
+            # Take center frames to avoid edge effects
+            extra = outputs.size(1) - max_len
+            start = extra // 2
+            outputs = outputs[:, start:start + max_len]
+        elif outputs.size(1) < max_len:
+            # Pad if needed (rare case)
+            pad_len = max_len - outputs.size(1)
+            outputs = torch.nn.functional.pad(outputs, (0, 0, 0, pad_len))
+        
+        # Apply smooth transition if we have previous output
+        if self.last_chunk_output is not None:
+            outputs = self.smooth_transition(outputs, self.last_chunk_output)
+        
+        # Cache current output for next chunk
+        self.last_chunk_output = outputs.clone()
         
         # Update states for next chunk
         next_states = [x, new_sink_cache]
         
-        return outputs, output_lengths, next_states
+        return outputs, expected_frames, next_states
 
     def forward(self, x: torch.Tensor, x_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Non-streaming forward pass"""

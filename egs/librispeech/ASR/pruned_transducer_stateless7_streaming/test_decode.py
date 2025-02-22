@@ -185,60 +185,92 @@ def clean_token_text(token_ids: List[int], token_table: k2.SymbolTable) -> str:
 def decode_with_beam_search(
     encoder_out: torch.Tensor,
     decoding_graph: k2.Fsa,
-    beam: float = 20.0,
-    max_states: int = 32,
-    max_contexts: int = 8
+    beam: float = 40.0,
+    max_states: int = 128,
+    max_contexts: int = 16
 ) -> List[int]:
-    """Simplified FSA-based decoding with better state handling"""
+    """
+    Decode encoder output using beam search with FSA.
+    Args:
+        encoder_out: Encoder output (batch, time, dim)
+        decoding_graph: FSA graph for decoding
+        beam: Beam size for pruning
+        max_states: Maximum number of FSA states to keep
+        max_contexts: Maximum number of contexts to keep
+    Returns:
+        List of token IDs
+    """
     assert encoder_out.ndim == 3, encoder_out.shape
     B, T, C = encoder_out.shape
     assert B == 1, "Only support batch size 1 for now"
+
+    # New: Fallback if time dimension is too large
+    MAX_T_FRAMES = 100  # Adjust based on your needs
+    if T > MAX_T_FRAMES:
+        logging.warning(
+            f"Time dimension {T} exceeds {MAX_T_FRAMES}. "
+            "Falling back to greedy decoding."
+        )
+        return decode_with_greedy_ctc(encoder_out)
+
+    # Convert encoder output to log-softmax with temperature scaling
+    temperature = 1.0
+    encoder_out = torch.nn.functional.log_softmax(encoder_out / temperature, dim=-1)
     
-    # Convert encoder output to log-softmax
-    encoder_out = torch.nn.functional.log_softmax(encoder_out, dim=-1)
+    # Create supervision segments - one segment per sequence
+    supervision_segments = torch.tensor(
+        [[0, 0, T]],  # [seq_idx, start_frame, num_frames]
+        dtype=torch.int32,
+        device=encoder_out.device
+    )
+    
+    # Create dense FSA from encoder output
+    dense_fsa = k2.DenseFsaVec(encoder_out, supervision_segments)
+    
+    # Ensure decoding graph is on same device
+    decoding_graph = decoding_graph.to(encoder_out.device)
+    
+    # Ensure decoding graph is properly sorted and connected
+    decoding_graph = k2.arc_sort(decoding_graph)
+    decoding_graph = k2.connect(decoding_graph)
+    
+    # Add self-loops to help with blank handling
+    decoding_graph = k2.add_epsilon_self_loops(decoding_graph)
+    decoding_graph = k2.arc_sort(decoding_graph)
+    
+    # Ensure graph has exactly one final state
+    decoding_graph = k2.create_fsa_vec([decoding_graph])
+    decoding_graph = k2.top_sort(decoding_graph)
     
     try:
-        # Create supervision segments
-        supervision = torch.tensor(
-            [[0, 0, T]],
-            dtype=torch.int32,
-            device=encoder_out.device
-        )
-        
-        # Create dense FSA
-        dense_fsa = k2.DenseFsaVec(encoder_out, supervision)
-        
-        # Ensure decoding graph is properly prepared
-        decoding_graph = k2.arc_sort(decoding_graph)
-        decoding_graph = k2.connect(decoding_graph)
-        
-        # Ensure single final state
-        decoding_graph = k2.create_fsa_vec([decoding_graph])
-        decoding_graph = k2.top_sort(decoding_graph)
-        
-        # Basic intersection with pruning
+        # Intersect with decoding graph using pruned intersection
         lattice = k2.intersect_dense_pruned(
-            decoding_graph.to(encoder_out.device),
+            decoding_graph,
             dense_fsa,
             search_beam=beam,
             output_beam=beam,
-            min_active_states=max_states // 4,
+            min_active_states=max_states // 4,  # Allow some variation
             max_active_states=max_states
         )
         
-        # Connect and sort before finding best path
+        # Connect and arc sort the lattice before finding shortest path
         lattice = k2.connect(lattice)
         lattice = k2.arc_sort(lattice)
         
-        # Get best path
+        # Get best path with double-precision scores for stability
         best_path = k2.shortest_path(lattice, use_double_scores=True)
         
-        # Extract labels, filtering out blanks (0) and epsilons (-1)
+        # Get labels from best path FSA
         labels = []
-        if best_path.shape[0] > 0:
-            labels = [x for x in best_path.labels.tolist() if x > 0]
+        if best_path.shape[0] > 0:  # Check if path exists
+            # Get labels and aux_labels, filtering out 0 (blank) and -1 (epsilon)
+            if hasattr(best_path, 'aux_labels'):
+                labels = [x for x in best_path.aux_labels.tolist() if x > 0]
+            else:
+                labels = [x for x in best_path.labels.tolist() if x > 0]
             
-            # Basic filtering of repeated tokens
+            # Apply some basic language constraints
+            # 1. Remove repeated tokens that are unlikely in Estonian
             filtered = []
             prev = None
             repeat_count = 0
@@ -253,15 +285,31 @@ def decode_with_beam_search(
                 prev = label
             
             labels = filtered
-            
-        return labels
-        
     except RuntimeError as e:
         logging.warning(f"FSA decoding failed: {e}")
-        # Fallback to simple argmax decoding
-        labels = encoder_out.argmax(dim=-1).squeeze(0).tolist()
-        labels = [x for x in labels if x > 0]
-        return labels
+        # Fallback to greedy decoding
+        return decode_with_greedy_ctc(encoder_out)
+            
+    return labels
+
+def decode_with_greedy_ctc(encoder_out: torch.Tensor) -> List[int]:
+    """
+    A simple argmax-based, CTC-style decoding that skips the FSA intersection.
+    Note: This does not remove repeated tokens or handle blanks beyond ignoring ID 0.
+    """
+    assert encoder_out.ndim == 3, encoder_out.shape
+    batch_size, time_steps, vocab_size = encoder_out.shape
+    assert batch_size == 1, "Greedy decode only supports batch_size=1 for now"
+
+    # Convert to log-softmax if your model doesn't already output it.
+    encoder_out = torch.nn.functional.log_softmax(encoder_out, dim=-1)
+
+    # Argmax over the vocabulary dimension and optionally remove blanks.
+    argmax_ids = encoder_out.argmax(dim=-1).squeeze(0).tolist()
+    # Example of filtering out blank if needed:
+    # argmax_ids = [x for x in argmax_ids if x != 0]
+
+    return argmax_ids
 
 def main():
     args = get_args()
@@ -283,11 +331,16 @@ def main():
     token_table = create_estonian_token_table(args.vocab_file)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Create simple trivial graph - following MDCC recipe
+    # Create generic FSA using k2.trivial_graph
+    # We subtract 1 from vocab_size because k2's trivial_graph doesn't need the blank token
     decoding_graph = k2.trivial_graph(
         max_token=len(token_table) - 1,  # -1 for blank token
         device=device
     )
+    
+    # Add epsilon self-loops for CTC-like decoding
+    decoding_graph = k2.add_epsilon_self_loops(decoding_graph)
+    decoding_graph = k2.arc_sort(decoding_graph)
     
     # Move encoder to device
     encoder = encoder.to(device)
@@ -309,15 +362,9 @@ def main():
         logging.info(f"Non-streaming output shape: {non_streaming_out.shape}")
         
         # Decode non-streaming output
-        non_streaming_hyps = decode_with_beam_search(
-            encoder_out=non_streaming_out,
-            decoding_graph=decoding_graph,
-            beam=args.beam,
-            max_states=args.max_states,
-            max_contexts=args.max_contexts
-        )
+        non_streaming_hyps = decode_with_greedy_ctc(non_streaming_out)
         non_streaming_text = clean_token_text(non_streaming_hyps, token_table)
-        logging.info(f"\nNon-streaming decoded text:")
+        logging.info(f"\nNon-streaming decoded text (greedy ONLY):")
         logging.info("-" * 50)
         logging.info(f"{non_streaming_text}")
         logging.info("-" * 50)
@@ -347,13 +394,7 @@ def main():
             
             # Optionally decode each chunk for progressive output
             if args.show_progressive:
-                chunk_hyps = decode_with_beam_search(
-                    encoder_out=chunk_out,
-                    decoding_graph=decoding_graph,
-                    beam=args.beam,
-                    max_states=args.max_states,
-                    max_contexts=args.max_contexts
-                )
+                chunk_hyps = decode_with_greedy_ctc(chunk_out)
                 chunk_text = clean_token_text(chunk_hyps, token_table)
                 logging.info(f"Chunk {len(encoder_out_chunks)}/{num_chunks} text: {chunk_text}")
             else:
@@ -374,13 +415,7 @@ def main():
         logging.info(f"Got output frames: {encoder_out.shape[1]}")
         
         # Decode streaming output
-        streaming_hyps = decode_with_beam_search(
-            encoder_out=encoder_out,
-            decoding_graph=decoding_graph,
-            beam=args.beam,
-            max_states=args.max_states,
-            max_contexts=args.max_contexts
-        )
+        streaming_hyps = decode_with_greedy_ctc(encoder_out)
         streaming_text = clean_token_text(streaming_hyps, token_table)
         logging.info(f"\nStreaming decoded text:")
         logging.info("-" * 50)

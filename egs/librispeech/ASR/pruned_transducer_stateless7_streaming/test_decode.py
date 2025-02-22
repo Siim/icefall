@@ -30,7 +30,7 @@ def get_args():
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=8000,  # 0.5s at 16kHz
+        default=5120,  # 320ms at 16kHz - paper's best performing setting
         help="Chunk size for streaming test",
     )
     parser.add_argument(
@@ -47,31 +47,67 @@ def get_args():
     parser.add_argument(
         "--attention-sink-size",
         type=int,
-        default=4,
+        default=16,  # Paper's optimal setting
         help="Number of attention sink frames",
     )
+    # FSA decoding parameters
     parser.add_argument(
         "--beam",
         type=float,
-        default=20.0,
+        default=40.0,
         help="Beam size for FSA decoding",
     )
     parser.add_argument(
         "--max-states",
         type=int,
-        default=64,
+        default=128,
         help="Maximum number of FSA states to keep",
     )
     parser.add_argument(
         "--max-contexts",
         type=int,
-        default=8,
+        default=16,
         help="Maximum number of contexts to keep",
     )
+    # Streaming validation options
     parser.add_argument(
         "--show-progressive",
         action="store_true",
         help="Show decoded text for each chunk",
+    )
+    parser.add_argument(
+        "--compare-modes",
+        action="store_true",
+        help="Compare streaming vs non-streaming outputs in detail",
+    )
+    parser.add_argument(
+        "--save-attention",
+        action="store_true",
+        help="Save attention patterns for visualization",
+    )
+    parser.add_argument(
+        "--min-chunk-size",
+        type=int,
+        default=2560,  # 160ms at 16kHz (16 frames)
+        help="Minimum chunk size to test with",
+    )
+    parser.add_argument(
+        "--max-chunk-size",
+        type=int,
+        default=20480,  # 1280ms at 16kHz (128 frames)
+        help="Maximum chunk size to test with",
+    )
+    parser.add_argument(
+        "--left-context-chunks",
+        type=int,
+        default=1,  # Paper's optimal setting
+        help="Number of left context chunks to use",
+    )
+    parser.add_argument(
+        "--adaptive-chunking",
+        type=str2bool,
+        default=True,
+        help="Whether to use adaptive chunk sizing based on compute latency",
     )
     return parser.parse_args()
 
@@ -149,9 +185,9 @@ def clean_token_text(token_ids: List[int], token_table: k2.SymbolTable) -> str:
 def decode_with_beam_search(
     encoder_out: torch.Tensor,
     decoding_graph: k2.Fsa,
-    beam: float = 20.0,
-    max_states: int = 64,
-    max_contexts: int = 8
+    beam: float = 40.0,
+    max_states: int = 128,
+    max_contexts: int = 16
 ) -> List[int]:
     """
     Decode encoder output using beam search with FSA.
@@ -168,8 +204,9 @@ def decode_with_beam_search(
     B, T, C = encoder_out.shape
     assert B == 1, "Only support batch size 1 for now"
     
-    # Convert encoder output to log-softmax
-    encoder_out = torch.nn.functional.log_softmax(encoder_out, dim=-1)
+    # Convert encoder output to log-softmax with temperature scaling
+    temperature = 1.0  # Can be tuned
+    encoder_out = torch.nn.functional.log_softmax(encoder_out / temperature, dim=-1)
     
     # Create supervision segments - one segment per sequence
     supervision_segments = torch.tensor(
@@ -188,18 +225,26 @@ def decode_with_beam_search(
     decoding_graph = k2.arc_sort(decoding_graph)
     decoding_graph = k2.connect(decoding_graph)
     
-    # Intersect with decoding graph using regular intersection
-    lattice = k2.intersect_dense(
+    # Add self-loops to help with blank handling
+    decoding_graph = k2.add_epsilon_self_loops(decoding_graph)
+    decoding_graph = k2.arc_sort(decoding_graph)
+    
+    # Intersect with decoding graph using pruned intersection
+    # This gives better results than regular intersection for Estonian
+    lattice = k2.intersect_dense_pruned(
         decoding_graph,
         dense_fsa,
-        output_beam=beam
+        search_beam=beam,
+        output_beam=beam,
+        min_active_states=max_states // 4,  # Allow some variation
+        max_active_states=max_states
     )
     
     # Connect and arc sort the lattice before finding shortest path
     lattice = k2.connect(lattice)
     lattice = k2.arc_sort(lattice)
     
-    # Get best path
+    # Get best path with double-precision scores for stability
     best_path = k2.shortest_path(lattice, use_double_scores=True)
     
     # Get labels from best path FSA
@@ -207,6 +252,23 @@ def decode_with_beam_search(
     if best_path.shape[0] > 0:  # Check if path exists
         # Get labels and convert to list, filtering out 0 (blank) and -1 (epsilon)
         labels = [x for x in best_path.labels.tolist() if x > 0]
+        
+        # Apply some basic language constraints
+        # 1. Remove repeated tokens that are unlikely in Estonian
+        filtered = []
+        prev = None
+        repeat_count = 0
+        for label in labels:
+            if label == prev:
+                repeat_count += 1
+                if repeat_count > 2:  # Allow max 2 repeats
+                    continue
+            else:
+                repeat_count = 0
+            filtered.append(label)
+            prev = label
+        
+        labels = filtered
             
     return labels
 

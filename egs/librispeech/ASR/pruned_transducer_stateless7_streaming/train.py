@@ -57,6 +57,7 @@ import sentencepiece as spm
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
+import torch.nn.functional as F
 from asr_datamodule import LibriSpeechAsrDataModule
 from decoder import Decoder
 from joiner import Joiner
@@ -789,9 +790,9 @@ def compute_loss(
       is_training:
         True for training, False for validation.
     """
-    device = model.device
-    feature = batch["inputs"]
-    feature_lens = batch["supervisions"]["num_frames"]
+    device = next(model.parameters()).device
+    feature = batch["inputs"].to(device)
+    feature_lens = batch["supervisions"]["num_frames"].to(device)
     y = batch["supervisions"]["text"]
     
     with torch.set_grad_enabled(is_training):

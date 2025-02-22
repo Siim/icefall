@@ -314,3 +314,52 @@ class XLSREncoder(EncoderInterface):
         output_lengths = torch.maximum(output_lengths, torch.ones_like(output_lengths))
         
         return outputs, output_lengths 
+
+    def prepare_chunks(self, x: torch.Tensor, chunk_size: Optional[int] = None) -> List[torch.Tensor]:
+        """Prepare input into chunks for streaming processing.
+        
+        Args:
+            x: Input tensor (batch, time) or (batch, time, 1)
+            chunk_size: Optional chunk size in samples. If None, uses self.decode_chunk_size
+        Returns:
+            List of chunks, each of shape (batch, chunk_size)
+        """
+        # Ensure input is float and in correct shape
+        x = x.float()
+        if x.ndim == 3:
+            x = x.squeeze(-1)
+        assert x.ndim == 2, f"Expected 2D input (batch, time), got shape {x.shape}"
+        
+        # Use default chunk size if none provided
+        if chunk_size is None:
+            chunk_size = self.decode_chunk_size
+            
+        # Calculate overlap
+        overlap = self.chunk_overlap if self.chunk_overlap is not None else chunk_size // 2
+        
+        # Split into chunks
+        chunks = []
+        current = 0
+        while current < x.shape[1]:
+            end = min(current + chunk_size, x.shape[1])
+            chunk = x[:, current:end]
+            
+            # Pad last chunk if needed
+            if end == x.shape[1] and chunk.shape[1] < chunk_size:
+                pad_size = chunk_size - chunk.shape[1]
+                chunk = torch.nn.functional.pad(chunk, (0, pad_size))
+                
+            chunks.append(chunk)
+            
+            # Move to next chunk, considering overlap
+            if end == x.shape[1]:  # Last chunk
+                break
+            current = end - overlap
+            
+        return chunks
+
+    def get_random_chunk_size(self) -> int:
+        """Returns a random chunk size for training.
+        Samples from paper's configurations: 320ms, 640ms, 1280ms, 2560ms
+        """
+        return random.choice(list(self.chunk_sizes.values())) 

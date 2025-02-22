@@ -1,7 +1,7 @@
 import k2
 import torch
 import torch.nn as nn
-from typing import Optional, List, Dict, Tuple, Union
+from typing import Optional, List, Dict, Tuple
 from pathlib import Path
 import logging
 import copy
@@ -57,7 +57,7 @@ class EstonianDecoder(nn.Module):
         vocab_size: int,
         decoder_dim: int,
         blank_id: int = 0,
-        context_size: int = 2,  # From paper: using bigram context
+        context_size: int = 2,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -68,14 +68,11 @@ class EstonianDecoder(nn.Module):
         # Embedding layer for tokens
         self.embedding = nn.Embedding(vocab_size, decoder_dim)
         
-        # Initialize with Xavier (as per paper)
-        nn.init.xavier_uniform_(self.embedding.weight)
-        
-        # Decoder layers (following paper's architecture)
+        # Decoder layers
         self.layers = nn.ModuleList([
             nn.Linear(decoder_dim, decoder_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),  # Paper uses dropout for regularization
+            nn.Dropout(0.1),
             nn.Linear(decoder_dim, decoder_dim)
         ])
         
@@ -103,37 +100,22 @@ class EstonianDecoder(nn.Module):
     
     def forward(
         self,
-        y: Union[torch.Tensor, k2.RaggedTensor],
+        y: torch.Tensor,
         need_pad: bool = False
     ) -> torch.Tensor:
         """
         Args:
             y: A 2-D tensor of shape (N, U) with U <= context_size
-               or a RaggedTensor containing token sequences
             need_pad: If True, pad y with blank_id to ensure context_size
         Returns:
             A 2-D tensor of shape (N, decoder_dim)
         """
-        device = next(self.parameters()).device
-        
-        if isinstance(y, k2.RaggedTensor):
-            # Get values and shape info
-            values = y.values
-            batch_size = y.shape[0]  # First dimension is batch size
-            
-            # Convert to padded tensor directly using k2's utilities
-            y = k2.ragged.pad(y, mode='constant', padding_value=self.blank_id)
-            y = y.to(device)
-        else:
-            # If it's already a tensor, just ensure it's on the right device
-            y = y.to(device)
-        
-        # Handle padding if needed (for context size)
+        # Handle padding if needed
         if need_pad and y.shape[1] < self.context_size:
             padding = torch.full(
                 (y.shape[0], self.context_size - y.shape[1]),
                 self.blank_id,
-                device=device,
+                device=y.device,
                 dtype=y.dtype
             )
             y = torch.cat([padding, y], dim=1)
@@ -141,7 +123,7 @@ class EstonianDecoder(nn.Module):
         # Embed tokens
         embedded = self.embedding(y)
         
-        # Average embeddings (as per paper's decoder architecture)
+        # Average embeddings
         decoder_out = torch.mean(embedded, dim=1)
         
         # Apply decoder layers

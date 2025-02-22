@@ -235,20 +235,6 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         help="Weight for streaming regularization loss",
     )
 
-    parser.add_argument(
-        "--gradient-accumulation-steps",
-        type=int,
-        default=4,
-        help="Number of steps to accumulate gradients before updating weights",
-    )
-
-    parser.add_argument(
-        "--effective-batch-size",
-        type=int,
-        default=8,
-        help="Target batch size after gradient accumulation",
-    )
-
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -1098,10 +1084,6 @@ def train_one_epoch(
             (20, 12)  # At epoch 20, unfreeze all
         ]
 
-    # Initialize gradient accumulation
-    optimizer.zero_grad()
-    accumulation_steps = getattr(params, "gradient_accumulation_steps", 1)
-    
     for batch_idx, batch in enumerate(train_dl):
         params.batch_idx_train += 1
         batch_size = len(batch["supervisions"]["text"])
@@ -1121,24 +1103,18 @@ def train_one_epoch(
                     batch=batch,
                     is_training=True,
                 )
-                # Scale loss by accumulation steps
-                loss = loss / accumulation_steps
-                
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
             # NOTE: We use reduction==sum and loss is computed over utterances
             # in the batch and there is no normalization to it so far.
             scaler.scale(loss).backward()
-            
-            # Only step optimizer after accumulating enough gradients
-            if (batch_idx + 1) % accumulation_steps == 0:
-                set_batch_count(model, params.batch_idx_train)
-                scheduler.step_batch(params.batch_idx_train)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-                
+            set_batch_count(model, params.batch_idx_train)
+            scheduler.step_batch(params.batch_idx_train)
+
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
         except:  # noqa
             display_and_save_batch(batch, params=params, sp=sp)
             raise
@@ -1414,7 +1390,7 @@ def run(rank, world_size, args):
     #         params=params,
     #     )
 
-    scaler = amp.GradScaler(enabled=params.use_fp16 or params.use_bf16, init_scale=1.0)
+    scaler = amp.GradScaler('cuda', enabled=params.use_fp16, init_scale=1.0)
     if checkpoints and "grad_scaler" in checkpoints:
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
@@ -1448,15 +1424,6 @@ def run(rank, world_size, args):
         if params.print_diagnostics:
             diagnostic.print_diagnostics()
             break
-
-        if not params.print_diagnostics:
-            scan_pessimistic_batches_for_oom(
-                model=model,
-                train_dl=train_dl,
-                optimizer=optimizer,
-                sp=sp,
-                params=params,
-            )
 
         save_checkpoint(
             params=params,

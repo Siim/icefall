@@ -9,7 +9,6 @@ import numpy as np
 from typing import Optional, List, Tuple
 from icefall.utils import make_pad_mask
 import math
-import torch.nn.functional as F
 
 # Import EncoderInterface from icefall
 from encoder_interface import EncoderInterface
@@ -27,7 +26,6 @@ class XLSREncoder(EncoderInterface):
         min_chunk_size: int = 2560,  # 160ms at 16kHz (16 frames)
         max_chunk_size: int = 20480,  # 1280ms at 16kHz (128 frames)
         left_context_chunks: int = 1,  # Paper's optimal setting
-        joiner_dim: int = 512,  # Dimension to project to for joiner
     ) -> None:
         super().__init__()
         from transformers import Wav2Vec2Model, Wav2Vec2Config
@@ -64,13 +62,8 @@ class XLSREncoder(EncoderInterface):
         # Initialize streaming state
         self.reset_streaming_state()
         
-        # Add projection layer if needed
-        self.output_dim = 1024  # XLSR-300M hidden dimension
-        if joiner_dim != self.output_dim:
-            self.proj = nn.Linear(self.output_dim, joiner_dim)
-            self.output_dim = joiner_dim
-        else:
-            self.proj = None
+        # Ensure output_dim matches joiner input
+        self.output_dim = 1024  # For XLS-R 300M
         
         # Define standard chunk sizes from paper
         self.chunk_sizes = {
@@ -188,36 +181,6 @@ class XLSREncoder(EncoderInterface):
         
         return torch.cat([context_tensor, chunk], dim=1)
 
-    def prepare_chunks(self, x: torch.Tensor, chunk_size: int) -> List[torch.Tensor]:
-        """Prepare chunks of input for streaming processing.
-        
-        Args:
-            x: Input tensor of shape (B, T, 1)
-            chunk_size: Size of each chunk in samples
-            
-        Returns:
-            List of tensors, each of shape (B, chunk_size, 1)
-        """
-        B, T, _ = x.shape
-        
-        # Add overlap between chunks (half chunk size)
-        overlap = chunk_size // 2
-        
-        chunks = []
-        current = 0
-        while current < T:
-            end = min(current + chunk_size, T)
-            chunk = x[:, current:end]
-            
-            # Pad last chunk if needed
-            if chunk.size(1) < chunk_size:
-                chunk = F.pad(chunk, (0, 0, 0, chunk_size - chunk.size(1)))
-            
-            chunks.append(chunk)
-            current = end - overlap  # Move by chunk_size - overlap
-        
-        return chunks
-
     def streaming_forward(
         self,
         x: torch.Tensor,
@@ -225,38 +188,51 @@ class XLSREncoder(EncoderInterface):
         states: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         """
+        Streaming forward pass with proper context and attention sink handling
         Args:
-            x: Input tensor of shape (B, T, 1)
+            x: Input tensor (batch, time) or (batch, time, 1)
             x_lens: Length of each sequence in batch
-            states: Previous states for streaming
+            states: Optional cached states from previous chunk
         Returns:
-            (output, output_lens, new_states)
+            (encoder_out, encoder_out_lens, next_states)
         """
-        # Enable gradient checkpointing to save memory
-        self.model.gradient_checkpointing_enable()
+        # Ensure input is float and in correct shape
+        x = x.float()
+        if x.ndim == 3:
+            x = x.squeeze(-1)
+        assert x.ndim == 2, f"Expected 2D input (batch, time), got shape {x.shape}"
         
-        # Process input
+        # Clamp values silently since inputs are already normalized
+        x = torch.clamp(x, min=-1.0, max=1.0)
+        
+        # Add left context if available
+        x = self.prepare_left_context(x)
+        
+        # Add attention sink
+        x, new_sink_cache = self.prepare_attention_sink(x, self.attention_sink_cache)
+        
+        # Process through XLSR model
         outputs = self.model(
             x,
             attention_mask=None,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+            output_hidden_states=False,
+            output_attentions=False,
+            return_dict=False
+        )[0]
         
-        # Get encoder outputs
-        encoder_outputs = outputs.hidden_states[-1]  # (B, T, D)
+        # Update left context buffer
+        self.left_context_buffer.append(x.clone())
+        if len(self.left_context_buffer) > self.left_context_chunks:
+            self.left_context_buffer.pop(0)
         
-        # Project to encoder dim if needed
-        if self.proj is not None:
-            encoder_outputs = self.proj(encoder_outputs)
+        # Calculate output lengths
+        output_lengths = ((x_lens.float() / self.downsample_factor).floor()).to(torch.int64)
+        output_lengths = torch.maximum(output_lengths, torch.ones_like(output_lengths))
         
-        # Compute output lengths
-        output_lens = x_lens
+        # Update states for next chunk
+        next_states = [x, new_sink_cache]
         
-        # Save states for streaming if needed
-        new_states = []
-        
-        return encoder_outputs, output_lens, new_states
+        return outputs, output_lengths, next_states
 
     def forward(self, x: torch.Tensor, x_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Non-streaming forward pass"""

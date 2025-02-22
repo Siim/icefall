@@ -843,6 +843,22 @@ def compute_loss(
         # Get decoder output
         decoder_out = model.decoder(y)
         
+        # Log shapes for debugging
+        logging.info(f"Encoder output shape: {encoder_out.shape}")
+        logging.info(f"Decoder output shape: {decoder_out.shape}")
+        
+        # Adjust dimensions if needed
+        if encoder_out.ndim == 3 and decoder_out.ndim == 2:
+            # Add time dimension to decoder output
+            decoder_out = decoder_out.unsqueeze(1)
+        elif encoder_out.ndim == 2 and decoder_out.ndim == 3:
+            # Add feature dimension to encoder output
+            encoder_out = encoder_out.unsqueeze(-1)
+            
+        # Verify dimensions match
+        assert encoder_out.ndim == decoder_out.ndim, \
+            f"Dimension mismatch: encoder_out.ndim={encoder_out.ndim}, decoder_out.ndim={decoder_out.ndim}"
+        
         # Compute joiner output
         joiner_out = model.joiner(encoder_out, decoder_out)
         

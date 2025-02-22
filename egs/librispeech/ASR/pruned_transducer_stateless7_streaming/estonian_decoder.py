@@ -108,7 +108,7 @@ class EstonianDecoder(nn.Module):
             y: A 2-D tensor of shape (N, U) with U <= context_size
             need_pad: If True, pad y with blank_id to ensure context_size
         Returns:
-            A 2-D tensor of shape (N, decoder_dim)
+            A 3-D tensor of shape (N, U, decoder_dim)
         """
         # Handle padding if needed
         if need_pad and y.shape[1] < self.context_size:
@@ -121,16 +121,14 @@ class EstonianDecoder(nn.Module):
             y = torch.cat([padding, y], dim=1)
         
         # Embed tokens
-        embedded = self.embedding(y)
-        
-        # Average embeddings
-        decoder_out = torch.mean(embedded, dim=1)
+        embedded = self.embedding(y)  # (N, U, decoder_dim)
         
         # Apply decoder layers
+        decoder_out = embedded
         for layer in self.layers:
             decoder_out = layer(decoder_out)
         
-        return decoder_out
+        return decoder_out  # Shape: (N, U, decoder_dim)
 
     @property
     def decoding_graph(self):

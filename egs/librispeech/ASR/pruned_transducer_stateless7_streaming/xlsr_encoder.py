@@ -10,25 +10,10 @@ from typing import Optional, List, Tuple
 from icefall.utils import make_pad_mask
 import math
 
-class EncoderInterface(nn.Module):
-    """Interface for encoders used in transducer models"""
-    def __init__(self) -> None:
-        super().__init__()
-        self.output_dim = 0  # Must be set by implementing class
-        
-    def forward(self, x: torch.Tensor, x_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: Input tensor (batch, time) or (batch, time, 1)
-            x_lens: Length of each sequence in the batch
-        Returns:
-            (output, output_lens)
-            output: (batch, time', output_dim)
-            output_lens: (batch,)
-        """
-        raise NotImplementedError
+from encoder_interface import EncoderInterface
 
 class XLSREncoder(EncoderInterface):
+    """XLSR encoder implementation following paper's specifications"""
     def __init__(
         self, 
         model_name: str = "facebook/wav2vec2-xls-r-300m",

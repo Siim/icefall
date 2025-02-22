@@ -10,6 +10,7 @@ import numpy as np
 
 from xlsr_encoder import XLSREncoder
 from estonian_decoder import create_estonian_token_table, create_estonian_decoding_graph
+from icefall.utils import str2bool
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -35,6 +36,18 @@ def get_args():
         "--plot",
         action="store_true",
         help="Plot chunk outputs for visualization",
+    )
+    parser.add_argument(
+        "--use-attention-sink",
+        type=str2bool,
+        default=True,
+        help="Whether to use attention sink mechanism",
+    )
+    parser.add_argument(
+        "--attention-sink-size",
+        type=int,
+        default=4,
+        help="Number of attention sink frames",
     )
     return parser.parse_args()
 
@@ -89,7 +102,11 @@ def main():
         model_name="facebook/wav2vec2-xls-r-300m",
         decode_chunk_size=args.chunk_size,
         chunk_overlap=args.chunk_size // 2,
-        use_attention_sink=True
+        use_attention_sink=args.use_attention_sink,
+        attention_sink_size=args.attention_sink_size,
+        context_frames=10,
+        transition_frames=5,
+        sink_warmup_frames=2
     )
     
     # Create token table and decoding graph
@@ -112,6 +129,7 @@ def main():
     
     logging.info(f"Testing streaming decoding with chunk size {args.chunk_size} samples ({args.chunk_size/16000:.3f}s)")
     logging.info(f"Audio duration: {audio.shape[1]/16000:.2f}s")
+    logging.info(f"Using attention sink: {args.use_attention_sink}, size: {args.attention_sink_size} frames")
     
     # Test streaming decoding
     with torch.no_grad():
@@ -140,13 +158,8 @@ def main():
             
             # Process chunk
             chunk_out, chunk_lens, states = encoder.streaming_forward(chunk, chunk_len, states)
-            
-            # For all chunks except the last, remove overlap frames from the end
-            if end < audio.shape[1]:
-                overlap_frames = chunk_overlap // encoder.downsample_factor
-                chunk_out = chunk_out[:, :-overlap_frames]
-            
             encoder_out_chunks.append(chunk_out)
+            
             logging.info(f"Processed chunk {len(encoder_out_chunks)}/{num_chunks}: {chunk.shape[1]/16000:.3f}s")
             
             # Move to next chunk, considering overlap

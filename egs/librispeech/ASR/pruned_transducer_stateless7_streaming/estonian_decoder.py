@@ -1,7 +1,7 @@
 import k2
 import torch
 import torch.nn as nn
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Union
 from pathlib import Path
 import logging
 import copy
@@ -57,7 +57,7 @@ class EstonianDecoder(nn.Module):
         vocab_size: int,
         decoder_dim: int,
         blank_id: int = 0,
-        context_size: int = 2,
+        context_size: int = 2,  # From paper: using bigram context
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -68,11 +68,14 @@ class EstonianDecoder(nn.Module):
         # Embedding layer for tokens
         self.embedding = nn.Embedding(vocab_size, decoder_dim)
         
-        # Decoder layers
+        # Initialize with Xavier (as per paper)
+        nn.init.xavier_uniform_(self.embedding.weight)
+        
+        # Decoder layers (following paper's architecture)
         self.layers = nn.ModuleList([
             nn.Linear(decoder_dim, decoder_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(0.1),  # Paper uses dropout for regularization
             nn.Linear(decoder_dim, decoder_dim)
         ])
         
@@ -100,17 +103,37 @@ class EstonianDecoder(nn.Module):
     
     def forward(
         self,
-        y: torch.Tensor,
+        y: Union[torch.Tensor, k2.RaggedTensor],
         need_pad: bool = False
     ) -> torch.Tensor:
         """
         Args:
             y: A 2-D tensor of shape (N, U) with U <= context_size
+               or a RaggedTensor containing token sequences
             need_pad: If True, pad y with blank_id to ensure context_size
         Returns:
             A 2-D tensor of shape (N, decoder_dim)
         """
-        # Handle padding if needed
+        if isinstance(y, k2.RaggedTensor):
+            # Convert RaggedTensor to dense tensor
+            dense_list = []
+            for i in range(y.dim0()):
+                # Get values for this sequence
+                seq = y[i].values.tolist()
+                dense_list.append(seq)
+            
+            # Pad sequences to same length
+            max_len = max(len(seq) for seq in dense_list)
+            y_padded = []
+            for seq in dense_list:
+                if len(seq) < max_len:
+                    seq = seq + [self.blank_id] * (max_len - len(seq))
+                y_padded.append(seq)
+            
+            # Convert to tensor on same device as RaggedTensor
+            y = torch.tensor(y_padded, device=y.device)
+        
+        # Handle padding if needed (for context size)
         if need_pad and y.shape[1] < self.context_size:
             padding = torch.full(
                 (y.shape[0], self.context_size - y.shape[1]),
@@ -123,7 +146,7 @@ class EstonianDecoder(nn.Module):
         # Embed tokens
         embedded = self.embedding(y)
         
-        # Average embeddings
+        # Average embeddings (as per paper's decoder architecture)
         decoder_out = torch.mean(embedded, dim=1)
         
         # Apply decoder layers

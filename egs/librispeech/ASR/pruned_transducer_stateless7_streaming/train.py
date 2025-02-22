@@ -55,8 +55,9 @@ import k2
 import optim
 import sentencepiece as spm
 import torch
-import torch.multiprocessing as mp
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.multiprocessing as mp
 from asr_datamodule import LibriSpeechAsrDataModule
 from decoder import Decoder
 from joiner import Joiner

@@ -262,4 +262,44 @@ class XLSREncoder(EncoderInterface):
         output_lengths = ((x_lens.float() / self.downsample_factor).floor()).to(torch.int64)
         output_lengths = torch.maximum(output_lengths, torch.ones_like(output_lengths))
         
-        return outputs, output_lengths 
+        return outputs, output_lengths
+
+    def prepare_chunks(self, x: torch.Tensor, chunk_size: int) -> List[torch.Tensor]:
+        """
+        Prepare input into chunks for streaming processing.
+        Args:
+            x: Input tensor (batch, time) or (batch, time, 1)
+            chunk_size: Size of each chunk in samples
+        Returns:
+            List of chunks, each of shape (batch, chunk_size)
+        """
+        # Ensure input is 2D
+        if x.ndim == 3:
+            x = x.squeeze(-1)
+        assert x.ndim == 2, f"Expected 2D input (batch, time), got shape {x.shape}"
+        
+        # Calculate overlap size
+        overlap = self.chunk_overlap
+        
+        # Initialize chunks list
+        chunks = []
+        
+        # Process in chunks with overlap
+        current = 0
+        while current < x.size(1):
+            end = min(current + chunk_size, x.size(1))
+            chunk = x[:, current:end]
+            
+            # Add padding if needed for last chunk
+            if chunk.size(1) < chunk_size:
+                pad_size = chunk_size - chunk.size(1)
+                chunk = torch.nn.functional.pad(chunk, (0, pad_size))
+            
+            chunks.append(chunk)
+            
+            # Move to next chunk considering overlap
+            if end == x.size(1):  # Last chunk
+                break
+            current = end - overlap
+        
+        return chunks 

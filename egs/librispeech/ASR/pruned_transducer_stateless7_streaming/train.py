@@ -891,18 +891,7 @@ def decode_batch(
     batch: dict,
     max_decode_samples: int = 4,
 ) -> List[Tuple[str, str, float]]:
-    """Decode a random subset of the batch and compute WER for monitoring.
-    
-    Args:
-        params: Training parameters
-        model: The model to use for decoding
-        sp: SentencePiece tokenizer
-        batch: Current batch of data
-        max_decode_samples: Maximum number of samples to decode
-        
-    Returns:
-        List of tuples containing (reference, hypothesis, WER)
-    """
+    """Decode a random subset of the batch and compute WER for monitoring."""
     model.eval()
     device = next(model.parameters()).device
     
@@ -915,7 +904,48 @@ def decode_batch(
         features = batch["inputs"][indices].to(device)
         feature_lens = batch["supervisions"]["num_frames"][indices].to(device)
         
-        encoder_out, encoder_out_lens = model.encoder(x=features, x_lens=feature_lens)
+        # Add right context for streaming
+        feature_lens += params.attention_sink_size
+        feature = torch.nn.functional.pad(
+            features,
+            pad=(0, 0, 0, params.attention_sink_size),
+            value=LOG_EPS,
+        )
+        
+        # Get encoder output with streaming settings
+        if hasattr(model.encoder, 'streaming_forward'):
+            # Initialize streaming state
+            states = model.encoder.get_init_state(device)
+            
+            # Process in chunks
+            current = 0
+            encoder_out_chunks = []
+            chunk_overlap = params.decode_chunk_len // 2
+            
+            while current < feature.size(1):
+                end = min(current + params.decode_chunk_len, feature.size(1))
+                chunk = feature[:, current:end]
+                chunk_len = torch.tensor([chunk.shape[1]], dtype=torch.int32, device=device)
+                
+                # Process chunk with streaming forward
+                chunk_out, chunk_lens, states = model.encoder.streaming_forward(
+                    chunk, 
+                    chunk_len, 
+                    states
+                )
+                encoder_out_chunks.append(chunk_out)
+                
+                # Move to next chunk considering overlap
+                if end == feature.size(1):  # Last chunk
+                    break
+                current = end - chunk_overlap
+            
+            # Concatenate chunks
+            encoder_out = torch.cat(encoder_out_chunks, dim=1)
+            encoder_out_lens = torch.tensor([encoder_out.size(1)], dtype=torch.int32, device=device)
+        else:
+            # Fallback to regular forward pass
+            encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
         
         # Log encoder output statistics
         logging.info(f"\nEncoder output stats:")
@@ -926,21 +956,37 @@ def decode_batch(
         logging.info(f"Max: {encoder_out.max().item():.3f}")
         
         hyps = []
-        # Use greedy search for quick monitoring
-        hyp_tokens = greedy_search_batch(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens
-        )
+        # Use FSA decoding for Estonian
+        if params.dataset == "estonian" and hasattr(model, "decoding_graph"):
+            from estonian_decoder import fast_beam_search_one_best
+            hyp_tokens = fast_beam_search_one_best(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+                beam=40.0,  # Paper's optimal setting
+                max_states=128,  # Paper's optimal setting
+                max_contexts=16,  # Paper's optimal setting
+                decoding_graph=model.decoding_graph.to(device)
+            )
+            for hyp in hyp_tokens:
+                hyps.append([model.decoder.token_table[i] for i in hyp])
+        else:
+            # Fallback to greedy search for quick monitoring
+            hyp_tokens = greedy_search_batch(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens
+            )
+            for tokens in hyp_tokens:
+                text = sp.decode(tokens)
+                hyps.append(text.split())
         
         total_words = 0
         total_errors = 0
+        results = []
         
-        for i, tokens in enumerate(hyp_tokens):
-            # Convert token IDs to text - tokens is already a list
-            text = sp.decode(tokens)
+        for i, hyp_words in enumerate(hyps):
             ref = texts[i]
-            hyp_words = text.split()
             ref_words = ref.split()
             # Compute WER for this sample
             errors = editdistance.eval(ref_words, hyp_words)
@@ -950,9 +996,9 @@ def decode_batch(
             total_errors += errors
             
             logging.info(f"\nReference: {ref}")
-            logging.info(f"Hypothesis: {text}")
+            logging.info(f"Hypothesis: {' '.join(hyp_words)}")
             logging.info(f"Sample WER: {wer:.1f}%")
-            hyps.append((ref, text, wer))
+            results.append((ref, ' '.join(hyp_words), wer))
             
         # Log overall WER for this batch
         if total_words > 0:
@@ -960,7 +1006,7 @@ def decode_batch(
             logging.info(f"\nBatch WER: {batch_wer:.1f}% (Total words: {total_words}, Total errors: {total_errors})")
     
     model.train()
-    return hyps
+    return results
 
 
 def compute_validation_loss(

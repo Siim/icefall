@@ -1649,8 +1649,7 @@ def get_optimizer(model: nn.Module, params: AttributeDict) -> ScaledAdam:
         betas=params.adam_betas,
         eps=params.adam_eps,
         clipping_scale=2.0,
-        parameters_names=parameters_names,
-        weight_decay=params.weight_decay,
+        parameters_names=parameters_names
     )
     return optimizer
 

@@ -474,26 +474,39 @@ def get_params() -> AttributeDict:
             "nhead": 8,
             "attention_dim": 512,
             "num_decoder_layers": 6,
-            # parameters for streaming
-            "decode_chunk_size": 16,  # in frames
-            "pad_length": 30,  # in frames
+            
+            # parameters for streaming (from paper)
+            "decode_chunk_size": 5120,  # 320ms at 16kHz (optimal)
+            "chunk_sizes": {
+                "320ms": 5120,   # 16 frames
+                "640ms": 10240,  # 32 frames
+                "1280ms": 20480, # 64 frames
+                "2560ms": 40960  # 128 frames
+            },
+            "use_attention_sink": True,
+            "attention_sink_size": 16,  # Paper's optimal setting
+            "left_context_chunks": 1,  # Paper's optimal setting
+            "streaming_regularization": 0.1,  # Weight for streaming regularization
+            
             # parameters for Noam
             "model_warm_step": 3000,  # arg given to model, not for lrate
             "env_info": get_env_info(),
             "use_xlsr": False,  # Whether to use XLSR encoder
-            "xlsr_model_name": "facebook/wav2vec2-xls-r-300m",  # XLSR model to use
-            "streaming_regularization": 0.1,  # Weight for streaming regularization loss
+            "xlsr_model_name": "facebook/wav2vec2-xls-r-300m",
+            
             # parameters for loss
             "simple_loss_scale": 0.5,
             "prune_range": 5,
             "lm_scale": 0.25,
             "am_scale": 0.0,
+            
             # parameters for decoding
             "search_beam": 20,
             "output_beam": 8,
             "min_active_states": 30,
             "max_active_states": 10000,
             "use_double_scores": True,
+            
             # parameters for training
             "context_size": 2,
             "max_duration": 200.0,
@@ -767,21 +780,14 @@ def compute_loss(
     """
     Compute transducer loss given the model and its inputs.
     Args:
-      params:
-        It is returned by :func:`get_params`.
-      model:
-        The model for training.
-      sp:
-        The BPE model.
-      batch:
-        A batch of data. See `lhotse.dataset.K2SpeechRecognitionDataset()`
-        for the content in it.
-      is_training:
-        True for training, False for validation.
+      params: Parameters for training
+      model: The model for training
+      sp: The BPE model
+      batch: A batch of data
+      is_training: True for training, False for validation
     """
     device = next(model.parameters()).device
     feature = batch["inputs"]
-    # at entry, feature is (N, T, C)
     assert feature.ndim == 3
     feature = feature.to(device)
 
@@ -798,7 +804,7 @@ def compute_loss(
 
         if is_training and params.use_xlsr:
             # Get random chunk size during training
-            chunk_size = model.encoder.get_random_chunk_size()
+            chunk_size = random.choice(list(params.chunk_sizes.values()))
             chunks = model.encoder.prepare_chunks(feature, chunk_size)
             encoder_out_chunks = []
             prev_chunk_last = None
@@ -814,6 +820,7 @@ def compute_loss(
                     # Subsequent chunks - compute streaming regularization
                     chunk_out, _, states = model.encoder.streaming_forward(chunk, chunk_len, states)
                     curr_chunk_first = chunk_out[:, :1, :]
+                    # Compute transition loss between chunks
                     streaming_loss += F.mse_loss(prev_chunk_last, curr_chunk_first)
                     prev_chunk_last = chunk_out[:, -1:, :]
                 

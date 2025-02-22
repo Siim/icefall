@@ -187,7 +187,8 @@ def decode_with_beam_search(
     decoding_graph: k2.Fsa,
     beam: float = 40.0,
     max_states: int = 128,
-    max_contexts: int = 16
+    max_contexts: int = 16,
+    temperature: float = 1.0,  # Added temperature parameter
 ) -> List[int]:
     """
     Decode encoder output using beam search with FSA.
@@ -197,6 +198,7 @@ def decode_with_beam_search(
         beam: Beam size for pruning
         max_states: Maximum number of FSA states to keep
         max_contexts: Maximum number of contexts to keep
+        temperature: Temperature for softmax scaling
     Returns:
         List of token IDs
     """
@@ -204,93 +206,50 @@ def decode_with_beam_search(
     B, T, C = encoder_out.shape
     assert B == 1, "Only support batch size 1 for now"
 
-    # New: Fallback if time dimension is too large
-    MAX_T_FRAMES = 100  # Adjust based on your needs
-    if T > MAX_T_FRAMES:
-        logging.warning(
-            f"Time dimension {T} exceeds {MAX_T_FRAMES}. "
-            "Falling back to greedy decoding."
-        )
-        return decode_with_greedy_ctc(encoder_out)
+    # Apply temperature scaling and convert to log probabilities
+    logits = encoder_out / temperature
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
 
-    # Convert encoder output to log-softmax with temperature scaling
-    temperature = 1.0
-    encoder_out = torch.nn.functional.log_softmax(encoder_out / temperature, dim=-1)
-    
-    # Create supervision segments - one segment per sequence
-    supervision_segments = torch.tensor(
-        [[0, 0, T]],  # [seq_idx, start_frame, num_frames]
-        dtype=torch.int32,
-        device=encoder_out.device
-    )
-    
-    # Create dense FSA from encoder output
-    dense_fsa = k2.DenseFsaVec(encoder_out, supervision_segments)
-    
-    # Ensure decoding graph is on same device
-    decoding_graph = decoding_graph.to(encoder_out.device)
-    
-    # Ensure decoding graph is properly sorted and connected
+    # Ensure decoding graph is on correct device and properly sorted
+    if decoding_graph.device != encoder_out.device:
+        decoding_graph = decoding_graph.to(encoder_out.device)
     decoding_graph = k2.arc_sort(decoding_graph)
-    decoding_graph = k2.connect(decoding_graph)
-    
-    # Add self-loops to help with blank handling
-    decoding_graph = k2.add_epsilon_self_loops(decoding_graph)
-    decoding_graph = k2.arc_sort(decoding_graph)
-    
-    # Ensure graph has exactly one final state
-    decoding_graph = k2.create_fsa_vec([decoding_graph])
-    decoding_graph = k2.top_sort(decoding_graph)
-    
+
+    # Create supervision for dense intersection
+    supervision = torch.tensor([[0, T]], device=encoder_out.device)
+    dense_fsa = k2.DenseFsaVec(log_probs, supervision)
+
     try:
-        # Intersect with decoding graph using pruned intersection
+        # Intersect with decoding graph and prune
         lattice = k2.intersect_dense_pruned(
             decoding_graph,
             dense_fsa,
             search_beam=beam,
             output_beam=beam,
-            min_active_states=max_states // 4,  # Allow some variation
+            min_active_states=max_states // 4,
             max_active_states=max_states
         )
-        
-        # Connect and arc sort the lattice before finding shortest path
+
+        # Ensure lattice is connected and has exactly one final state
         lattice = k2.connect(lattice)
-        lattice = k2.arc_sort(lattice)
-        
-        # Get best path with double-precision scores for stability
+        lattice = k2.top_sort(lattice)
+
+        # Find best path with double precision for stability
         best_path = k2.shortest_path(lattice, use_double_scores=True)
         
-        # Get labels from best path FSA
-        labels = []
-        if best_path.shape[0] > 0:  # Check if path exists
-            # Get labels and aux_labels, filtering out 0 (blank) and -1 (epsilon)
-            if hasattr(best_path, 'aux_labels'):
-                labels = [x for x in best_path.aux_labels.tolist() if x > 0]
-            else:
-                labels = [x for x in best_path.labels.tolist() if x > 0]
-            
-            # Apply some basic language constraints
-            # 1. Remove repeated tokens that are unlikely in Estonian
-            filtered = []
-            prev = None
-            repeat_count = 0
-            for label in labels:
-                if label == prev:
-                    repeat_count += 1
-                    if repeat_count > 2:  # Allow max 2 repeats
-                        continue
-                else:
-                    repeat_count = 0
-                filtered.append(label)
-                prev = label
-            
-            labels = filtered
+        # Extract labels from best path
+        token_ids = []
+        for arc in best_path.arcs:
+            if arc.label != 0:  # Skip blank tokens
+                token_ids.append(arc.label)
+
+        return token_ids
+
     except RuntimeError as e:
-        logging.warning(f"FSA decoding failed: {e}")
-        # Fallback to greedy decoding
-        return decode_with_greedy_ctc(encoder_out)
-            
-    return labels
+        if "FSA has no final states" in str(e):
+            logging.warning("FSA decoding failed due to no final states, falling back to greedy decoding")
+            return decode_with_greedy_ctc(encoder_out)
+        raise  # Re-raise other runtime errors
 
 def decode_with_greedy_ctc(encoder_out: torch.Tensor) -> List[int]:
     """

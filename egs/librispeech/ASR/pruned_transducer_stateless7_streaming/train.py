@@ -466,65 +466,61 @@ def get_parser():
 def get_params() -> AttributeDict:
     params = AttributeDict(
         {
-            # parameters for conformer
-            "subsampling_factor": 4,
-            "vgg_frontend": False,
-            "use_feat_batchnorm": True,
-            "feature_dim": 80,
-            "nhead": 8,
-            "attention_dim": 512,
-            "num_decoder_layers": 6,
-            # parameters for streaming
-            "decode_chunk_size": 16,  # in frames
-            "pad_length": 30,  # in frames
-            # parameters for Noam
-            "model_warm_step": 3000,  # arg given to model, not for lrate
-            "env_info": get_env_info(),
-            "use_xlsr": False,  # Whether to use XLSR encoder
-            "xlsr_model_name": "facebook/wav2vec2-xls-r-300m",  # XLSR model to use
+            # XLSR parameters from paper
+            "use_xlsr": True,  # Enable XLSR by default
+            "xlsr_model_name": "facebook/wav2vec2-xls-r-300m",
+            "frame_duration": 0.025,  # 25ms per frame
+            "frame_stride": 0.020,  # 20ms stride
+            "downsample_factor": 320,  # For wav2vec2/XLSR models
+            
+            # Chunk configurations from paper
+            "decode_chunk_size": 5120,  # 320ms at 16kHz (best performing)
+            "chunk_overlap": 2560,  # Half of decode_chunk_size
+            "use_attention_sink": True,
+            "attention_sink_size": 16,  # Paper's optimal setting
+            "left_context_chunks": 1,  # Paper's optimal setting
+            
+            # Training parameters
             "streaming_regularization": 0.1,  # Weight for streaming regularization loss
-            # parameters for loss
-            "simple_loss_scale": 0.5,
-            "prune_range": 5,
-            "lm_scale": 0.25,
-            "am_scale": 0.0,
-            # parameters for decoding
-            "search_beam": 20,
-            "output_beam": 8,
-            "min_active_states": 30,
-            "max_active_states": 10000,
-            "use_double_scores": True,
-            # parameters for training
-            "context_size": 2,
-            "max_duration": 200.0,
-            "random_seed": 42,
-            "batch_size": 4,
+            "batch_size": 4,  # Adjust based on your GPU memory
             "num_epochs": 30,
-            "best_train_loss": float("inf"),
-            "best_valid_loss": float("inf"),
-            "best_train_epoch": -1,
-            "best_valid_epoch": -1,
-            "batch_idx_train": 0,
-            "exp_dir": Path("pruned_transducer_stateless7_streaming/exp"),
-            "lang_dir": Path("data/lang_bpe_2500"),
-            "vocab_file": "data/lang_bpe_2500/tokens.txt",  # Path to vocabulary file
             "lr": 1e-3,
             "weight_decay": 1e-6,
             "warm_step": 2000,
+            
+            # Progressive unfreezing schedule
+            "unfreeze_schedule": [
+                (10, 8),   # At epoch 10, unfreeze 8 more layers
+                (20, 12)   # At epoch 20, unfreeze all layers
+            ],
+            
+            # Dataset parameters
+            "dataset": "estonian",  # "librispeech" or "estonian"
+            "train_txt": None,  # Path to train.txt for Estonian dataset
+            "val_txt": None,  # Path to val.txt for Estonian dataset
+            
+            # Other parameters
+            "feature_dim": 80,
+            "vocab_size": None,  # Will be set after loading tokenizer
+            "blank_id": None,  # Will be set after loading tokenizer
+            "context_size": 2,
+            "max_duration": 200.0,
+            "random_seed": 42,
             "log_interval": 50,
-            "reset_interval": 200,
-            "valid_interval": 2000,  # Match save_every_n for consistent evaluation
+            "valid_interval": 2000,
             "save_every_n": 2000,
             "keep_last_k": 20,
             "average_period": 100,
             "use_fp16": False,
             "epoch": 1,
-            "return_encoder_output": False,  # used only during inference
-            "return_boundaries": False,  # used only during inference
-            "use_averaged_model": False,  # used only during inference
-            "dataset": "librispeech",  # "librispeech" or "estonian"
-            "train_txt": None,  # Path to train.txt for Estonian dataset
-            "val_txt": None,  # Path to val.txt for Estonian dataset
+            "return_encoder_output": False,
+            "return_boundaries": False,
+            "use_averaged_model": False,
+            
+            # Experiment directory
+            "exp_dir": Path("pruned_transducer_stateless7_streaming/exp"),
+            "lang_dir": Path("data/lang_bpe_2500"),
+            "vocab_file": "data/lang_bpe_2500/tokens.txt",
         }
     )
     return params
@@ -764,8 +760,8 @@ def compute_loss(
     batch: dict,
     is_training: bool,
 ) -> Tuple[Tensor, MetricsTracker]:
-    """
-    Compute transducer loss given the model and its inputs.
+    """Compute transducer loss.
+    
     Args:
       params:
         It is returned by :func:`get_params`.
@@ -779,30 +775,22 @@ def compute_loss(
       is_training:
         True for training, False for validation.
     """
-    device = next(model.parameters()).device
+    device = model.device
     feature = batch["inputs"]
-    # at entry, feature is (N, T, C)
-    assert feature.ndim == 3
-    feature = feature.to(device)
-
-    supervisions = batch["supervisions"]
-    feature_lens = supervisions["num_frames"].to(device)
-
-    texts = batch["supervisions"]["text"]
-    y = sp.encode(texts, out_type=int)
-    y = k2.RaggedTensor(y).to(device)
-
+    feature_lens = batch["supervisions"]["num_frames"]
+    y = batch["supervisions"]["text"]
+    
     with torch.set_grad_enabled(is_training):
         simple_loss, pruned_loss = None, None
         streaming_loss = torch.tensor([0.0], device=device)
-
+        
         if is_training and params.use_xlsr:
             # Get random chunk size during training
             chunk_size = model.encoder.get_random_chunk_size()
             chunks = model.encoder.prepare_chunks(feature, chunk_size)
             encoder_out_chunks = []
             prev_chunk_last = None
-
+            
             # Process each chunk
             for chunk in chunks:
                 chunk_len = torch.tensor([chunk.shape[1]], dtype=torch.int32, device=device)
@@ -818,7 +806,7 @@ def compute_loss(
                     prev_chunk_last = chunk_out[:, -1:, :]
                 
                 encoder_out_chunks.append(chunk_out)
-
+            
             # Concatenate chunks
             encoder_out = torch.cat(encoder_out_chunks, dim=1)
             
@@ -828,19 +816,19 @@ def compute_loss(
         else:
             # Regular forward pass for validation or non-XLSR
             encoder_out, _ = model.encoder(feature, feature_lens)
-
+        
         # Get decoder output
         decoder_out = model.decoder(y)
         
         # Compute joiner output
         joiner_out = model.joiner(encoder_out, decoder_out)
-
+        
         # Compute losses
         simple_loss = model.simple_loss(joiner_out, y)
         
         if params.batch_idx_train > params.model_warm_step:
             pruned_loss = model.pruned_loss(joiner_out, y)
-
+        
         # Combine losses
         loss = simple_loss
         if pruned_loss is not None:
@@ -849,14 +837,14 @@ def compute_loss(
         # Add streaming regularization if training with XLSR
         if is_training and params.use_xlsr:
             loss += params.streaming_regularization * streaming_loss
-
+    
     assert loss.requires_grad == is_training
-
+    
     info = MetricsTracker()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
-
+    
     # Note: We use reduction=sum while computing the loss.
     info["loss"] = loss.detach().cpu().item()
     if simple_loss is not None:
@@ -865,7 +853,7 @@ def compute_loss(
         info["pruned_loss"] = pruned_loss.detach().cpu().item()
     if streaming_loss.item() != 0:
         info["streaming_loss"] = streaming_loss.detach().cpu().item()
-
+    
     return loss, info
 
 
@@ -1001,39 +989,28 @@ def train_one_epoch(
     world_size: int = 1,
     rank: int = 0,
 ) -> None:
-    """Train the model for one epoch.
-
-    The training loss from the mean of all frames is saved in
-    `params.train_loss`. It runs the validation process every
-    `params.valid_interval` batches.
-
-    Args:
-      params:
-        It is returned by :func:`get_params`.
-      model:
-        The model for training.
-      optimizer:
-        The optimizer we are using.
-      scheduler:
-        The learning rate scheduler, we call step() every step.
-      train_dl:
-        Dataloader for the training dataset.
-      valid_dl:
-        Dataloader for the validation dataset.
-      scaler:
-        The scaler used for mix precision training.
-      model_avg:
-        The stored model averaged from the start of training.
-      tb_writer:
-        Writer to write log messages to tensorboard.
-      world_size:
-        Number of nodes in DDP training. If it is 1, DDP is disabled.
-      rank:
-        The rank of the node in DDP training. If no DDP is used, it should
-        be set to 0.
-    """
+    """Train the model for one epoch."""
+    params.batch_idx_train = 0
     model.train()
-
+    
+    # Progressive unfreezing for XLSR
+    if params.use_xlsr:
+        cur_epoch = params.cur_epoch
+        # Initially freeze all encoder layers
+        for layer in model.encoder.model.encoder.layers:
+            layer.requires_grad_(False)
+        
+        # Unfreeze last 4 layers initially
+        for layer in model.encoder.model.encoder.layers[-4:]:
+            layer.requires_grad_(True)
+        
+        # Check unfreeze schedule
+        for epoch, num_layers in params.unfreeze_schedule:
+            if cur_epoch >= epoch:
+                # Unfreeze specified number of layers from the end
+                for layer in model.encoder.model.encoder.layers[-num_layers:]:
+                    layer.requires_grad_(True)
+    
     tot_loss = MetricsTracker()
 
     for batch_idx, batch in enumerate(train_dl):

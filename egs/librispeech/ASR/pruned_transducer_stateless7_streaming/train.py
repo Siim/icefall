@@ -87,6 +87,7 @@ from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
 from torch import amp
 import editdistance
 import random
+import re
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -480,6 +481,12 @@ def get_params() -> AttributeDict:
             "attention_sink_size": 16,  # Paper's optimal setting
             "left_context_chunks": 1,  # Paper's optimal setting
             
+            # Decoding parameters
+            "temperature": 1.0,  # Temperature for softmax scaling
+            "min_active_states": 30,  # Minimum active FSA states
+            "max_active_states": 10000,  # Maximum active FSA states
+            "beam": 20.0,  # Beam size for pruning
+            
             # Training parameters
             "streaming_regularization": 0.1,  # Weight for streaming regularization loss
             "batch_size": 4,  # Adjust based on your GPU memory
@@ -516,6 +523,10 @@ def get_params() -> AttributeDict:
             "return_encoder_output": False,
             "return_boundaries": False,
             "use_averaged_model": False,
+            
+            # Best metrics tracking
+            "best_valid_wer": float("inf"),
+            "best_valid_epoch": 0,
             
             # Experiment directory
             "exp_dir": Path("pruned_transducer_stateless7_streaming/exp"),
@@ -945,9 +956,11 @@ def compute_validation_loss(
 ) -> MetricsTracker:
     """Run the validation process."""
     model.eval()
-
     tot_loss = MetricsTracker()
-
+    
+    # Initialize WER computer
+    wer = WERComputer()
+    
     for batch_idx, batch in enumerate(valid_dl):
         loss, loss_info = compute_loss(
             params=params,
@@ -956,23 +969,190 @@ def compute_validation_loss(
             batch=batch,
             is_training=False,
         )
-        assert loss.requires_grad is False
-        tot_loss = tot_loss + loss_info
         
-        # Decode samples when we would save a checkpoint
-        if batch_idx == 0:
-            logging.info(f"\nDecoding samples from validation batch {batch_idx}")
-            decode_batch(params, model, sp, batch)
-
+        # Compute WER for this batch
+        if params.use_xlsr:
+            # Get encoder output
+            feature = batch["inputs"].to(model.device)
+            feature_lens = batch["supervisions"]["num_frames"].to(model.device)
+            
+            # Non-streaming forward pass for validation
+            encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
+            
+            # Decode with beam search
+            hyps = decode_with_beam_search(
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+                params=params,
+                sp=sp,
+                decoding_graph=params.decoding_graph if hasattr(params, "decoding_graph") else None
+            )
+            
+            # Get reference texts
+            refs = batch["supervisions"]["text"]
+            
+            # Update WER stats
+            for ref, hyp in zip(refs, hyps):
+                wer.add_sentence(ref, hyp)
+        
+        tot_loss = tot_loss + loss_info
+    
     if world_size > 1:
         tot_loss.reduce(loss.device)
-
+        
     loss_value = tot_loss["loss"] / tot_loss["frames"]
-    if loss_value < params.best_valid_loss:
-        params.best_valid_epoch = params.cur_epoch
-        params.best_valid_loss = loss_value
-
+    
+    # Get final WER
+    if params.use_xlsr:
+        wer_stats = wer.get_stats()
+        logging.info(f"WER: {wer_stats['wer']:.2f}%")
+        logging.info(f"Number of words: {wer_stats['num_words']}")
+        logging.info(f"Number of errors: {wer_stats['num_errors']}")
+        
+        if hasattr(params, "best_valid_wer"):
+            if wer_stats["wer"] < params.best_valid_wer:
+                params.best_valid_wer = wer_stats["wer"]
+                params.best_valid_epoch = params.cur_epoch
+    
     return tot_loss
+
+
+class WERComputer:
+    """Compute Word Error Rate."""
+    def __init__(self):
+        self.total_words = 0
+        self.total_errors = 0
+        
+    def add_sentence(self, ref: str, hyp: str) -> None:
+        """Add a sentence pair to WER computation.
+        
+        Args:
+            ref: Reference text
+            hyp: Hypothesis text
+        """
+        # Normalize texts
+        ref = self._normalize_text(ref)
+        hyp = self._normalize_text(hyp)
+        
+        # Split into words
+        ref_words = ref.split()
+        hyp_words = hyp.split()
+        
+        # Compute Levenshtein distance
+        distance = self._levenshtein_distance(ref_words, hyp_words)
+        
+        # Update statistics
+        self.total_words += len(ref_words)
+        self.total_errors += distance
+    
+    def get_stats(self) -> Dict[str, Union[float, int]]:
+        """Get WER statistics.
+        
+        Returns:
+            Dictionary containing:
+                - wer: Word Error Rate as percentage
+                - num_words: Total number of words
+                - num_errors: Total number of errors
+        """
+        wer = (self.total_errors / self.total_words * 100) if self.total_words > 0 else float("inf")
+        return {
+            "wer": wer,
+            "num_words": self.total_words,
+            "num_errors": self.total_errors
+        }
+    
+    def _normalize_text(self, text: str) -> str:
+        """Normalize text for WER computation."""
+        # Convert to lowercase
+        text = text.lower()
+        # Remove multiple spaces
+        text = " ".join(text.split())
+        # Remove punctuation except apostrophes
+        text = re.sub(r'[^\w\s\']', '', text)
+        return text
+    
+    def _levenshtein_distance(self, s1: List[str], s2: List[str]) -> int:
+        """Compute Levenshtein distance between two word lists."""
+        if len(s1) < len(s2):
+            return self._levenshtein_distance(s2, s1)
+        
+        if len(s2) == 0:
+            return len(s1)
+        
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+        
+        return previous_row[-1]
+
+def decode_with_beam_search(
+    encoder_out: torch.Tensor,
+    encoder_out_lens: torch.Tensor,
+    params: AttributeDict,
+    sp: spm.SentencePieceProcessor,
+    decoding_graph: Optional[k2.Fsa] = None,
+) -> List[str]:
+    """Decode with beam search and FSA.
+    
+    Args:
+        encoder_out: Output from encoder (B, T, C)
+        encoder_out_lens: Length of each sequence
+        params: Parameters
+        sp: SentencePiece tokenizer
+        decoding_graph: Optional FSA graph for decoding
+    
+    Returns:
+        List of decoded texts
+    """
+    device = encoder_out.device
+    batch_size = encoder_out.size(0)
+    
+    # Convert encoder output to log probabilities
+    log_probs = torch.nn.functional.log_softmax(encoder_out / params.temperature, dim=-1)
+    
+    # Create supervision for dense intersection
+    supervision = torch.tensor([[0, encoder_out.size(1)]], device=device)
+    dense_fsa = k2.DenseFsaVec(log_probs, supervision)
+    
+    # If no decoding graph provided, create a simple one
+    if decoding_graph is None:
+        decoding_graph = k2.trivial_graph(params.vocab_size, device=device)
+    
+    # Ensure graph is on correct device and sorted
+    if decoding_graph.device != device:
+        decoding_graph = decoding_graph.to(device)
+    decoding_graph = k2.arc_sort(decoding_graph)
+    
+    # Intersect with decoding graph
+    lattice = k2.intersect_dense_pruned(
+        decoding_graph,
+        dense_fsa,
+        search_beam=params.beam,
+        output_beam=params.beam,
+        min_active_states=params.min_active_states,
+        max_active_states=params.max_active_states
+    )
+    
+    # Get best path
+    best_path = k2.shortest_path(lattice, use_double_scores=True)
+    
+    # Extract tokens and convert to text
+    hyps = []
+    for i in range(batch_size):
+        tokens = []
+        for arc in best_path[i].arcs:
+            if arc.label != 0:  # Skip epsilon transitions
+                tokens.append(arc.label)
+        text = sp.decode(tokens)
+        hyps.append(text)
+    
+    return hyps
 
 
 def train_one_epoch(

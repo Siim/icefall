@@ -10,8 +10,23 @@ from typing import Optional, List, Tuple
 from icefall.utils import make_pad_mask
 import math
 
-# Import EncoderInterface from icefall
-from encoder_interface import EncoderInterface
+class EncoderInterface(nn.Module):
+    """Interface for encoders used in transducer models"""
+    def __init__(self) -> None:
+        super().__init__()
+        self.output_dim = 0  # Must be set by implementing class
+        
+    def forward(self, x: torch.Tensor, x_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: Input tensor (batch, time) or (batch, time, 1)
+            x_lens: Length of each sequence in the batch
+        Returns:
+            (output, output_lens)
+            output: (batch, time', output_dim)
+            output_lens: (batch,)
+        """
+        raise NotImplementedError
 
 class XLSREncoder(EncoderInterface):
     def __init__(
@@ -262,44 +277,4 @@ class XLSREncoder(EncoderInterface):
         output_lengths = ((x_lens.float() / self.downsample_factor).floor()).to(torch.int64)
         output_lengths = torch.maximum(output_lengths, torch.ones_like(output_lengths))
         
-        return outputs, output_lengths
-
-    def prepare_chunks(self, x: torch.Tensor, chunk_size: int) -> List[torch.Tensor]:
-        """
-        Prepare input into chunks for streaming processing.
-        Args:
-            x: Input tensor (batch, time) or (batch, time, 1)
-            chunk_size: Size of each chunk in samples
-        Returns:
-            List of chunks, each of shape (batch, chunk_size)
-        """
-        # Ensure input is 2D
-        if x.ndim == 3:
-            x = x.squeeze(-1)
-        assert x.ndim == 2, f"Expected 2D input (batch, time), got shape {x.shape}"
-        
-        # Calculate overlap size
-        overlap = self.chunk_overlap
-        
-        # Initialize chunks list
-        chunks = []
-        
-        # Process in chunks with overlap
-        current = 0
-        while current < x.size(1):
-            end = min(current + chunk_size, x.size(1))
-            chunk = x[:, current:end]
-            
-            # Add padding if needed for last chunk
-            if chunk.size(1) < chunk_size:
-                pad_size = chunk_size - chunk.size(1)
-                chunk = torch.nn.functional.pad(chunk, (0, pad_size))
-            
-            chunks.append(chunk)
-            
-            # Move to next chunk considering overlap
-            if end == x.size(1):  # Last chunk
-                break
-            current = end - overlap
-        
-        return chunks 
+        return outputs, output_lengths 

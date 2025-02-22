@@ -55,9 +55,8 @@ import k2
 import optim
 import sentencepiece as spm
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.multiprocessing as mp
+import torch.nn as nn
 from asr_datamodule import LibriSpeechAsrDataModule
 from decoder import Decoder
 from joiner import Joiner
@@ -475,39 +474,26 @@ def get_params() -> AttributeDict:
             "nhead": 8,
             "attention_dim": 512,
             "num_decoder_layers": 6,
-            
-            # parameters for streaming (from paper)
-            "decode_chunk_size": 5120,  # 320ms at 16kHz (optimal)
-            "chunk_sizes": {
-                "320ms": 5120,   # 16 frames
-                "640ms": 10240,  # 32 frames
-                "1280ms": 20480, # 64 frames
-                "2560ms": 40960  # 128 frames
-            },
-            "use_attention_sink": True,
-            "attention_sink_size": 16,  # Paper's optimal setting
-            "left_context_chunks": 1,  # Paper's optimal setting
-            "streaming_regularization": 0.1,  # Weight for streaming regularization
-            
+            # parameters for streaming
+            "decode_chunk_size": 16,  # in frames
+            "pad_length": 30,  # in frames
             # parameters for Noam
             "model_warm_step": 3000,  # arg given to model, not for lrate
             "env_info": get_env_info(),
             "use_xlsr": False,  # Whether to use XLSR encoder
-            "xlsr_model_name": "facebook/wav2vec2-xls-r-300m",
-            
+            "xlsr_model_name": "facebook/wav2vec2-xls-r-300m",  # XLSR model to use
+            "streaming_regularization": 0.1,  # Weight for streaming regularization loss
             # parameters for loss
             "simple_loss_scale": 0.5,
             "prune_range": 5,
             "lm_scale": 0.25,
             "am_scale": 0.0,
-            
             # parameters for decoding
             "search_beam": 20,
             "output_beam": 8,
             "min_active_states": 30,
             "max_active_states": 10000,
             "use_double_scores": True,
-            
             # parameters for training
             "context_size": 2,
             "max_duration": 200.0,
@@ -522,24 +508,6 @@ def get_params() -> AttributeDict:
             "exp_dir": Path("pruned_transducer_stateless7_streaming/exp"),
             "lang_dir": Path("data/lang_bpe_2500"),
             "vocab_file": "data/lang_bpe_2500/tokens.txt",  # Path to vocabulary file
-            
-            # Training parameters from paper
-            "base_lr": 1e-3,
-            "warmup_steps": 10000,
-            "min_lr": 1e-5,
-            "lr_decay": "linear",  # Linear decay after warmup
-            
-            # Optimizer settings from paper
-            "adam_betas": (0.9, 0.98),
-            "adam_eps": 1e-6,
-            "weight_decay": 0.01,
-            "grad_clip": 5.0,
-            
-            # Multi-chunk training
-            "min_chunks": 2,  # Minimum chunks per sequence
-            "max_chunks": 4,  # Maximum chunks per sequence
-            
-            # Other training parameters
             "lr": 1e-3,
             "weight_decay": 1e-6,
             "warm_step": 2000,
@@ -796,8 +764,24 @@ def compute_loss(
     batch: dict,
     is_training: bool,
 ) -> Tuple[Tensor, MetricsTracker]:
+    """
+    Compute transducer loss given the model and its inputs.
+    Args:
+      params:
+        It is returned by :func:`get_params`.
+      model:
+        The model for training.
+      sp:
+        The BPE model.
+      batch:
+        A batch of data. See `lhotse.dataset.K2SpeechRecognitionDataset()`
+        for the content in it.
+      is_training:
+        True for training, False for validation.
+    """
     device = next(model.parameters()).device
     feature = batch["inputs"]
+    # at entry, feature is (N, T, C)
     assert feature.ndim == 3
     feature = feature.to(device)
 
@@ -814,7 +798,7 @@ def compute_loss(
 
         if is_training and params.use_xlsr:
             # Get random chunk size during training
-            chunk_size = random.choice(list(params.chunk_sizes.values()))
+            chunk_size = model.encoder.get_random_chunk_size()
             chunks = model.encoder.prepare_chunks(feature, chunk_size)
             encoder_out_chunks = []
             prev_chunk_last = None
@@ -830,7 +814,6 @@ def compute_loss(
                     # Subsequent chunks - compute streaming regularization
                     chunk_out, _, states = model.encoder.streaming_forward(chunk, chunk_len, states)
                     curr_chunk_first = chunk_out[:, :1, :]
-                    # Compute transition loss between chunks
                     streaming_loss += F.mse_loss(prev_chunk_last, curr_chunk_first)
                     prev_chunk_last = chunk_out[:, -1:, :]
                 
@@ -874,6 +857,7 @@ def compute_loss(
         warnings.simplefilter("ignore")
         info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
 
+    # Note: We use reduction=sum while computing the loss.
     info["loss"] = loss.detach().cpu().item()
     if simple_loss is not None:
         info["simple_loss"] = simple_loss.detach().cpu().item()
@@ -892,7 +876,18 @@ def decode_batch(
     batch: dict,
     max_decode_samples: int = 4,
 ) -> List[Tuple[str, str, float]]:
-    """Decode a random subset of the batch and compute WER for monitoring."""
+    """Decode a random subset of the batch and compute WER for monitoring.
+    
+    Args:
+        params: Training parameters
+        model: The model to use for decoding
+        sp: SentencePiece tokenizer
+        batch: Current batch of data
+        max_decode_samples: Maximum number of samples to decode
+        
+    Returns:
+        List of tuples containing (reference, hypothesis, WER)
+    """
     model.eval()
     device = next(model.parameters()).device
     
@@ -905,48 +900,7 @@ def decode_batch(
         features = batch["inputs"][indices].to(device)
         feature_lens = batch["supervisions"]["num_frames"][indices].to(device)
         
-        # Add right context for streaming
-        feature_lens += params.attention_sink_size
-        feature = torch.nn.functional.pad(
-            features,
-            pad=(0, 0, 0, params.attention_sink_size),
-            value=LOG_EPS,
-        )
-        
-        # Get encoder output with streaming settings
-        if hasattr(model.encoder, 'streaming_forward'):
-            # Initialize streaming state
-            states = model.encoder.get_init_state(device)
-            
-            # Process in chunks
-            current = 0
-            encoder_out_chunks = []
-            chunk_overlap = params.decode_chunk_len // 2
-            
-            while current < feature.size(1):
-                end = min(current + params.decode_chunk_len, feature.size(1))
-                chunk = feature[:, current:end]
-                chunk_len = torch.tensor([chunk.shape[1]], dtype=torch.int32, device=device)
-                
-                # Process chunk with streaming forward
-                chunk_out, chunk_lens, states = model.encoder.streaming_forward(
-                    chunk, 
-                    chunk_len, 
-                    states
-                )
-                encoder_out_chunks.append(chunk_out)
-                
-                # Move to next chunk considering overlap
-                if end == feature.size(1):  # Last chunk
-                    break
-                current = end - chunk_overlap
-            
-            # Concatenate chunks
-            encoder_out = torch.cat(encoder_out_chunks, dim=1)
-            encoder_out_lens = torch.tensor([encoder_out.size(1)], dtype=torch.int32, device=device)
-        else:
-            # Fallback to regular forward pass
-            encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
+        encoder_out, encoder_out_lens = model.encoder(x=features, x_lens=feature_lens)
         
         # Log encoder output statistics
         logging.info(f"\nEncoder output stats:")
@@ -957,37 +911,21 @@ def decode_batch(
         logging.info(f"Max: {encoder_out.max().item():.3f}")
         
         hyps = []
-        # Use FSA decoding for Estonian
-        if params.dataset == "estonian" and hasattr(model, "decoding_graph"):
-            from estonian_decoder import fast_beam_search_one_best
-            hyp_tokens = fast_beam_search_one_best(
-                model=model,
-                encoder_out=encoder_out,
-                encoder_out_lens=encoder_out_lens,
-                beam=40.0,  # Paper's optimal setting
-                max_states=128,  # Paper's optimal setting
-                max_contexts=16,  # Paper's optimal setting
-                decoding_graph=model.decoding_graph.to(device)
-            )
-            for hyp in hyp_tokens:
-                hyps.append([model.decoder.token_table[i] for i in hyp])
-        else:
-            # Fallback to greedy search for quick monitoring
-            hyp_tokens = greedy_search_batch(
-                model=model,
-                encoder_out=encoder_out,
-                encoder_out_lens=encoder_out_lens
-            )
-            for tokens in hyp_tokens:
-                text = sp.decode(tokens)
-                hyps.append(text.split())
+        # Use greedy search for quick monitoring
+        hyp_tokens = greedy_search_batch(
+            model=model,
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens
+        )
         
         total_words = 0
         total_errors = 0
-        results = []
         
-        for i, hyp_words in enumerate(hyps):
+        for i, tokens in enumerate(hyp_tokens):
+            # Convert token IDs to text - tokens is already a list
+            text = sp.decode(tokens)
             ref = texts[i]
+            hyp_words = text.split()
             ref_words = ref.split()
             # Compute WER for this sample
             errors = editdistance.eval(ref_words, hyp_words)
@@ -997,9 +935,9 @@ def decode_batch(
             total_errors += errors
             
             logging.info(f"\nReference: {ref}")
-            logging.info(f"Hypothesis: {' '.join(hyp_words)}")
+            logging.info(f"Hypothesis: {text}")
             logging.info(f"Sample WER: {wer:.1f}%")
-            results.append((ref, ' '.join(hyp_words), wer))
+            hyps.append((ref, text, wer))
             
         # Log overall WER for this batch
         if total_words > 0:
@@ -1007,7 +945,7 @@ def decode_batch(
             logging.info(f"\nBatch WER: {batch_wer:.1f}% (Total words: {total_words}, Total errors: {total_errors})")
     
     model.train()
-    return results
+    return hyps
 
 
 def compute_validation_loss(
@@ -1063,26 +1001,40 @@ def train_one_epoch(
     world_size: int = 1,
     rank: int = 0,
 ) -> None:
-    """Train the model for one epoch."""
+    """Train the model for one epoch.
+
+    The training loss from the mean of all frames is saved in
+    `params.train_loss`. It runs the validation process every
+    `params.valid_interval` batches.
+
+    Args:
+      params:
+        It is returned by :func:`get_params`.
+      model:
+        The model for training.
+      optimizer:
+        The optimizer we are using.
+      scheduler:
+        The learning rate scheduler, we call step() every step.
+      train_dl:
+        Dataloader for the training dataset.
+      valid_dl:
+        Dataloader for the validation dataset.
+      scaler:
+        The scaler used for mix precision training.
+      model_avg:
+        The stored model averaged from the start of training.
+      tb_writer:
+        Writer to write log messages to tensorboard.
+      world_size:
+        Number of nodes in DDP training. If it is 1, DDP is disabled.
+      rank:
+        The rank of the node in DDP training. If no DDP is used, it should
+        be set to 0.
+    """
     model.train()
 
     tot_loss = MetricsTracker()
-
-    # After model initialization
-    if params.use_xlsr:
-        # Gradually unfreeze layers
-        for layer in model.encoder.model.encoder.layers:
-            layer.requires_grad_(False)
-            
-        # Unfreeze last 4 layers initially
-        for layer in model.encoder.model.encoder.layers[-4:]:
-            layer.requires_grad_(True)
-            
-        # Schedule more layers to unfreeze later
-        scheduler.unfreeze_schedule = [
-            (10, 8),  # At epoch 10, unfreeze 8 more layers
-            (20, 12)  # At epoch 20, unfreeze all
-        ]
 
     for batch_idx, batch in enumerate(train_dl):
         params.batch_idx_train += 1
@@ -1222,6 +1174,22 @@ def train_one_epoch(
         params.best_train_epoch = params.cur_epoch
         params.best_train_loss = params.train_loss
 
+    # After model initialization
+    if params.use_xlsr:
+        # Gradually unfreeze layers
+        for layer in model.encoder.model.encoder.layers:
+            layer.requires_grad_(False)
+            
+        # Unfreeze last 4 layers initially
+        for layer in model.encoder.model.encoder.layers[-4:]:
+            layer.requires_grad_(True)
+            
+        # Schedule more layers to unfreeze later
+        scheduler.unfreeze_schedule = [
+            (10, 8),  # At epoch 10, unfreeze 8 more layers
+            (20, 12)  # At epoch 20, unfreeze all
+        ]
+
 
 def run(rank, world_size, args):
     """
@@ -1291,7 +1259,16 @@ def run(rank, world_size, args):
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
-    optimizer = get_optimizer(model, params)
+    parameters_names = []
+    parameters_names.append(
+        [name_param_pair[0] for name_param_pair in model.named_parameters()]
+    )
+    optimizer = ScaledAdam(
+        model.parameters(),
+        lr=params.base_lr,
+        clipping_scale=2.0,
+        parameters_names=parameters_names,
+    )
 
     scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
 
@@ -1545,7 +1522,12 @@ def run_accelerate(accelerator, args):
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
 
-    optimizer = get_optimizer(model, params)
+    optimizer = ScaledAdam(
+        model.parameters(),
+        lr=params.base_lr,
+        clipping_scale=2.0,
+        parameters_names=[ [name for name, _ in model.named_parameters()] ]
+    )
     scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
 
     # Data loading
@@ -1636,23 +1618,6 @@ def run_accelerate(accelerator, args):
             )
 
     logging.info("Training completed (Accelerate Mode)!")
-
-
-def get_optimizer(model: nn.Module, params: AttributeDict) -> ScaledAdam:
-    parameters_names = []
-    parameters_names.append(
-        [name_param_pair[0] for name_param_pair in model.named_parameters()]
-    )
-    
-    optimizer = ScaledAdam(
-        model.parameters(),
-        lr=params.base_lr,
-        betas=params.adam_betas,
-        eps=params.adam_eps,
-        clipping_scale=2.0,
-        parameters_names=parameters_names
-    )
-    return optimizer
 
 
 def main():

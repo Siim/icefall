@@ -367,7 +367,7 @@ def get_parser():
     parser.add_argument(
         "--beam",
         type=float,
-        default=40.0,
+        default=20.0,
         help="""A floating point value to calculate the cutoff score during beam
         search (i.e., `cutoff = max-score - beam`), which is the same as the
         `beam` in Kaldi.
@@ -390,7 +390,7 @@ def get_parser():
     parser.add_argument(
         "--max-contexts",
         type=int,
-        default=16,
+        default=8,
         help="""Used only when --decoding-method is
         fast_beam_search, fast_beam_search_nbest, fast_beam_search_nbest_LG,
         and fast_beam_search_nbest_oracle""",
@@ -399,7 +399,7 @@ def get_parser():
     parser.add_argument(
         "--max-states",
         type=int,
-        default=128,
+        default=64,
         help="""Used only when --decoding-method is
         fast_beam_search, fast_beam_search_nbest, fast_beam_search_nbest_LG,
         and fast_beam_search_nbest_oracle""",
@@ -507,34 +507,6 @@ def get_parser():
         help="Batch size for decoding (used only with Estonian dataset)",
     )
 
-    parser.add_argument(
-        "--decode-chunk-len",
-        type=int,
-        default=5120,  # 320ms at 16kHz (paper's optimal setting)
-        help="The chunk size for decoding (in frames before subsampling)",
-    )
-
-    parser.add_argument(
-        "--use-attention-sink",
-        type=str2bool,
-        default=True,
-        help="Whether to use attention sink mechanism",
-    )
-
-    parser.add_argument(
-        "--attention-sink-size",
-        type=int,
-        default=16,  # Paper's optimal setting
-        help="Number of attention sink frames",
-    )
-
-    parser.add_argument(
-        "--left-context-chunks",
-        type=int,
-        default=1,  # Paper's optimal setting
-        help="Number of left context chunks to use",
-    )
-
     add_model_arguments(parser)
 
     return parser
@@ -554,47 +526,15 @@ def decode_one_batch(
     feature_lens = batch["supervisions"]["num_frames"].to(device)
     
     # Add right context for streaming
-    feature_lens += params.attention_sink_size
+    feature_lens += 30
     feature = torch.nn.functional.pad(
         feature,
-        pad=(0, 0, 0, params.attention_sink_size),
+        pad=(0, 0, 0, 30),
         value=LOG_EPS,
     )
     
-    # Get encoder output with streaming settings
-    if hasattr(model.encoder, 'streaming_forward'):
-        # Initialize streaming state
-        states = model.encoder.get_init_state(device)
-        
-        # Process in chunks
-        current = 0
-        encoder_out_chunks = []
-        chunk_overlap = params.decode_chunk_len // 2
-        
-        while current < feature.size(1):
-            end = min(current + params.decode_chunk_len, feature.size(1))
-            chunk = feature[:, current:end]
-            chunk_len = torch.tensor([chunk.shape[1]], dtype=torch.int32, device=device)
-            
-            # Process chunk with streaming forward
-            chunk_out, chunk_lens, states = model.encoder.streaming_forward(
-                chunk, 
-                chunk_len, 
-                states
-            )
-            encoder_out_chunks.append(chunk_out)
-            
-            # Move to next chunk considering overlap
-            if end == feature.size(1):  # Last chunk
-                break
-            current = end - chunk_overlap
-        
-        # Concatenate chunks
-        encoder_out = torch.cat(encoder_out_chunks, dim=1)
-        encoder_out_lens = torch.tensor([encoder_out.size(1)], dtype=torch.int32, device=device)
-    else:
-        # Fallback to regular forward pass
-        encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
+    # Get encoder output
+    encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
     
     hyps = []
     

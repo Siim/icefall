@@ -118,7 +118,7 @@ class EstonianDecoder(nn.Module):
         
         if isinstance(y, k2.RaggedTensor):
             # Convert RaggedTensor to dense tensor
-            values = y.values()
+            values = y.values  # This is a property, not a method
             row_splits = y.row_splits(1)
             batch_size = y.dim0
             
@@ -138,6 +138,9 @@ class EstonianDecoder(nn.Module):
                 dense_tensor[i, :seq_len] = values[start:end]
             
             y = dense_tensor
+        else:
+            # If it's already a tensor, just ensure it's on the right device
+            y = y.to(device)
         
         # Handle padding if needed (for context size)
         if need_pad and y.shape[1] < self.context_size:

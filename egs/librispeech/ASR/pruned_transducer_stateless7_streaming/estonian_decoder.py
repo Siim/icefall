@@ -117,41 +117,13 @@ class EstonianDecoder(nn.Module):
         device = next(self.parameters()).device
         
         if isinstance(y, k2.RaggedTensor):
-            # Convert RaggedTensor to dense tensor
-            values = y.values  # Get values
-            batch_size = y.num_axes()[0]  # Get batch size
+            # Get values and shape info
+            values = y.values
+            batch_size = y.shape[0]  # First dimension is batch size
             
-            # Get row splits using row_ids
-            row_ids = y.row_ids(1)  # Get row IDs for axis 1
-            row_splits = [0]  # Start with 0
-            current_row = 0
-            current_count = 0
-            
-            # Count elements in each row
-            for rid in row_ids:
-                if rid != current_row:
-                    row_splits.append(current_count)
-                    current_row = rid
-                current_count += 1
-            row_splits.append(current_count)  # Add final count
-            
-            # Create dense tensor with padding
-            max_len = max(row_splits[i+1] - row_splits[i] for i in range(batch_size))
-            dense_tensor = torch.full(
-                (batch_size, max_len),
-                self.blank_id,
-                dtype=torch.int64,
-                device=device
-            )
-            
-            # Fill in values
-            for i in range(batch_size):
-                start, end = row_splits[i], row_splits[i+1]
-                seq_len = end - start
-                if seq_len > 0:  # Only fill if we have values
-                    dense_tensor[i, :seq_len] = values[start:end]
-            
-            y = dense_tensor
+            # Convert to padded tensor directly using k2's utilities
+            y = k2.ragged.pad(y, mode='constant', padding_value=self.blank_id)
+            y = y.to(device)
         else:
             # If it's already a tensor, just ensure it's on the right device
             y = y.to(device)

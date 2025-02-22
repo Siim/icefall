@@ -521,6 +521,24 @@ def get_params() -> AttributeDict:
             "exp_dir": Path("pruned_transducer_stateless7_streaming/exp"),
             "lang_dir": Path("data/lang_bpe_2500"),
             "vocab_file": "data/lang_bpe_2500/tokens.txt",  # Path to vocabulary file
+            
+            # Training parameters from paper
+            "base_lr": 1e-3,
+            "warmup_steps": 10000,
+            "min_lr": 1e-5,
+            "lr_decay": "linear",  # Linear decay after warmup
+            
+            # Optimizer settings from paper
+            "adam_betas": (0.9, 0.98),
+            "adam_eps": 1e-6,
+            "weight_decay": 0.01,
+            "grad_clip": 5.0,
+            
+            # Multi-chunk training
+            "min_chunks": 2,  # Minimum chunks per sequence
+            "max_chunks": 4,  # Maximum chunks per sequence
+            
+            # Other training parameters
             "lr": 1e-3,
             "weight_decay": 1e-6,
             "warm_step": 2000,
@@ -777,15 +795,6 @@ def compute_loss(
     batch: dict,
     is_training: bool,
 ) -> Tuple[Tensor, MetricsTracker]:
-    """
-    Compute transducer loss given the model and its inputs.
-    Args:
-      params: Parameters for training
-      model: The model for training
-      sp: The BPE model
-      batch: A batch of data
-      is_training: True for training, False for validation
-    """
     device = next(model.parameters()).device
     feature = batch["inputs"]
     assert feature.ndim == 3
@@ -864,7 +873,6 @@ def compute_loss(
         warnings.simplefilter("ignore")
         info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
 
-    # Note: We use reduction=sum while computing the loss.
     info["loss"] = loss.detach().cpu().item()
     if simple_loss is not None:
         info["simple_loss"] = simple_loss.detach().cpu().item()
@@ -1008,40 +1016,26 @@ def train_one_epoch(
     world_size: int = 1,
     rank: int = 0,
 ) -> None:
-    """Train the model for one epoch.
-
-    The training loss from the mean of all frames is saved in
-    `params.train_loss`. It runs the validation process every
-    `params.valid_interval` batches.
-
-    Args:
-      params:
-        It is returned by :func:`get_params`.
-      model:
-        The model for training.
-      optimizer:
-        The optimizer we are using.
-      scheduler:
-        The learning rate scheduler, we call step() every step.
-      train_dl:
-        Dataloader for the training dataset.
-      valid_dl:
-        Dataloader for the validation dataset.
-      scaler:
-        The scaler used for mix precision training.
-      model_avg:
-        The stored model averaged from the start of training.
-      tb_writer:
-        Writer to write log messages to tensorboard.
-      world_size:
-        Number of nodes in DDP training. If it is 1, DDP is disabled.
-      rank:
-        The rank of the node in DDP training. If no DDP is used, it should
-        be set to 0.
-    """
+    """Train the model for one epoch."""
     model.train()
 
     tot_loss = MetricsTracker()
+
+    # After model initialization
+    if params.use_xlsr:
+        # Gradually unfreeze layers
+        for layer in model.encoder.model.encoder.layers:
+            layer.requires_grad_(False)
+            
+        # Unfreeze last 4 layers initially
+        for layer in model.encoder.model.encoder.layers[-4:]:
+            layer.requires_grad_(True)
+            
+        # Schedule more layers to unfreeze later
+        scheduler.unfreeze_schedule = [
+            (10, 8),  # At epoch 10, unfreeze 8 more layers
+            (20, 12)  # At epoch 20, unfreeze all
+        ]
 
     for batch_idx, batch in enumerate(train_dl):
         params.batch_idx_train += 1
@@ -1181,22 +1175,6 @@ def train_one_epoch(
         params.best_train_epoch = params.cur_epoch
         params.best_train_loss = params.train_loss
 
-    # After model initialization
-    if params.use_xlsr:
-        # Gradually unfreeze layers
-        for layer in model.encoder.model.encoder.layers:
-            layer.requires_grad_(False)
-            
-        # Unfreeze last 4 layers initially
-        for layer in model.encoder.model.encoder.layers[-4:]:
-            layer.requires_grad_(True)
-            
-        # Schedule more layers to unfreeze later
-        scheduler.unfreeze_schedule = [
-            (10, 8),  # At epoch 10, unfreeze 8 more layers
-            (20, 12)  # At epoch 20, unfreeze all
-        ]
-
 
 def run(rank, world_size, args):
     """
@@ -1266,16 +1244,7 @@ def run(rank, world_size, args):
         logging.info("Using DDP")
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
-    parameters_names = []
-    parameters_names.append(
-        [name_param_pair[0] for name_param_pair in model.named_parameters()]
-    )
-    optimizer = ScaledAdam(
-        model.parameters(),
-        lr=params.base_lr,
-        clipping_scale=2.0,
-        parameters_names=parameters_names,
-    )
+    optimizer = get_optimizer(model, params)
 
     scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
 
@@ -1529,12 +1498,7 @@ def run_accelerate(accelerator, args):
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
 
-    optimizer = ScaledAdam(
-        model.parameters(),
-        lr=params.base_lr,
-        clipping_scale=2.0,
-        parameters_names=[ [name for name, _ in model.named_parameters()] ]
-    )
+    optimizer = get_optimizer(model, params)
     scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
 
     # Data loading
@@ -1625,6 +1589,24 @@ def run_accelerate(accelerator, args):
             )
 
     logging.info("Training completed (Accelerate Mode)!")
+
+
+def get_optimizer(model: nn.Module, params: AttributeDict) -> ScaledAdam:
+    parameters_names = []
+    parameters_names.append(
+        [name_param_pair[0] for name_param_pair in model.named_parameters()]
+    )
+    
+    optimizer = ScaledAdam(
+        model.parameters(),
+        lr=params.base_lr,
+        betas=params.adam_betas,
+        eps=params.adam_eps,
+        clipping_scale=2.0,
+        parameters_names=parameters_names,
+        weight_decay=params.weight_decay,
+    )
+    return optimizer
 
 
 def main():

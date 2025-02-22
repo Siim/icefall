@@ -494,6 +494,7 @@ def get_params() -> AttributeDict:
             "lr": 1e-3,
             "weight_decay": 1e-6,
             "warm_step": 2000,
+            "batch_idx_train": 0,  # Initialize batch index counter
             
             # Progressive unfreezing schedule
             "unfreeze_schedule": [
@@ -527,6 +528,8 @@ def get_params() -> AttributeDict:
             # Best metrics tracking
             "best_valid_wer": float("inf"),
             "best_valid_epoch": 0,
+            "best_train_loss": float("inf"),
+            "best_train_epoch": 0,
             
             # Experiment directory
             "exp_dir": Path("pruned_transducer_stateless7_streaming/exp"),

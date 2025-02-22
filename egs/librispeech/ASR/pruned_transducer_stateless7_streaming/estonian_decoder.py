@@ -114,31 +114,37 @@ class EstonianDecoder(nn.Module):
         Returns:
             A 2-D tensor of shape (N, decoder_dim)
         """
+        device = next(self.parameters()).device
+        
         if isinstance(y, k2.RaggedTensor):
             # Convert RaggedTensor to dense tensor
-            dense_list = []
-            for i in range(y.dim0()):
-                # Get values for this sequence
-                seq = y[i].values.tolist()
-                dense_list.append(seq)
+            values = y.values()
+            row_splits = y.row_splits(1)
+            batch_size = y.dim0
             
-            # Pad sequences to same length
-            max_len = max(len(seq) for seq in dense_list)
-            y_padded = []
-            for seq in dense_list:
-                if len(seq) < max_len:
-                    seq = seq + [self.blank_id] * (max_len - len(seq))
-                y_padded.append(seq)
+            # Create dense tensor with padding
+            max_len = max(row_splits[i+1] - row_splits[i] for i in range(batch_size))
+            dense_tensor = torch.full(
+                (batch_size, max_len),
+                self.blank_id,
+                dtype=torch.int64,
+                device=device
+            )
             
-            # Convert to tensor on same device as RaggedTensor
-            y = torch.tensor(y_padded, device=y.device)
+            # Fill in values
+            for i in range(batch_size):
+                start, end = row_splits[i], row_splits[i+1]
+                seq_len = end - start
+                dense_tensor[i, :seq_len] = values[start:end]
+            
+            y = dense_tensor
         
         # Handle padding if needed (for context size)
         if need_pad and y.shape[1] < self.context_size:
             padding = torch.full(
                 (y.shape[0], self.context_size - y.shape[1]),
                 self.blank_id,
-                device=y.device,
+                device=device,
                 dtype=y.dtype
             )
             y = torch.cat([padding, y], dim=1)

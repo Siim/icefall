@@ -16,6 +16,7 @@
 
 
 import random
+from typing import Tuple
 
 import k2
 import torch
@@ -79,6 +80,11 @@ class Transducer(nn.Module):
         )
         self.simple_lm_proj = nn.Linear(decoder_dim, vocab_size)
 
+        self.encoder_dim = encoder_dim
+        self.decoder_dim = decoder_dim
+        self.joiner_dim = joiner_dim
+        self.vocab_size = vocab_size
+
     def forward(
         self,
         x: torch.Tensor,
@@ -87,7 +93,7 @@ class Transducer(nn.Module):
         prune_range: int = 5,
         am_scale: float = 0.0,
         lm_scale: float = 0.0,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
           x:
@@ -208,3 +214,111 @@ class Transducer(nn.Module):
             )
 
         return (simple_loss, pruned_loss)
+
+    def simple_loss(self, logits: torch.Tensor, y: k2.RaggedTensor) -> torch.Tensor:
+        """
+        Compute simple loss (un-pruned) following paper's approach.
+        Args:
+            logits: Output from joiner, shape (B, T, U, vocab_size)
+            y: Target labels as k2.RaggedTensor
+        Returns:
+            A scalar tensor containing the simple loss
+        """
+        # Convert ragged tensor to dense padded tensor
+        y_padded = y.pad(mode="constant", padding_value=0)
+        
+        # Get batch size and max sequence lengths
+        B, T, U, V = logits.shape
+        
+        # Create target tensor with blank padding
+        target = torch.full(
+            (B, T, U),
+            fill_value=0,  # 0 is blank_id
+            device=logits.device,
+            dtype=torch.long,
+        )
+        
+        # Fill in the target values
+        for b in range(B):
+            cur_len = y.shape[b][0]
+            target[b, :, :cur_len] = y_padded[b, :cur_len]
+        
+        # Compute loss using cross entropy
+        logits = logits.reshape(-1, V)  # (B*T*U, V)
+        target = target.reshape(-1)  # (B*T*U)
+        
+        loss = torch.nn.functional.cross_entropy(
+            logits,
+            target,
+            reduction="sum",
+            ignore_index=0,  # Ignore blank_id
+        )
+        
+        return loss
+
+    def pruned_loss(
+        self,
+        logits: torch.Tensor,
+        y: k2.RaggedTensor,
+        prune_range: int = 5,
+        am_scale: float = 0.0,
+        lm_scale: float = 0.0,
+    ) -> torch.Tensor:
+        """
+        Compute pruned loss following paper's approach.
+        Args:
+            logits: Output from joiner, shape (B, T, U, vocab_size)
+            y: Target labels as k2.RaggedTensor
+            prune_range: Range for pruning
+            am_scale: Scale for acoustic model scores
+            lm_scale: Scale for language model scores
+        Returns:
+            A scalar tensor containing the pruned loss
+        """
+        B, T, U, V = logits.shape
+        
+        # Convert ragged tensor to dense padded tensor
+        y_padded = y.pad(mode="constant", padding_value=0)
+        
+        # Create pruning mask
+        mask = torch.zeros((B, T, U), dtype=torch.bool, device=logits.device)
+        
+        # Fill pruning mask based on prune_range
+        for b in range(B):
+            cur_len = y.shape[b][0]
+            for t in range(T):
+                start = max(0, t - prune_range)
+                end = min(cur_len, t + prune_range)
+                mask[b, t, start:end] = True
+        
+        # Apply mask to logits
+        logits = logits.masked_select(mask.unsqueeze(-1)).reshape(-1, V)
+        
+        # Create target tensor
+        target = []
+        for b in range(B):
+            cur_len = y.shape[b][0]
+            for t in range(T):
+                start = max(0, t - prune_range)
+                end = min(cur_len, t + prune_range)
+                target.extend(y_padded[b, start:end].tolist())
+        
+        target = torch.tensor(target, device=logits.device)
+        
+        # Apply scaling if provided
+        if am_scale != 0.0:
+            logits = logits * am_scale
+        if lm_scale != 0.0:
+            # Apply language model scaling
+            lm_scores = torch.log_softmax(logits, dim=-1)
+            logits = logits + lm_scale * lm_scores
+        
+        # Compute loss
+        loss = torch.nn.functional.cross_entropy(
+            logits,
+            target,
+            reduction="sum",
+            ignore_index=0,  # Ignore blank_id
+        )
+        
+        return loss

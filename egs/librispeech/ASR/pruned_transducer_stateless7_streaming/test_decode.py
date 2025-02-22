@@ -229,46 +229,58 @@ def decode_with_beam_search(
     decoding_graph = k2.add_epsilon_self_loops(decoding_graph)
     decoding_graph = k2.arc_sort(decoding_graph)
     
-    # Intersect with decoding graph using pruned intersection
-    # This gives better results than regular intersection for Estonian
-    lattice = k2.intersect_dense_pruned(
-        decoding_graph,
-        dense_fsa,
-        search_beam=beam,
-        output_beam=beam,
-        min_active_states=max_states // 4,  # Allow some variation
-        max_active_states=max_states
-    )
+    # Ensure graph has exactly one final state
+    decoding_graph = k2.create_fsa_vec([decoding_graph])
+    decoding_graph = k2.top_sort(decoding_graph)
     
-    # Connect and arc sort the lattice before finding shortest path
-    lattice = k2.connect(lattice)
-    lattice = k2.arc_sort(lattice)
-    
-    # Get best path with double-precision scores for stability
-    best_path = k2.shortest_path(lattice, use_double_scores=True)
-    
-    # Get labels from best path FSA
-    labels = []
-    if best_path.shape[0] > 0:  # Check if path exists
-        # Get labels and convert to list, filtering out 0 (blank) and -1 (epsilon)
-        labels = [x for x in best_path.labels.tolist() if x > 0]
+    try:
+        # Intersect with decoding graph using pruned intersection
+        lattice = k2.intersect_dense_pruned(
+            decoding_graph,
+            dense_fsa,
+            search_beam=beam,
+            output_beam=beam,
+            min_active_states=max_states // 4,  # Allow some variation
+            max_active_states=max_states
+        )
         
-        # Apply some basic language constraints
-        # 1. Remove repeated tokens that are unlikely in Estonian
-        filtered = []
-        prev = None
-        repeat_count = 0
-        for label in labels:
-            if label == prev:
-                repeat_count += 1
-                if repeat_count > 2:  # Allow max 2 repeats
-                    continue
+        # Connect and arc sort the lattice before finding shortest path
+        lattice = k2.connect(lattice)
+        lattice = k2.arc_sort(lattice)
+        
+        # Get best path with double-precision scores for stability
+        best_path = k2.shortest_path(lattice, use_double_scores=True)
+        
+        # Get labels from best path FSA
+        labels = []
+        if best_path.shape[0] > 0:  # Check if path exists
+            # Get labels and aux_labels, filtering out 0 (blank) and -1 (epsilon)
+            if hasattr(best_path, 'aux_labels'):
+                labels = [x for x in best_path.aux_labels.tolist() if x > 0]
             else:
-                repeat_count = 0
-            filtered.append(label)
-            prev = label
-        
-        labels = filtered
+                labels = [x for x in best_path.labels.tolist() if x > 0]
+            
+            # Apply some basic language constraints
+            # 1. Remove repeated tokens that are unlikely in Estonian
+            filtered = []
+            prev = None
+            repeat_count = 0
+            for label in labels:
+                if label == prev:
+                    repeat_count += 1
+                    if repeat_count > 2:  # Allow max 2 repeats
+                        continue
+                else:
+                    repeat_count = 0
+                filtered.append(label)
+                prev = label
+            
+            labels = filtered
+    except RuntimeError as e:
+        logging.warning(f"FSA decoding failed: {e}")
+        # Fallback to simple argmax decoding
+        labels = encoder_out.argmax(dim=-1).squeeze(0).tolist()
+        labels = [x for x in labels if x > 0]  # Filter out blanks
             
     return labels
 

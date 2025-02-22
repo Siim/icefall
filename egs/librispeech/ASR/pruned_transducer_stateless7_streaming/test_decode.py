@@ -114,6 +114,38 @@ def plot_outputs(streaming_out: torch.Tensor, non_streaming_out: torch.Tensor, s
     plt.savefig(save_path)
     plt.close()
 
+def clean_token_text(token_ids: List[int], token_table: k2.SymbolTable) -> str:
+    """Clean up token sequence and format nicely.
+    
+    Args:
+        token_ids: List of token IDs from decoder
+        token_table: Symbol table for token lookup
+    Returns:
+        Cleaned and formatted text
+    """
+    # Get raw tokens
+    tokens = [token_table[i].replace('▁', ' ').strip() for i in token_ids]
+    
+    # Remove consecutive duplicates
+    cleaned = []
+    prev = None
+    for token in tokens:
+        # Skip if same as previous or empty
+        if token == prev or not token:
+            continue
+        cleaned.append(token)
+        prev = token
+    
+    # Join with proper spacing
+    text = ' '.join(cleaned).strip()
+    
+    # Clean up any remaining artifacts
+    text = text.replace('  ', ' ')  # Remove double spaces
+    text = text.replace(' ,', ',')  # Fix comma spacing
+    text = text.replace(' .', '.')  # Fix period spacing
+    
+    return text
+
 def decode_with_beam_search(
     encoder_out: torch.Tensor,
     decoding_graph: k2.Fsa,
@@ -156,14 +188,11 @@ def decode_with_beam_search(
     decoding_graph = k2.arc_sort(decoding_graph)
     decoding_graph = k2.connect(decoding_graph)
     
-    # Intersect with decoding graph and prune
-    lattice = k2.intersect_dense_pruned(
+    # Intersect with decoding graph using regular intersection
+    lattice = k2.intersect_dense(
         decoding_graph,
         dense_fsa,
-        search_beam=beam,
-        output_beam=beam,
-        min_active_states=1,
-        max_active_states=max_states
+        output_beam=beam
     )
     
     # Connect and arc sort the lattice before finding shortest path
@@ -173,13 +202,13 @@ def decode_with_beam_search(
     # Get best path
     best_path = k2.shortest_path(lattice, use_double_scores=True)
     
-    # Convert to token IDs, skipping blanks (0)
-    token_ids = []
-    for arc in best_path.arcs:
-        if arc.label != 0:  # Skip blank tokens
-            token_ids.append(arc.label)
+    # Get labels from best path FSA
+    labels = []
+    if best_path.shape[0] > 0:  # Check if path exists
+        # Get labels and convert to list, filtering out 0 (blank) and -1 (epsilon)
+        labels = [x for x in best_path.labels.tolist() if x > 0]
             
-    return token_ids
+    return labels
 
 def main():
     args = get_args()
@@ -239,7 +268,7 @@ def main():
             max_states=args.max_states,
             max_contexts=args.max_contexts
         )
-        non_streaming_text = ''.join([token_table[i] for i in non_streaming_hyps])
+        non_streaming_text = clean_token_text(non_streaming_hyps, token_table)
         logging.info(f"\nNon-streaming decoded text:")
         logging.info("-" * 50)
         logging.info(f"{non_streaming_text}")
@@ -277,7 +306,7 @@ def main():
                     max_states=args.max_states,
                     max_contexts=args.max_contexts
                 )
-                chunk_text = ''.join([token_table[i] for i in chunk_hyps])
+                chunk_text = clean_token_text(chunk_hyps, token_table)
                 logging.info(f"Chunk {len(encoder_out_chunks)}/{num_chunks} text: {chunk_text}")
             else:
                 logging.info(f"Processed chunk {len(encoder_out_chunks)}/{num_chunks}: {chunk.shape[1]/16000:.3f}s")
@@ -304,7 +333,7 @@ def main():
             max_states=args.max_states,
             max_contexts=args.max_contexts
         )
-        streaming_text = ''.join([token_table[i] for i in streaming_hyps])
+        streaming_text = clean_token_text(streaming_hyps, token_table)
         logging.info(f"\nStreaming decoded text:")
         logging.info("-" * 50)
         logging.info(f"{streaming_text}")

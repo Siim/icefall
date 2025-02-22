@@ -4,12 +4,14 @@ import torchaudio
 from torch.utils.data import Dataset
 
 class EstonianASRDataset(Dataset):
-    def __init__(self, txt_path: str, base_path: str = None, transform=None) -> None:
+    def __init__(self, txt_path: str, base_path: str = None, transform=None, min_duration: float = 1.0, max_duration: float = 10.0) -> None:
         """
         Args:
             txt_path: Path to the text file containing wav paths and transcripts
             base_path: Base path to prepend to the audio file paths
             transform: Optional transform to apply to the audio
+            min_duration: Minimum audio duration in seconds (default: 1.0)
+            max_duration: Maximum audio duration in seconds (default: 10.0)
         """
         self.samples = []  # list of tuples (wav_path, transcript)
         self.transform = transform
@@ -18,8 +20,12 @@ class EstonianASRDataset(Dataset):
         if base_path:
             base_path = os.path.join(base_path, '')
         
+        filtered_count = 0
+        total_count = 0
+        
         with open(txt_path, 'r', encoding='utf-8') as f:
             for line in f:
+                total_count += 1
                 line = line.strip()
                 if not line:
                     continue
@@ -37,9 +43,20 @@ class EstonianASRDataset(Dataset):
                     if not os.path.isabs(wav_path):
                         wav_path = os.path.abspath(wav_path)
                 
-                self.samples.append((wav_path, transcript))
+                # Check audio duration
+                try:
+                    info = torchaudio.info(wav_path)
+                    duration = info.num_frames / info.sample_rate
+                    if min_duration <= duration <= max_duration:
+                        self.samples.append((wav_path, transcript))
+                    else:
+                        filtered_count += 1
+                except Exception as e:
+                    print(f"Warning: Could not read {wav_path}: {e}")
+                    filtered_count += 1
         
         print(f"Loaded {len(self.samples)} samples from {txt_path}")
+        print(f"Filtered out {filtered_count} of {total_count} samples based on duration ({min_duration}s - {max_duration}s)")
         print(f"Using base path: {base_path if base_path else 'None'}")
         # Print first few samples for verification
         for i, (wav_path, transcript) in enumerate(self.samples[:3]):

@@ -1458,7 +1458,12 @@ def run(rank, world_size, args):
         from estonian_dataset import EstonianASRDataset, collate_fn
         logging.info("Using Estonian dataset")
         
-        train_dataset = EstonianASRDataset(params.train_txt, base_path=params.audio_base_path)
+        train_dataset = EstonianASRDataset(
+            params.train_txt, 
+            base_path=params.audio_base_path,
+            min_duration=1.0,  # 1 second minimum
+            max_duration=10.0  # 10 seconds maximum
+        )
         train_sampler = torch.utils.data.distributed.DistributedSampler(
             train_dataset,
             num_replicas=world_size,
@@ -1476,7 +1481,12 @@ def run(rank, world_size, args):
             persistent_workers=True,
         )
 
-        valid_dataset = EstonianASRDataset(params.val_txt, base_path=params.audio_base_path)
+        valid_dataset = EstonianASRDataset(
+            params.val_txt, 
+            base_path=params.audio_base_path,
+            min_duration=1.0,  # 1 second minimum
+            max_duration=10.0  # 10 seconds maximum
+        )
         valid_dl = torch.utils.data.DataLoader(
             valid_dataset,
             batch_size=params.batch_size,

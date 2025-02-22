@@ -1,9 +1,9 @@
+import k2
 import torch
 import torch.nn as nn
-from typing import Optional, List, Dict, Tuple, Union
+from typing import Optional, List, Dict, Tuple
 from pathlib import Path
 import logging
-import k2
 import copy
 
 logger = logging.getLogger(__name__)
@@ -100,29 +100,16 @@ class EstonianDecoder(nn.Module):
     
     def forward(
         self,
-        y: Union[torch.Tensor, k2.RaggedTensor],
+        y: torch.Tensor,
         need_pad: bool = False
     ) -> torch.Tensor:
         """
         Args:
             y: A 2-D tensor of shape (N, U) with U <= context_size
-               or a RaggedTensor
             need_pad: If True, pad y with blank_id to ensure context_size
         Returns:
             A 2-D tensor of shape (N, decoder_dim)
         """
-        if isinstance(y, k2.RaggedTensor):
-            # Convert RaggedTensor to dense tensor
-            y = y.tolist()
-            # Pad sequences to same length
-            max_len = max(len(seq) for seq in y)
-            y_padded = []
-            for seq in y:
-                if len(seq) < max_len:
-                    seq = seq + [self.blank_id] * (max_len - len(seq))
-                y_padded.append(seq)
-            y = torch.tensor(y_padded, device=y.device)
-        
         # Handle padding if needed
         if need_pad and y.shape[1] < self.context_size:
             padding = torch.full(

@@ -1414,7 +1414,7 @@ def run(rank, world_size, args):
     #         params=params,
     #     )
 
-    scaler = amp.GradScaler('cuda', enabled=params.use_fp16, init_scale=1.0)
+    scaler = amp.GradScaler(enabled=params.use_fp16 or params.use_bf16, init_scale=1.0)
     if checkpoints and "grad_scaler" in checkpoints:
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
@@ -1448,6 +1448,15 @@ def run(rank, world_size, args):
         if params.print_diagnostics:
             diagnostic.print_diagnostics()
             break
+
+        if not params.print_diagnostics:
+            scan_pessimistic_batches_for_oom(
+                model=model,
+                train_dl=train_dl,
+                optimizer=optimizer,
+                sp=sp,
+                params=params,
+            )
 
         save_checkpoint(
             params=params,

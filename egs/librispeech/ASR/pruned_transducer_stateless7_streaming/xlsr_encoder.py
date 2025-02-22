@@ -27,6 +27,7 @@ class XLSREncoder(EncoderInterface):
         min_chunk_size: int = 2560,  # 160ms at 16kHz (16 frames)
         max_chunk_size: int = 20480,  # 1280ms at 16kHz (128 frames)
         left_context_chunks: int = 1,  # Paper's optimal setting
+        joiner_dim: int = 512,  # Dimension to project to for joiner
     ) -> None:
         super().__init__()
         from transformers import Wav2Vec2Model, Wav2Vec2Config
@@ -63,8 +64,13 @@ class XLSREncoder(EncoderInterface):
         # Initialize streaming state
         self.reset_streaming_state()
         
-        # Ensure output_dim matches joiner input
-        self.output_dim = 1024  # For XLS-R 300M
+        # Add projection layer if needed
+        self.output_dim = 1024  # XLSR-300M hidden dimension
+        if joiner_dim != self.output_dim:
+            self.proj = nn.Linear(self.output_dim, joiner_dim)
+            self.output_dim = joiner_dim
+        else:
+            self.proj = None
         
         # Define standard chunk sizes from paper
         self.chunk_sizes = {

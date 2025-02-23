@@ -200,35 +200,35 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         "--use-xlsr",
         type=str2bool,
         default=True,
-        help="Whether to use XLSR encoder instead of Zipformer",
+        help="Whether to use XLSR encoder instead of Zipformer.",
     )
-    
+
     parser.add_argument(
-        "--xlsr-model",
+        "--xlsr-model-name",
         type=str,
         default="facebook/wav2vec2-xls-r-300m",
-        help="XLSR model name from HuggingFace",
+        help="Name of the XLSR model to use from HuggingFace.",
     )
-    
-    parser.add_argument(
-        "--decode-chunk-size",
-        type=int,
-        default=5120,  # 320ms at 16kHz
-        help="Chunk size for streaming decoding (in samples)",
-    )
-    
+
     parser.add_argument(
         "--attention-sink-size",
         type=int,
         default=16,
-        help="Number of frames for attention sink",
+        help="Number of frames to use for attention sink (paper's optimal setting).",
     )
-    
+
+    parser.add_argument(
+        "--decode-chunk-size",
+        type=int,
+        default=5120,
+        help="Chunk size for decoding in samples (320ms at 16kHz).",
+    )
+
     parser.add_argument(
         "--left-context-chunks",
         type=int,
         default=1,
-        help="Number of left context chunks to use",
+        help="Number of left context chunks to use (paper's optimal setting).",
     )
 
 
@@ -486,32 +486,23 @@ def get_params() -> AttributeDict:
             "log_interval": 50,
             "reset_interval": 200,
             "valid_interval": 3000,
-            # parameters for zipformer
+            
+            # XLSR specific parameters
+            "use_xlsr": True,
+            "xlsr_model_name": "facebook/wav2vec2-xls-r-300m",
+            "attention_sink_size": 16,  # Paper's optimal setting
+            "decode_chunk_size": 5120,  # 320ms at 16kHz
+            "left_context_chunks": 1,   # Paper's optimal setting
+            
+            # Frame parameters from paper
+            "frame_duration": 0.025,  # 25ms per frame
+            "frame_stride": 0.020,   # 20ms stride
+            
+            # Original parameters
             "feature_dim": 80,
             "subsampling_factor": 4,  # not passed in, this is fixed.
             "warm_step": 2000,
             "env_info": get_env_info(),
-            
-            # XLSR specific parameters
-            "use_xlsr": True,
-            "xlsr_model": "facebook/wav2vec2-xls-r-300m",
-            "decode_chunk_size": 5120,  # 320ms at 16kHz (paper's best performing)
-            "attention_sink_size": 16,   # Paper's optimal setting
-            "left_context_chunks": 1,    # Paper's optimal setting
-            "frame_duration": 0.025,     # 25ms per frame (from paper)
-            "frame_stride": 0.020,       # 20ms stride (from paper)
-            
-            # Estonian specific parameters
-            "vocab_size": 2503,  # Will be updated based on tokenizer
-            "blank_id": 0,       # Will be updated based on tokenizer
-            "unk_id": 1,
-            "pad_id": 2,
-            
-            # Training parameters
-            "batch_size": 8,     # Adjust based on GPU memory
-            "accum_grad": 4,     # Gradient accumulation steps
-            "lr_epochs": 3.5,    # Learning rate schedule epochs
-            "lr_batches": 5000,  # Learning rate schedule batches
         }
     )
 
@@ -521,14 +512,18 @@ def get_params() -> AttributeDict:
 def get_encoder_model(params: AttributeDict) -> nn.Module:
     if params.use_xlsr:
         from xlsr_encoder import XLSREncoder
+        # Create XLSR encoder with streaming capabilities built-in
         encoder = XLSREncoder(
-            model_name=params.xlsr_model,
-            decode_chunk_size=params.decode_chunk_size,
+            model_name=params.xlsr_model_name,
+            decode_chunk_size=params.decode_chunk_size,  # 320ms at 16kHz
+            chunk_overlap=params.decode_chunk_size // 2,  # Half of chunk size
             use_attention_sink=True,
-            attention_sink_size=params.attention_sink_size,
-            frame_duration=params.frame_duration,
-            frame_stride=params.frame_stride,
-            left_context_chunks=params.left_context_chunks,
+            attention_sink_size=params.attention_sink_size,  # 16 frames (paper's optimal)
+            frame_duration=params.frame_duration,  # 25ms per frame
+            frame_stride=params.frame_stride,    # 20ms stride
+            min_chunk_size=2560,   # 160ms at 16kHz (16 frames)
+            max_chunk_size=20480,  # 1280ms at 16kHz (128 frames)
+            left_context_chunks=params.left_context_chunks  # 1 chunk (paper's optimal)
         )
         return encoder
         
@@ -565,8 +560,11 @@ def get_decoder_model(params: AttributeDict) -> nn.Module:
 
 
 def get_joiner_model(params: AttributeDict) -> nn.Module:
+    # For XLSR encoder, output dim is fixed at 1024 for XLS-R 300M
+    encoder_dim = 1024 if params.use_xlsr else int(params.encoder_dims.split(",")[-1])
+    
     joiner = Joiner(
-        encoder_dim=int(params.encoder_dims.split(",")[-1]),
+        encoder_dim=encoder_dim,
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
@@ -579,11 +577,14 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
     decoder = get_decoder_model(params)
     joiner = get_joiner_model(params)
 
+    # For XLSR encoder, output dim is fixed at 1024 for XLS-R 300M
+    encoder_dim = 1024 if params.use_xlsr else int(params.encoder_dims.split(",")[-1])
+
     model = Transducer(
         encoder=encoder,
         decoder=decoder,
         joiner=joiner,
-        encoder_dim=int(params.encoder_dims.split(",")[-1]),
+        encoder_dim=encoder_dim,
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,

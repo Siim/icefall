@@ -777,9 +777,14 @@ def compute_loss(
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
-) -> Tuple[Tensor, MetricsTracker]:
+) -> Tuple[Tensor, MetricsTracker, Dict]:
     """
     Compute transducer loss given the model and batch.
+    Returns:
+        (loss, info, aux_info) where:
+        - loss is the loss tensor
+        - info is the MetricsTracker with numeric metrics
+        - aux_info is a dict with non-numeric info like hypothesis texts
     """
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
     feature = batch["inputs"]
@@ -920,7 +925,13 @@ def compute_loss(
     if not is_training:
         info["hyp_texts"] = hyp_texts  # Add hypothesis texts to info
     
-    return loss, info
+    # Create auxiliary info dict
+    aux_info = {}
+    if not is_training:
+        aux_info["hyp_texts"] = hyp_texts
+        aux_info["ref_texts"] = texts
+
+    return loss, info, aux_info
 
 
 def compute_validation_loss(
@@ -937,7 +948,7 @@ def compute_validation_loss(
     all_aux_info = {"hyp_texts": [], "ref_texts": []}
 
     for batch_idx, batch in enumerate(valid_dl):
-        loss, (loss_info, aux_info) = compute_loss(
+        loss, loss_info, aux_info = compute_loss(
             params=params,
             model=model,
             sp=sp,
@@ -950,6 +961,8 @@ def compute_validation_loss(
         # Collect auxiliary information
         if aux_info:
             for key in aux_info:
+                if key not in all_aux_info:
+                    all_aux_info[key] = []
                 all_aux_info[key].extend(aux_info[key])
 
     if world_size > 1:
@@ -988,7 +1001,7 @@ def train_one_epoch(
 
         try:
             with torch.amp.autocast('cuda', enabled=params.use_fp16):
-                loss, loss_info = compute_loss(
+                loss, loss_info, _ = compute_loss(
                     params=params,
                     model=model,
                     sp=sp,
@@ -1388,7 +1401,7 @@ def scan_pessimistic_batches_for_oom(
         batch = train_dl.dataset[cuts]
         try:
             with torch.cuda.amp.autocast(enabled=params.use_fp16):
-                loss, _ = compute_loss(
+                loss, _, _ = compute_loss(
                     params=params,
                     model=model,
                     sp=sp,

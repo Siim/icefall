@@ -22,6 +22,10 @@ class EstonianASRDataset(Dataset):
         # Add logging
         self.logger = logging.getLogger(__name__)
         
+        # Initialize processor
+        from transformers import Wav2Vec2Processor
+        self.processor = Wav2Vec2Processor.from_pretrained("TalTechNLP/xls-r-300m-et")
+        
         # Ensure base_path ends with a slash if provided
         if base_path:
             base_path = os.path.join(base_path, '')
@@ -100,36 +104,32 @@ class EstonianASRDataset(Dataset):
             # Convert to mono if stereo
             if waveform.size(0) > 1:
                 waveform = torch.mean(waveform, dim=0, keepdim=True)
-                
-            # Normalize to [-1, 1]
-            if waveform.dtype == torch.int16:
-                waveform = waveform.float() / 32768.0
-            elif waveform.dtype == torch.int32:
-                waveform = waveform.float() / 2147483648.0
-            elif waveform.dtype == torch.uint8:
-                waveform = (waveform.float() - 128) / 128.0
             
-            # Ensure values are clamped to [-1, 1]
-            waveform = torch.clamp(waveform, min=-1.0, max=1.0)
+            # Process using HuggingFace processor (same as xl_exp.py)
+            input_values = self.processor(
+                waveform.squeeze().numpy(),
+                sampling_rate=16000,
+                return_tensors="pt"
+            ).input_values
             
             # Double check length constraints with some margin for resampling
             margin = 100  # Small safety margin
-            if waveform.size(1) < self.min_samples - margin:
-                raise ValueError(f"Audio too short after processing: {waveform.size(1)} samples")
-            if waveform.size(1) > self.max_samples + margin:
-                raise ValueError(f"Audio too long after processing: {waveform.size(1)} samples")
+            if input_values.size(1) < self.min_samples - margin:
+                raise ValueError(f"Audio too short after processing: {input_values.size(1)} samples")
+            if input_values.size(1) > self.max_samples + margin:
+                raise ValueError(f"Audio too long after processing: {input_values.size(1)} samples")
             
             # Validate audio duration vs text length
             min_chars_per_second = 3  # Estonian ~4.5 chars/sec avg
-            audio_duration = waveform.size(1) / 16000
+            audio_duration = input_values.size(1) / 16000
             if len(transcript) / audio_duration < min_chars_per_second:
                 self.logger.warning(f"Suspicious sample {wav_path} - {len(transcript)} chars in {audio_duration:.1f}s")
             
-            # Return a dictionary with raw waveform and supervision
+            # Return a dictionary with processed input values
             return {
-                'inputs': waveform,  # shape: (1, time)
+                'inputs': input_values,  # shape: (1, time)
                 'supervisions': {
-                    'num_frames': waveform.size(1),
+                    'num_frames': input_values.size(1),
                     'text': transcript,
                     'audio_paths': wav_path
                 }
@@ -162,14 +162,8 @@ def collate_fn(batch: list) -> dict:
         texts.append(item['supervisions']['text'])
         audio_paths.append(item['supervisions']['audio_paths'])
     
-    # Stack to get a tensor of shape (batch, channel, time)
+    # Stack to get a tensor of shape (batch, time)
     inputs = torch.cat(padded_waveforms, dim=0)  # (batch, time)
-    # Reshape to (batch, time, channel)
-    inputs = inputs.unsqueeze(-1)  # Add channel dimension at the end
-    
-    # Double check normalization
-    if torch.any(inputs > 1.0) or torch.any(inputs < -1.0):
-        inputs = torch.clamp(inputs, min=-1.0, max=1.0)
     
     supervisions = {
         'num_frames': torch.tensor(num_frames, dtype=torch.int32),

@@ -861,19 +861,17 @@ def compute_loss(
                 
                 # Process each frame
                 for t in range(enc_out.size(1)):
-                    # Get encoder frame (shape: (N, 1, encoder_dim))
+                    # Get encoder frame and reshape to (N, encoder_dim)
                     encoder_frame = enc_out[:, t:t+1]
                     if hasattr(model, "encoder_proj"):
                         encoder_frame = model.encoder_proj(encoder_frame)
-
-                    # Ensure decoder output has a time dimension (shape: (N, 1, decoder_dim))
-                    decoder_current = decoder_out.unsqueeze(1)
-
+                    encoder_frame = encoder_frame.squeeze(1)  # Remove time dimension
+                    
+                    # Both inputs will now be 2D: (N, dim)
+                    decoder_current = decoder_out
+                    
                     # Now joiner inputs both have 3 dimensions
                     logits = model.joiner(encoder_frame, decoder_current)
-                    logits = logits.squeeze(1).squeeze(1)  # Remove T=1, U=1 dimensions
-                    
-                    # Get prediction
                     log_probs = torch.log_softmax(logits, dim=-1)
                     preds = log_probs.argmax(dim=-1)
                     # Ensure hyp is a list of lists, one per sample in the batch

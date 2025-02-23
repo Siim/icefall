@@ -819,7 +819,15 @@ def compute_loss(
         # Calculate WER if not training
         if not is_training:
             try:
-                encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
+                # Add right context for streaming, just like in decode.py
+                feature_lens_pad = feature_lens + 30
+                feature_pad = torch.nn.functional.pad(
+                    feature,
+                    pad=(0, 0, 0, 30),
+                    value=LOG_EPS,
+                )
+                
+                encoder_out, encoder_out_lens = model.encoder(x=feature_pad, x_lens=feature_lens_pad)
                 
                 # Project encoder output if using XLSR
                 if hasattr(model, "encoder_proj"):

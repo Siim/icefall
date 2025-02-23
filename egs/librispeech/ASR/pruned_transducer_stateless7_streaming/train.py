@@ -807,7 +807,8 @@ def compute_loss(
             # Always create 3D input (batch, time, channels) - XLSR will squeeze internally if needed
             feature = torch.zeros((1, dummy_samples, 1), device=device)
             feature_lens = torch.tensor([dummy_samples], device=device)
-            texts = [""]
+            # Use a minimal valid text to ensure pruning range works
+            texts = ["a"]  # Single character to ensure S > 0
         else:
             # Keep only valid samples
             feature = feature[valid_lens_mask]

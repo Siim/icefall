@@ -826,9 +826,12 @@ def compute_loss(
                     x_lens=feature_lens,
                 )
                 
+                logging.info(f"Encoder output shape before projection: {encoder_out.shape}")
+                
                 # Project encoder output if using XLSR
                 if hasattr(model, "encoder_proj"):
                     encoder_out = model.encoder_proj(encoder_out)
+                    logging.info(f"Encoder output shape after projection: {encoder_out.shape}")
                 
                 # Use greedy search for quick WER calculation
                 hyps = greedy_search_batch(

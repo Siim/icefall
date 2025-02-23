@@ -2,6 +2,7 @@ import os
 import torch
 import torchaudio
 from torch.utils.data import Dataset
+import logging
 
 class EstonianASRDataset(Dataset):
     def __init__(self, txt_path: str, base_path: str = None, transform=None) -> None:
@@ -17,6 +18,9 @@ class EstonianASRDataset(Dataset):
         # Duration limits (in samples at 16kHz)
         self.min_samples = 16000  # 1 sec minimum
         self.max_samples = 320000  # 20 sec maximum
+        
+        # Add logging
+        self.logger = logging.getLogger(__name__)
         
         # Ensure base_path ends with a slash if provided
         if base_path:
@@ -46,28 +50,37 @@ class EstonianASRDataset(Dataset):
                     if not os.path.isabs(wav_path):
                         wav_path = os.path.abspath(wav_path)
                 
-                # Get audio duration without loading the whole file
-                info = torchaudio.info(wav_path)
-                num_samples = info.num_frames
-                
-                # Filter by duration (1-20 seconds)
-                if num_samples < self.min_samples:
-                    filtered_short += 1
+                try:
+                    # Get audio info without loading the whole file
+                    info = torchaudio.info(wav_path)
+                    
+                    # Calculate expected samples after resampling to 16kHz
+                    expected_samples = int(info.num_frames * (16000 / info.sample_rate))
+                    
+                    # Add some margin for resampling artifacts
+                    margin = 100  # Small safety margin
+                    if expected_samples - margin < self.min_samples:
+                        filtered_short += 1
+                        self.logger.debug(f"File too short: {wav_path} ({expected_samples} samples)")
+                        continue
+                    if expected_samples + margin > self.max_samples:
+                        filtered_long += 1
+                        self.logger.debug(f"File too long: {wav_path} ({expected_samples} samples)")
+                        continue
+                    
+                    self.samples.append((wav_path, transcript))
+                except Exception as e:
+                    self.logger.warning(f"Error checking file {wav_path}: {str(e)}")
                     continue
-                if num_samples > self.max_samples:
-                    filtered_long += 1
-                    continue
-                
-                self.samples.append((wav_path, transcript))
         
-        print(f"Loaded {len(self.samples)} samples from {txt_path}")
-        print(f"Filtered out {filtered_short} samples shorter than {self.min_samples/16000:.1f}s")
-        print(f"Filtered out {filtered_long} samples longer than {self.max_samples/16000:.1f}s")
-        print(f"Total acceptance rate: {len(self.samples)/total_files*100:.1f}%")
-        print(f"Using base path: {base_path if base_path else 'None'}")
+        self.logger.info(f"Loaded {len(self.samples)} samples from {txt_path}")
+        self.logger.info(f"Filtered out {filtered_short} samples shorter than {self.min_samples/16000:.1f}s")
+        self.logger.info(f"Filtered out {filtered_long} samples longer than {self.max_samples/16000:.1f}s")
+        self.logger.info(f"Total acceptance rate: {len(self.samples)/total_files*100:.1f}%")
+        self.logger.info(f"Using base path: {base_path if base_path else 'None'}")
         # Print first few samples for verification
         for i, (wav_path, transcript) in enumerate(self.samples[:3]):
-            print(f"Sample {i}: {wav_path} | {transcript[:50]}...")
+            self.logger.info(f"Sample {i}: {wav_path} | {transcript[:50]}...")
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -75,47 +88,58 @@ class EstonianASRDataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         wav_path, transcript = self.samples[idx]
         
-        # Load audio
-        waveform, sample_rate = torchaudio.load(wav_path)
-        
-        # Resample if needed
-        if sample_rate != 16000:
-            waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
+        try:
+            # Load audio
+            waveform, sample_rate = torchaudio.load(wav_path)
             
-        # Convert to mono if stereo
-        if waveform.size(0) > 1:
-            waveform = torch.mean(waveform, dim=0, keepdim=True)
+            # Resample if needed
+            if sample_rate != 16000:
+                resampler = torchaudio.transforms.Resample(sample_rate, 16000)
+                waveform = resampler(waveform)
+                
+            # Convert to mono if stereo
+            if waveform.size(0) > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+                
+            # Normalize to [-1, 1]
+            if waveform.dtype == torch.int16:
+                waveform = waveform.float() / 32768.0
+            elif waveform.dtype == torch.int32:
+                waveform = waveform.float() / 2147483648.0
+            elif waveform.dtype == torch.uint8:
+                waveform = (waveform.float() - 128) / 128.0
             
-        # Normalize to [-1, 1]
-        if waveform.dtype == torch.int16:
-            waveform = waveform.float() / 32768.0
-        elif waveform.dtype == torch.int32:
-            waveform = waveform.float() / 2147483648.0
-        elif waveform.dtype == torch.uint8:
-            waveform = (waveform.float() - 128) / 128.0
-        
-        # Ensure values are clamped to [-1, 1]
-        waveform = torch.clamp(waveform, min=-1.0, max=1.0)
-        
-        # Double check length constraints
-        assert waveform.size(1) >= self.min_samples, f"Audio too short: {waveform.size(1)} samples"
-        assert waveform.size(1) <= self.max_samples, f"Audio too long: {waveform.size(1)} samples"
-        
-        # Validate audio duration vs text length
-        min_chars_per_second = 3  # Estonian ~4.5 chars/sec avg
-        audio_duration = waveform.size(1) / 16000
-        if len(transcript) / audio_duration < min_chars_per_second:
-            print(f"Warning: Suspicious sample {wav_path} - {len(transcript)} chars in {audio_duration:.1f}s")
-        
-        # Return a dictionary with raw waveform and supervision
-        return {
-            'inputs': waveform,  # shape: (1, time)
-            'supervisions': {
-                'num_frames': waveform.size(1),
-                'text': transcript,
-                'audio_paths': wav_path
+            # Ensure values are clamped to [-1, 1]
+            waveform = torch.clamp(waveform, min=-1.0, max=1.0)
+            
+            # Double check length constraints with some margin for resampling
+            margin = 100  # Small safety margin
+            if waveform.size(1) < self.min_samples - margin:
+                raise ValueError(f"Audio too short after processing: {waveform.size(1)} samples")
+            if waveform.size(1) > self.max_samples + margin:
+                raise ValueError(f"Audio too long after processing: {waveform.size(1)} samples")
+            
+            # Validate audio duration vs text length
+            min_chars_per_second = 3  # Estonian ~4.5 chars/sec avg
+            audio_duration = waveform.size(1) / 16000
+            if len(transcript) / audio_duration < min_chars_per_second:
+                self.logger.warning(f"Suspicious sample {wav_path} - {len(transcript)} chars in {audio_duration:.1f}s")
+            
+            # Return a dictionary with raw waveform and supervision
+            return {
+                'inputs': waveform,  # shape: (1, time)
+                'supervisions': {
+                    'num_frames': waveform.size(1),
+                    'text': transcript,
+                    'audio_paths': wav_path
+                }
             }
-        }
+            
+        except Exception as e:
+            self.logger.error(f"Error loading file {wav_path}: {str(e)}")
+            # Skip this sample by loading the next one
+            next_idx = (idx + 1) % len(self)
+            return self[next_idx]
 
 
 def collate_fn(batch: list) -> dict:

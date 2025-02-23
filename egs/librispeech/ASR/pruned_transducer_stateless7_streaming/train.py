@@ -803,8 +803,16 @@ def compute_loss(
         cached_tot_size=row_splits[-1].item()
     )
     
-    # Ensure values tensor is properly formatted
-    values = tokens.flatten().to(dtype=torch.int32)
+    # Get total number of elements from shape
+    total_elements = shape.NumElements()
+    
+    # Debug logging
+    logging.debug(f"Shape expects {total_elements} elements")
+    logging.debug(f"Original flattened tokens size: {tokens.flatten().size(0)}")
+    
+    # Ensure values tensor matches shape's elements
+    values = tokens.flatten()[:total_elements].to(dtype=torch.int32)
+    logging.debug(f"Final values size: {values.size(0)}")
     
     # Create RaggedTensor with proper shape and values
     ragged_y = k2.RaggedTensor(shape=shape, value=values)

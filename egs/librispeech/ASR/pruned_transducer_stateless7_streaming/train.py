@@ -1097,8 +1097,8 @@ def decode_with_beam_search(
     # Convert encoder output to log probabilities
     log_probs = torch.nn.functional.log_softmax(encoder_out / params.temperature, dim=-1)
     
-    # Create supervision for dense intersection
-    supervision = torch.tensor([[0, encoder_out.size(1)]], device=device)
+    # Create supervision for dense intersection - ensure int32 dtype
+    supervision = torch.tensor([[0, encoder_out.size(1)]], device=device, dtype=torch.int32)
     dense_fsa = k2.DenseFsaVec(log_probs, supervision)
     
     # If no decoding graph provided, create a simple one

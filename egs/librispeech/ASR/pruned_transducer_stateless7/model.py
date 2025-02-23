@@ -108,21 +108,12 @@ class Transducer(nn.Module):
             part
         Returns:
           Return the transducer loss.
-
-        Note:
-           Regarding am_scale & lm_scale, it will make the loss-function one of
-           the form:
-              lm_scale * lm_probs + am_scale * am_probs +
-              (1-lm_scale-am_scale) * combined_probs
         """
         assert x.ndim == 3, x.shape
         assert x_lens.ndim == 1, x_lens.shape
         assert y.num_axes == 2, y.num_axes
 
         assert x.size(0) == x_lens.size(0) == y.dim0
-
-        # x.T_dim == max(x_len)
-        assert x.size(1) == x_lens.max().item(), (x.shape, x_lens, x_lens.max())
 
         encoder_out, x_lens = self.encoder(x, x_lens)
         
@@ -147,21 +138,30 @@ class Transducer(nn.Module):
         # Note: y does not start with SOS
         # y_padded : [B, S]
         y_padded = y.pad(mode="constant", padding_value=0)
-
         y_padded = y_padded.to(torch.int64)
-        boundary = torch.zeros((x.size(0), 4), dtype=torch.int64, device=x.device)
-        boundary[:, 2] = y_lens
-        boundary[:, 3] = x_lens
+
+        # Create and validate boundary tensor
+        batch_size = x.size(0)
+        boundary = torch.zeros((batch_size, 4), dtype=torch.int64, device=x.device)
+        
+        # First validate lengths
+        assert torch.all(y_lens >= 0), "Label lengths must be non-negative"
+        assert torch.all(x_lens >= 0), "Frame lengths must be non-negative"
+        
+        # Set boundary values
+        boundary[:, 0] = 0  # Start frame index
+        boundary[:, 1] = 0  # Start label index  
+        boundary[:, 2] = y_lens  # End label index
+        boundary[:, 3] = x_lens  # End frame index
+        
+        # Validate boundary conditions
+        assert torch.all(boundary[:, 2] <= y_padded.size(1)), "Label length exceeds padded size"
+        assert torch.all(boundary[:, 3] <= encoder_out.size(1)), "Frame length exceeds encoder output size"
 
         lm = self.simple_lm_proj(decoder_out)
         am = self.simple_am_proj(encoder_out)
 
-        # if self.training and random.random() < 0.25:
-        #    lm = penalize_abs_values_gt(lm, 100.0, 1.0e-04)
-        # if self.training and random.random() < 0.25:
-        #    am = penalize_abs_values_gt(am, 30.0, 1.0e-04)
-
-        with amp.autocast('cuda', enabled=False):
+        with torch.cuda.amp.autocast(enabled=False):
             simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
                 lm=lm.float(),
                 am=am.float(),
@@ -191,12 +191,9 @@ class Transducer(nn.Module):
         )
 
         # logits : [B, T, prune_range, vocab_size]
-
-        # project_input=False since we applied the decoder's input projections
-        # prior to do_rnnt_pruning (this is an optimization for speed).
         logits = self.joiner(am_pruned, lm_pruned, project_input=False)
 
-        with amp.autocast('cuda', enabled=False):
+        with torch.cuda.amp.autocast(enabled=False):
             pruned_loss = k2.rnnt_loss_pruned(
                 logits=logits.float(),
                 symbols=y_padded,

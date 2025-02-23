@@ -14,9 +14,17 @@ class EstonianASRDataset(Dataset):
         self.samples = []  # list of tuples (wav_path, transcript)
         self.transform = transform
         
+        # Duration limits (in samples at 16kHz)
+        min_samples = max(16000, 400)  # 1 sec or 400 samples, whichever is larger
+        max_samples = 320000  # 20 sec
+        
         # Ensure base_path ends with a slash if provided
         if base_path:
             base_path = os.path.join(base_path, '')
+        
+        filtered_short = 0
+        filtered_long = 0
+        total_files = 0
         
         with open(txt_path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -28,6 +36,7 @@ class EstonianASRDataset(Dataset):
                 if len(parts) < 2:  # Need at least path and transcript
                     continue
                 wav_path, transcript = parts[0], parts[1]
+                total_files += 1
                 
                 # If base_path is provided, join it with wav_path
                 if base_path:
@@ -37,9 +46,24 @@ class EstonianASRDataset(Dataset):
                     if not os.path.isabs(wav_path):
                         wav_path = os.path.abspath(wav_path)
                 
+                # Get audio duration without loading the whole file
+                info = torchaudio.info(wav_path)
+                num_samples = info.num_frames
+                
+                # Filter by duration
+                if num_samples < min_samples:
+                    filtered_short += 1
+                    continue
+                if num_samples > max_samples:
+                    filtered_long += 1
+                    continue
+                
                 self.samples.append((wav_path, transcript))
         
         print(f"Loaded {len(self.samples)} samples from {txt_path}")
+        print(f"Filtered out {filtered_short} samples shorter than {min_samples/16000:.1f}s")
+        print(f"Filtered out {filtered_long} samples longer than {max_samples/16000:.1f}s")
+        print(f"Total acceptance rate: {len(self.samples)/total_files*100:.1f}%")
         print(f"Using base path: {base_path if base_path else 'None'}")
         # Print first few samples for verification
         for i, (wav_path, transcript) in enumerate(self.samples[:3]):

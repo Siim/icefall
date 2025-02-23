@@ -776,48 +776,15 @@ def compute_loss(
     is_training: bool,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
-    Compute transducer loss and WER given the model and its inputs.
+    Compute transducer loss given the model and its inputs.
     """
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
     feature = batch["inputs"]
-    assert feature.ndim == 3
     feature = feature.to(device)
 
     supervisions = batch["supervisions"]
     feature_lens = supervisions["num_frames"].to(device)
-
-    # Filter samples between 1 sec and 20 sec (at 16kHz)
-    # Also ensure minimum length is at least 400 samples for XLSR conv layers
-    min_samples = max(16000, 400)  # 1 sec or 400 samples, whichever is larger
-    max_samples = 320000  # 20 sec
-    frame_shift = 160  # 10ms at 16kHz
-    
-    sample_lens = feature_lens * frame_shift
-    valid_lens_mask = (sample_lens >= min_samples) & (sample_lens <= max_samples)
-    
-    if not valid_lens_mask.all():
-        num_short = (sample_lens < min_samples).sum().item()
-        num_long = (sample_lens > max_samples).sum().item()
-        if num_short > 0 or num_long > 0:
-            logging.debug(f"Filtered out {num_short} samples < {min_samples/16000:.1f}s and {num_long} samples > 20s")
-        
-        if not valid_lens_mask.any():
-            # If no valid samples, create a dummy batch with 2-second audio
-            if params.batch_idx_train == 0:  # Only log on first batch
-                logging.info("No valid samples in batch, using dummy 2-second sample")
-            dummy_samples = 32000  # 2 seconds at 16kHz
-            # Always create 3D input (batch, time, channels) - XLSR will squeeze internally if needed
-            feature = torch.zeros((1, dummy_samples, 1), device=device)
-            feature_lens = torch.tensor([dummy_samples], device=device)
-            # Use a minimal valid text to ensure pruning range works
-            texts = ["a"]  # Single character to ensure S > 0
-        else:
-            # Keep only valid samples
-            feature = feature[valid_lens_mask]
-            feature_lens = feature_lens[valid_lens_mask]
-            texts = [t for i, t in enumerate(batch["supervisions"]["text"]) if valid_lens_mask[i]]
-    else:
-        texts = batch["supervisions"]["text"]
+    texts = batch["supervisions"]["text"]
 
     batch_idx_train = params.batch_idx_train
     warm_step = params.warm_step
@@ -851,58 +818,39 @@ def compute_loss(
 
         # Calculate WER if not training
         if not is_training:
-            with torch.no_grad():
-                # Get encoder output with proper streaming settings
-                encoder_out, encoder_out_lens = model.encoder(
-                    x=feature,
-                    x_lens=feature_lens,
-                )
-                
-                # Ensure we have at least one frame
-                if encoder_out.size(1) == 0:
-                    logging.warning(f"Empty encoder output detected, padding to minimum size")
-                    encoder_out = torch.zeros(
-                        (encoder_out.size(0), 1, encoder_out.size(2)),
-                        device=encoder_out.device,
-                        dtype=encoder_out.dtype
-                    )
-                    encoder_out_lens = torch.ones_like(encoder_out_lens)
+            try:
+                encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
                 
                 # Project encoder output if using XLSR
                 if hasattr(model, "encoder_proj"):
                     encoder_out = model.encoder_proj(encoder_out)
                 
-                # Verify encoder output is valid
-                assert encoder_out.size(1) > 0, f"Encoder output still empty after padding: {encoder_out.shape}"
-                assert torch.all(encoder_out_lens > 0), f"Invalid encoder output lengths: {encoder_out_lens}"
-                
                 # Use greedy search for quick WER calculation
-                try:
-                    hyps = greedy_search_batch(
-                        model=model,
-                        encoder_out=encoder_out,
-                        encoder_out_lens=encoder_out_lens,
-                    )
-                    
-                    # Convert hypotheses to text
-                    hyp_texts = [sp.decode(hyp) for hyp in hyps]
-                    
-                    # Calculate WER
-                    total_words = sum(len(text.split()) for text in texts)
-                    total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
-                                     for hyp, ref in zip(hyp_texts, texts))
-                    wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
-                    
-                    # Log some examples periodically
-                    if batch_idx_train % 1000 == 0:
-                        logging.info("\nExample Predictions:")
-                        for i in range(min(2, len(texts))):  # Show first 2 examples
-                            logging.info(f"Reference: {texts[i]}")
-                            logging.info(f"Predicted: {hyp_texts[i]}")
-                            logging.info("-" * 50)
-                except Exception as e:
-                    logging.warning(f"WER calculation failed: {str(e)}")
-                    wer = float('inf')
+                hyps = greedy_search_batch(
+                    model=model,
+                    encoder_out=encoder_out,
+                    encoder_out_lens=encoder_out_lens,
+                )
+                
+                # Convert hypotheses to text
+                hyp_texts = [sp.decode(hyp) for hyp in hyps]
+                
+                # Calculate WER
+                total_words = sum(len(text.split()) for text in texts)
+                total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
+                                 for hyp, ref in zip(hyp_texts, texts))
+                wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
+                
+                # Log some examples periodically
+                if batch_idx_train % 1000 == 0:
+                    logging.info("\nExample Predictions:")
+                    for i in range(min(2, len(texts))):  # Show first 2 examples
+                        logging.info(f"Reference: {texts[i]}")
+                        logging.info(f"Predicted: {hyp_texts[i]}")
+                        logging.info("-" * 50)
+            except Exception as e:
+                logging.warning(f"WER calculation failed: {str(e)}")
+                wer = float('inf')
         else:
             wer = 0.0  # Don't calculate WER during training
 

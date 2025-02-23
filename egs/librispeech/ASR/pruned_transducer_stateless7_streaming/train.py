@@ -868,8 +868,21 @@ def compute_loss(
                     # Get encoder frame
                     encoder_frame = enc_out[:, t:t+1]
                     
+                    # Project encoder output if needed
+                    if hasattr(model, "encoder_proj"):
+                        encoder_frame = model.encoder_proj(encoder_frame)
+                    
+                    # Reshape encoder frame for joiner (N, T=1, encoder_dim)
+                    encoder_frame = encoder_frame.unsqueeze(1)
+                    
+                    # Reshape decoder output for joiner (N, U=1, decoder_dim)
+                    decoder_out = decoder_out.unsqueeze(1)
+                    
                     # Get logits from joiner
                     logits = model.joiner(encoder_frame, decoder_out)
+                    
+                    # Remove extra dimensions (N, T=1, U=1, vocab_size) -> (N, vocab_size)
+                    logits = logits.squeeze(1).squeeze(1)
                     
                     # Get prediction
                     log_probs = torch.log_softmax(logits, dim=-1)

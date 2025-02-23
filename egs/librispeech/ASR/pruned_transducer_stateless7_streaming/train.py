@@ -426,6 +426,49 @@ def get_parser():
         help="Whether to use half precision training.",
     )
 
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="librispeech",
+        choices=["librispeech", "estonian"],
+        help="Dataset to use for training (librispeech or estonian)",
+    )
+
+    parser.add_argument(
+        "--train-txt",
+        type=str,
+        default="Data/train_list.txt",
+        help="Path to training data list file for Estonian dataset",
+    )
+
+    parser.add_argument(
+        "--val-txt",
+        type=str,
+        default="Data/val_list.txt",
+        help="Path to validation data list file for Estonian dataset",
+    )
+
+    parser.add_argument(
+        "--audio-base-path",
+        type=str,
+        default=None,
+        help="Base path for audio files in Estonian dataset",
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Batch size for training",
+    )
+
+    parser.add_argument(
+        "--streaming-regularization",
+        type=float,
+        default=0.1,
+        help="Weight for streaming regularization loss",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -1103,94 +1146,53 @@ def run(rank, world_size, args):
     if params.inf_check:
         register_inf_check_hooks(model)
 
-    librispeech = LibriSpeechAsrDataModule(args)
-
-    assert not (
-        params.mini_libri and params.full_libri
-    ), f"Cannot set both mini-libri and full-libri flags to True, now mini-libri {params.mini_libri} and full-libri {params.full_libri}"
-
-    if params.mini_libri:
-        train_cuts = librispeech.train_clean_5_cuts()
+    if params.dataset == "estonian":
+        from estonian_dataset import EstonianASRDataset, collate_fn
+        logging.info("Using Estonian dataset")
+        
+        train_dataset = EstonianASRDataset(params.train_txt, base_path=params.audio_base_path)
+        train_dl = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=params.batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=2,
+        )
+        
+        valid_dataset = EstonianASRDataset(params.val_txt, base_path=params.audio_base_path)
+        valid_dl = torch.utils.data.DataLoader(
+            valid_dataset,
+            batch_size=params.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=2,
+        )
     else:
-        if params.full_libri:
-            train_cuts = librispeech.train_all_shuf_cuts()
-
-            # previously we used the following code to load all training cuts,
-            # strictly speaking, shuffled training cuts should be used instead,
-            # but we leave the code here to demonstrate that there is an option
-            # like this to combine multiple cutsets
-
-            # train_cuts = librispeech.train_clean_100_cuts()
-            # train_cuts += librispeech.train_clean_360_cuts()
-            # train_cuts += librispeech.train_other_500_cuts()
+        librispeech = LibriSpeechAsrDataModule(args)
+        
+        if params.mini_libri:
+            train_cuts = librispeech.train_clean_5_cuts()
         else:
-            train_cuts = librispeech.train_clean_100_cuts()
+            if params.full_libri:
+                train_cuts = librispeech.train_all_shuf_cuts()
+            else:
+                train_cuts = librispeech.train_clean_100_cuts()
 
-    def remove_short_and_long_utt(c: Cut):
-        # Keep only utterances with duration between 1 second and 20 seconds
-        #
-        # Caution: There is a reason to select 20.0 here. Please see
-        # ../local/display_manifest_statistics.py
-        #
-        # You should use ../local/display_manifest_statistics.py to get
-        # an utterance duration distribution for your dataset to select
-        # the threshold
-        if c.duration < 1.0 or c.duration > 20.0:
-            logging.warning(
-                f"Exclude cut with ID {c.id} from training. Duration: {c.duration}"
-            )
-            return False
+        if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
+            sampler_state_dict = checkpoints["sampler"]
+        else:
+            sampler_state_dict = None
 
-        # In pruned RNN-T, we require that T >= S
-        # where T is the number of feature frames after subsampling
-        # and S is the number of tokens in the utterance
+        train_dl = librispeech.train_dataloaders(
+            train_cuts, sampler_state_dict=sampler_state_dict
+        )
 
-        # In ./zipformer.py, the conv module uses the following expression
-        # for subsampling
-        T = ((c.num_frames - 7) // 2 + 1) // 2
-        tokens = sp.encode(c.supervisions[0].text, out_type=str)
-
-        if T < len(tokens):
-            logging.warning(
-                f"Exclude cut with ID {c.id} from training. "
-                f"Number of frames (before subsampling): {c.num_frames}. "
-                f"Number of frames (after subsampling): {T}. "
-                f"Text: {c.supervisions[0].text}. "
-                f"Tokens: {tokens}. "
-                f"Number of tokens: {len(tokens)}"
-            )
-            return False
-
-        return True
-
-    # train_cuts = train_cuts.filter(remove_short_and_long_utt)
-
-    if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
-        # We only load the sampler's state dict when it loads a checkpoint
-        # saved in the middle of an epoch
-        sampler_state_dict = checkpoints["sampler"]
-    else:
-        sampler_state_dict = None
-
-    train_dl = librispeech.train_dataloaders(
-        train_cuts, sampler_state_dict=sampler_state_dict
-    )
-
-    if params.mini_libri:
-        valid_cuts = librispeech.dev_clean_2_cuts()
-    else:
-        valid_cuts = librispeech.dev_clean_cuts()
-        valid_cuts += librispeech.dev_other_cuts()
-    valid_dl = librispeech.valid_dataloaders(valid_cuts)
-
-    # if not params.print_diagnostics:
-    #     scan_pessimistic_batches_for_oom(
-    #         model=model,
-    #         train_dl=train_dl,
-    #         optimizer=optimizer,
-    #         sp=sp,
-    #         params=params,
-    #     )
+        if params.mini_libri:
+            valid_cuts = librispeech.dev_clean_2_cuts()
+        else:
+            valid_cuts = librispeech.dev_clean_cuts()
+            valid_cuts += librispeech.dev_other_cuts()
+        valid_dl = librispeech.valid_dataloaders(valid_cuts)
 
     scaler = GradScaler(enabled=params.use_fp16, init_scale=1.0)
     if checkpoints and "grad_scaler" in checkpoints:
@@ -1200,7 +1202,9 @@ def run(rank, world_size, args):
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         scheduler.step_epoch(epoch - 1)
         fix_random_seed(params.seed + epoch - 1)
-        train_dl.sampler.set_epoch(epoch - 1)
+        
+        if params.dataset != "estonian":
+            train_dl.sampler.set_epoch(epoch - 1)
 
         if tb_writer is not None:
             tb_writer.add_scalar("train/epoch", epoch, params.batch_idx_train)
@@ -1232,7 +1236,7 @@ def run(rank, world_size, args):
             model_avg=model_avg,
             optimizer=optimizer,
             scheduler=scheduler,
-            sampler=train_dl.sampler,
+            sampler=train_dl.sampler if params.dataset != "estonian" else None,
             scaler=scaler,
             rank=rank,
         )

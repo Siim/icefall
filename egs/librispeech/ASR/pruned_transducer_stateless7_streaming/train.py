@@ -797,8 +797,11 @@ def compute_loss(
     row_splits = torch.zeros(token_lens.size(0) + 1, dtype=torch.int32, device=device)
     row_splits[1:] = torch.cumsum(token_lens, dim=0)
     
-    # Create RaggedShape first
-    shape = k2.ragged.RaggedShape(row_splits=row_splits)
+    # Create RaggedShape using create_ragged_shape2
+    shape = k2.ragged.create_ragged_shape2(
+        row_splits=row_splits,
+        cached_tot_size=row_splits[-1].item()
+    )
     
     # Then create RaggedTensor using shape and values
     ragged_y = k2.RaggedTensor(shape=shape, values=tokens.flatten())

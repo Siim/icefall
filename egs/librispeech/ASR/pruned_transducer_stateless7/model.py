@@ -115,12 +115,6 @@ class Transducer(nn.Module):
             part
         Returns:
           Return the transducer loss.
-
-        Note:
-           Regarding am_scale & lm_scale, it will make the loss-function one of
-           the form:
-              lm_scale * lm_probs + am_scale * am_probs +
-              (1-lm_scale-am_scale) * combined_probs
         """
         assert x.ndim == 3, x.shape
         assert x_lens.ndim == 1, x_lens.shape
@@ -128,9 +122,7 @@ class Transducer(nn.Module):
 
         assert x.size(0) == x_lens.size(0) == y.dim0
 
-        # x.T_dim == max(x_len)
-        assert x.size(1) == x_lens.max().item(), (x.shape, x_lens, x_lens.max())
-
+        # Get encoder output
         encoder_out, x_lens = self.encoder(x, x_lens)
         
         # Project XLSR output if needed
@@ -160,13 +152,9 @@ class Transducer(nn.Module):
         boundary[:, 2] = y_lens
         boundary[:, 3] = x_lens
 
+        # Get simple loss components
         lm = self.simple_lm_proj(decoder_out)
         am = self.simple_am_proj(encoder_out)
-
-        # if self.training and random.random() < 0.25:
-        #    lm = penalize_abs_values_gt(lm, 100.0, 1.0e-04)
-        # if self.training and random.random() < 0.25:
-        #    am = penalize_abs_values_gt(am, 30.0, 1.0e-04)
 
         with amp.autocast('cuda', enabled=False):
             simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
@@ -181,7 +169,7 @@ class Transducer(nn.Module):
                 return_grad=True,
             )
 
-        # ranges : [B, T, prune_range]
+        # Get pruning ranges
         ranges = k2.get_rnnt_prune_ranges(
             px_grad=px_grad,
             py_grad=py_grad,
@@ -189,20 +177,17 @@ class Transducer(nn.Module):
             s_range=prune_range,
         )
 
-        # am_pruned : [B, T, prune_range, encoder_dim]
-        # lm_pruned : [B, T, prune_range, decoder_dim]
+        # Get pruned components
         am_pruned, lm_pruned = k2.do_rnnt_pruning(
             am=self.joiner.encoder_proj(encoder_out),
             lm=self.joiner.decoder_proj(decoder_out),
             ranges=ranges,
         )
 
-        # logits : [B, T, prune_range, vocab_size]
-
-        # project_input=False since we applied the decoder's input projections
-        # prior to do_rnnt_pruning (this is an optimization for speed).
+        # Get joiner output for pruned components
         logits = self.joiner(am_pruned, lm_pruned, project_input=False)
 
+        # Compute pruned loss
         with amp.autocast('cuda', enabled=False):
             pruned_loss = k2.rnnt_loss_pruned(
                 logits=logits.float(),

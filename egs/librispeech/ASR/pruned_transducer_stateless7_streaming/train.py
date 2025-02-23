@@ -89,6 +89,7 @@ from torch import amp
 import editdistance
 import random
 import re
+import itertools
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -918,9 +919,20 @@ def decode_with_beam_search(
         for i in range(batch_size):
             # Get labels (token IDs) from the best path
             labels = []
-            for arc in best_path[i].arcs:
-                if arc.label != 0:  # Skip blank tokens
-                    labels.append(arc.label)
+            # Use k2's proper methods to get labels
+            if hasattr(best_path[i], 'labels'):
+                # Some k2 versions provide labels directly
+                labels = best_path[i].labels.tolist()
+            else:
+                # Otherwise extract from arcs
+                fsa = best_path[i]
+                aux_labels = fsa.aux_labels.tolist() if hasattr(fsa, 'aux_labels') else []
+                labels = [arc.label for arc in fsa.arcs if arc.label != 0]
+                if aux_labels:
+                    labels = aux_labels
+            
+            # Remove consecutive duplicates and zeros
+            labels = [x for x, _ in itertools.groupby(labels) if x != 0]
             
             # Convert token IDs to text using sentencepiece
             hyp = sp.decode(labels)
@@ -940,8 +952,8 @@ def decode_with_beam_search(
             # Get sequence up to its length
             sequence = predictions[i, :encoder_out_lens[i]]
             # Remove consecutive duplicates and zeros (CTC blank)
-            sequence = [t for t in sequence.tolist()]
-            sequence = [t for t, _ in itertools.groupby(sequence) if t != 0]
+            sequence = [t.item() for t in sequence]
+            sequence = [x for x, _ in itertools.groupby(sequence) if x != 0]
             # Decode to text
             hyp = sp.decode(sequence)
             hyps.append(hyp)

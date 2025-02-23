@@ -876,13 +876,13 @@ def compute_loss(
                     logits = model.joiner(encoder_frame, decoder_out)
                     logits = logits.squeeze(1).squeeze(1)  # Remove T=1, U=1 dimensions
                     
-                    # Get prediction (handle batch dimension properly)
+                    # Get prediction
                     log_probs = torch.log_softmax(logits, dim=-1)
-                    pred = log_probs[0].argmax().item()  # Take first (and only) item since we're processing one sequence
+                    pred = log_probs.argmax(dim=-1)  # Keep as tensor for now
                     
                     # Add token if not blank and not repeating
-                    if pred != params.blank_id and (len(hyp) <= params.context_size or pred != hyp[-1]):
-                        hyp.append(pred)
+                    if pred.item() != params.blank_id and (len(hyp) <= params.context_size or pred.item() != hyp[-1]):
+                        hyp.append(pred.item())
                         
                         # Update decoder state
                         decoder_input = torch.tensor([hyp[-params.context_size:]], device=device)

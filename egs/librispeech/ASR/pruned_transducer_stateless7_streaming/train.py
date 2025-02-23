@@ -833,8 +833,8 @@ def compute_loss(
                     encoder_out_lens=encoder_out_lens,
                 )
                 
-                # Convert hypotheses to text
-                hyp_texts = [sp.decode(hyp.tolist()) for hyp in hyps]
+                # Convert hypotheses to text - hyps is already a list of lists
+                hyp_texts = [sp.decode(hyp) for hyp in hyps]
                 
                 # Calculate WER
                 total_words = sum(len(text.split()) for text in texts)

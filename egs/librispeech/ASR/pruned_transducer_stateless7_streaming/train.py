@@ -775,11 +775,11 @@ def compute_loss(
     batch: dict,
     is_training: bool,
 ) -> Tuple[Tensor, MetricsTracker]:
-    """Compute transducer loss.
-    
+    """
+    Compute transducer loss given the model and its inputs.
     Args:
       params:
-        It is returned by :func:`get_params`.
+        Parameters for training. See :func:`get_params`.
       model:
         The model for training.
       sp:
@@ -788,111 +788,60 @@ def compute_loss(
         A batch of data. See `lhotse.dataset.K2SpeechRecognitionDataset()`
         for the content in it.
       is_training:
-        True for training, False for validation.
+        True for training. False for validation.
     """
     device = next(model.parameters()).device
-    feature = batch["inputs"].to(device)
-    feature_lens = batch["supervisions"]["num_frames"].to(device)
+    feature = batch["inputs"]
+    # at entry, feature is (N, T, C)
+    assert feature.ndim == 3
+    feature = feature.to(device)
+
+    supervisions = batch["supervisions"]
+    feature_lens = supervisions["num_frames"].to(device)
+
     texts = batch["supervisions"]["text"]
-    
-    # Convert text to token IDs using sentencepiece
-    token_ids = sp.encode(texts, out_type=int)
-    # Convert token lists to tensor
-    max_token_len = max(len(ids) for ids in token_ids)
-    y = torch.full((len(texts), max_token_len), params.blank_id, dtype=torch.long, device=device)
-    for i, ids in enumerate(token_ids):
-        y[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
-    
+    y = sp.encode(texts, out_type=int)
+    y = k2.RaggedTensor(y)
+
     with torch.set_grad_enabled(is_training):
-        simple_loss, pruned_loss = None, None
-        streaming_loss = torch.tensor([0.0], device=device)
-        
-        if is_training and params.use_xlsr:
-            # Get random chunk size during training
-            chunk_size = model.encoder.get_random_chunk_size()
-            chunks = model.encoder.prepare_chunks(feature, chunk_size)
-            encoder_out_chunks = []
-            prev_chunk_last = None
-            
-            # Process each chunk
-            for chunk in chunks:
-                chunk_len = torch.tensor([chunk.shape[1]], dtype=torch.int32, device=device)
-                if prev_chunk_last is None:
-                    # First chunk
-                    chunk_out, _, states = model.encoder.streaming_forward(chunk, chunk_len, None)
-                    prev_chunk_last = chunk_out[:, -1:, :]
-                else:
-                    # Subsequent chunks - compute streaming regularization
-                    chunk_out, _, states = model.encoder.streaming_forward(chunk, chunk_len, states)
-                    curr_chunk_first = chunk_out[:, :1, :]
-                    streaming_loss += F.mse_loss(prev_chunk_last, curr_chunk_first)
-                    prev_chunk_last = chunk_out[:, -1:, :]
-                
-                encoder_out_chunks.append(chunk_out)
-            
-            # Concatenate chunks
-            encoder_out = torch.cat(encoder_out_chunks, dim=1)
-            
-            # Scale streaming loss by number of chunks
-            if len(chunks) > 1:
-                streaming_loss = streaming_loss / (len(chunks) - 1)
-        else:
-            # Regular forward pass for validation or non-XLSR
-            encoder_out, _ = model.encoder(feature, feature_lens)
-        
-        # Get decoder output
-        decoder_out = model.decoder(y)
-        
-        # Log shapes for debugging
-        logging.info(f"Encoder output shape: {encoder_out.shape}")
-        logging.info(f"Decoder output shape: {decoder_out.shape}")
-        
-        # Adjust dimensions if needed
-        if encoder_out.ndim == 3 and decoder_out.ndim == 2:
-            # Add time dimension to decoder output
-            decoder_out = decoder_out.unsqueeze(1)
-        elif encoder_out.ndim == 2 and decoder_out.ndim == 3:
-            # Add feature dimension to encoder output
-            encoder_out = encoder_out.unsqueeze(-1)
-            
-        # Verify dimensions match
-        assert encoder_out.ndim == decoder_out.ndim, \
-            f"Dimension mismatch: encoder_out.ndim={encoder_out.ndim}, decoder_out.ndim={decoder_out.ndim}"
-        
-        # Compute joiner output
-        joiner_out = model.joiner(encoder_out, decoder_out)
-        
-        # Compute losses
-        simple_loss = model.simple_loss(joiner_out, y)
-        
-        if params.batch_idx_train > params.model_warm_step:
-            pruned_loss = model.pruned_loss(joiner_out, y)
-        
-        # Combine losses
-        loss = simple_loss
-        if pruned_loss is not None:
-            loss += pruned_loss
-        
-        # Add streaming regularization if training with XLSR
-        if is_training and params.use_xlsr:
-            loss += params.streaming_regularization * streaming_loss
-    
+        # Forward pass through model - this now computes both simple and pruned loss
+        simple_loss, pruned_loss = model(
+            x=feature,
+            x_lens=feature_lens,
+            y=y,
+            prune_range=params.prune_range,
+            am_scale=params.am_scale,
+            lm_scale=params.lm_scale,
+        )
+
+        # Combine losses according to params
+        s = params.simple_loss_scale
+        # take down the scale on the simple loss from 1.0 at the start
+        # to params.simple_loss scale by warm_step
+        simple_loss_scale = (
+            s
+            if params.batch_idx_train >= params.warm_step
+            else 1.0 - (params.batch_idx_train / params.warm_step) * (1.0 - s)
+        )
+        pruned_loss_scale = (
+            1.0
+            if params.batch_idx_train >= params.warm_step
+            else 0.1 + 0.9 * (params.batch_idx_train / params.warm_step)
+        )
+        loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
+
     assert loss.requires_grad == is_training
-    
+
     info = MetricsTracker()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
-    
+
     # Note: We use reduction=sum while computing the loss.
     info["loss"] = loss.detach().cpu().item()
-    if simple_loss is not None:
-        info["simple_loss"] = simple_loss.detach().cpu().item()
-    if pruned_loss is not None:
-        info["pruned_loss"] = pruned_loss.detach().cpu().item()
-    if streaming_loss.item() != 0:
-        info["streaming_loss"] = streaming_loss.detach().cpu().item()
-    
+    info["simple_loss"] = simple_loss.detach().cpu().item()
+    info["pruned_loss"] = pruned_loss.detach().cpu().item()
+
     return loss, info
 
 

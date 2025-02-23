@@ -867,57 +867,75 @@ def decode_with_beam_search(
     device = encoder_out.device
     batch_size = encoder_out.size(0)
 
-    # Convert encoder output to log probabilities
-    encoder_out = torch.nn.functional.log_softmax(encoder_out, dim=-1)
+    try:
+        # Convert encoder output to log probabilities
+        encoder_out = torch.nn.functional.log_softmax(encoder_out, dim=-1)
 
-    # Create supervision segments for k2
-    supervision_segments = torch.tensor(
-        [[i, 0, encoder_out_lens[i].item()] for i in range(batch_size)],
-        dtype=torch.int32,
-        device=device,
-    )
-
-    # Create dense FSA from encoder output
-    dense_fsa = k2.DenseFsaVec(encoder_out, supervision_segments)
-
-    if decoding_graph is None:
-        # Create a simple CTC-like decoding graph
-        decoding_graph = k2.trivial_graph(
-            params.vocab_size - 1,  # -1 since k2 doesn't need the blank token
-            device=device
+        # Create supervision segments on CPU as required by k2
+        supervision_segments = torch.tensor(
+            [[i, 0, encoder_out_lens[i].item()] for i in range(batch_size)],
+            dtype=torch.int32,
+            device="cpu"  # k2 requires this to be on CPU
         )
 
-    # Ensure decoding graph is on the correct device
-    decoding_graph = decoding_graph.to(device)
-    decoding_graph = k2.arc_sort(decoding_graph)
-
-    # Intersect with decoding graph and find best path
-    lattice = k2.intersect_dense_pruned(
-        decoding_graph,
-        dense_fsa,
-        search_beam=params.beam,
-        output_beam=params.beam,
-        min_active_states=params.max_states // 4,
-        max_active_states=params.max_states
-    )
-
-    # Get best path
-    best_path = k2.shortest_path(lattice, use_double_scores=True)
-    
-    # Convert best path to token IDs
-    hyps = []
-    for i in range(batch_size):
-        # Get labels (token IDs) from the best path
-        labels = []
-        for arc in best_path[i]:  # k2 handles iteration internally
-            if arc.label != 0:  # Skip blank tokens
-                labels.append(arc.label)
+        # Move encoder output to CPU for k2
+        encoder_out_cpu = encoder_out.detach().cpu()
         
-        # Convert token IDs to text using sentencepiece
-        hyp = sp.decode(labels)
-        hyps.append(hyp)
+        # Create dense FSA from encoder output
+        dense_fsa = k2.DenseFsaVec(encoder_out_cpu, supervision_segments)
 
-    return hyps
+        if decoding_graph is None:
+            # Create a simple CTC-like decoding graph
+            decoding_graph = k2.trivial_graph(
+                params.vocab_size - 1,  # -1 since k2 doesn't need the blank token
+                device="cpu"  # Create on CPU first
+            )
+
+        # Ensure decoding graph is on CPU and sorted
+        decoding_graph = decoding_graph.to("cpu")
+        decoding_graph = k2.arc_sort(decoding_graph)
+
+        # Intersect with decoding graph and find best path
+        lattice = k2.intersect_dense_pruned(
+            decoding_graph,
+            dense_fsa,
+            search_beam=params.beam,
+            output_beam=params.beam,
+            min_active_states=params.max_states // 4,
+            max_active_states=params.max_states
+        )
+
+        # Connect and sort the lattice
+        lattice = k2.connect(lattice)
+        lattice = k2.top_sort(lattice)
+
+        # Get best path
+        best_path = k2.shortest_path(lattice, use_double_scores=True)
+        
+        # Convert best path to token IDs
+        hyps = []
+        for i in range(batch_size):
+            # Get labels (token IDs) from the best path
+            labels = []
+            for arc in best_path[i].arcs:
+                if arc.label != 0:  # Skip blank tokens
+                    labels.append(arc.label)
+            
+            # Convert token IDs to text using sentencepiece
+            hyp = sp.decode(labels)
+            hyps.append(hyp)
+
+        return hyps
+
+    except Exception as e:
+        logging.warning(f"FSA decoding failed: {e}, falling back to greedy decoding")
+        # Fallback to greedy search
+        hyps = greedy_search_batch(
+            model=None,  # Not needed for CTC-style decoding
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens
+        )
+        return [sp.decode(h.tolist()) for h in hyps]
 
 
 def compute_validation_loss(

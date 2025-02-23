@@ -831,7 +831,29 @@ def compute_loss(
                 am_scale=params.am_scale,
                 lm_scale=params.lm_scale,
             )
-            wer = float('inf')  # Don't calculate WER during validation for now
+            
+            # Compute WER using greedy search decoding
+            # Get encoder output for decoding
+            encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
+            if hasattr(model, 'encoder_proj'):
+                encoder_out = model.encoder_proj(encoder_out)
+            
+            # Import greedy_search_batch if not already imported
+            from beam_search import greedy_search_batch
+            
+            hyp_tokens = greedy_search_batch(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+            )
+            
+            # Decode token sequences to texts
+            hyp_texts = [sp.decode(tokens) for tokens in hyp_tokens]
+            
+            # Compute word error rate (WER)
+            total_words = sum(len(ref.split()) for ref in texts)
+            total_errors = sum(editdistance.eval(hyp.split(), ref.split()) for hyp, ref in zip(hyp_texts, texts))
+            wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
     else:
         simple_loss, pruned_loss = model(
             x=feature,
@@ -841,7 +863,7 @@ def compute_loss(
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
         )
-        wer = 0.0  # Don't calculate WER during training
+        wer = 0.0  # Do not compute WER during training
     
     s = params.simple_loss_scale
     simple_loss_scale = (

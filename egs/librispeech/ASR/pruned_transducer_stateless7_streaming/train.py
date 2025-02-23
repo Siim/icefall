@@ -48,6 +48,7 @@ import copy
 import logging
 import warnings
 import editdistance
+import math
 from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, Optional, Tuple, Union
@@ -101,6 +102,8 @@ from beam_search import (
 )
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
+
+LOG_EPS = math.log(1e-10)  # Small value for padding in log space
 
 
 def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:

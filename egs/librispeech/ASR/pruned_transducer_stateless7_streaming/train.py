@@ -778,7 +778,8 @@ def compute_loss(
     batch: dict,
     is_training: bool,
 ) -> Tuple[Tensor, MetricsTracker]:
-    """Compute transducer loss given the model and batch.
+    """
+    Compute transducer loss given the model and batch.
     """
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
     feature = batch["inputs"]
@@ -786,10 +787,21 @@ def compute_loss(
     
     # Get supervisions
     supervisions = batch["supervisions"]
-    feature_lens = supervisions["num_frames"].to(device)
+    
+    # Get supervision segments
     texts = supervisions["text"]
     tokens = supervisions["tokens"].to(device)
     token_lens = supervisions["token_lens"].to(device)
+    
+    # Create row splits from token lengths
+    row_splits = torch.zeros(token_lens.size(0) + 1, dtype=torch.int32, device=device)
+    row_splits[1:] = torch.cumsum(token_lens, dim=0)
+    
+    # Create RaggedShape first
+    shape = k2.ragged.RaggedShape(row_splits=row_splits)
+    
+    # Then create RaggedTensor using shape and values
+    ragged_y = k2.RaggedTensor(shape=shape, values=tokens.flatten())
     
     if not is_training:
         try:
@@ -897,11 +909,6 @@ def compute_loss(
             wer = float('inf')
     else:
         wer = 0.0  # Don't calculate WER during training
-    
-    # Create RaggedTensor from tokens
-    row_splits = torch.zeros(token_lens.size(0) + 1, dtype=torch.int32, device=device)
-    row_splits[1:] = torch.cumsum(token_lens, dim=0)
-    ragged_y = k2.RaggedTensor(row_splits=row_splits, values=tokens.flatten())
     
     # Calculate loss
     simple_loss, pruned_loss = model(

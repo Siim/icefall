@@ -248,7 +248,7 @@ class XLSREncoder(EncoderInterface):
             # For first chunk, use full length
             effective_input_len = x_lens
             
-        # Calculate expected frames precisely
+        # Calculate expected frames precisely using ceil instead of floor
         expected_frames = ((effective_input_len.float() / self.downsample_factor).ceil()).to(torch.int64)
         expected_frames = torch.maximum(expected_frames, torch.ones_like(expected_frames))
         
@@ -276,17 +276,30 @@ class XLSREncoder(EncoderInterface):
         if context_frames > 0:
             outputs = outputs[:, context_frames:]
         
-        # Ensure outputs match expected length
+        # Ensure outputs match expected length precisely
         max_len = expected_frames.max().item()
         if outputs.size(1) > max_len:
-            # Take center frames to avoid edge effects
+            # Calculate optimal start position to minimize edge effects
             extra = outputs.size(1) - max_len
-            start = extra // 2
+            # Bias towards keeping more recent frames for streaming
+            start = (extra * 2) // 3  # Take more frames from the end
             outputs = outputs[:, start:start + max_len]
-        elif outputs.size(1) < max_len:
-            # Pad if needed (rare case)
+        elif outputs.size(1) < max_len and outputs.size(1) > 0:  # Only pad if we have some frames
+            # Calculate required padding
             pad_len = max_len - outputs.size(1)
-            outputs = torch.nn.functional.pad(outputs, (0, 0, 0, pad_len))
+            # Add padding at the end to maintain temporal order
+            outputs = torch.nn.functional.pad(
+                outputs,
+                (0, 0, 0, pad_len),
+                mode='replicate'  # Replicate last frame instead of zeros
+            )
+        elif outputs.size(1) == 0:  # Handle empty tensor case
+            # Create a tensor of the expected size filled with zeros
+            outputs = torch.zeros(
+                (outputs.size(0), max_len, outputs.size(2)),
+                device=outputs.device,
+                dtype=outputs.dtype
+            )
         
         # Apply smooth transition if we have previous output
         if self.last_chunk_output is not None:

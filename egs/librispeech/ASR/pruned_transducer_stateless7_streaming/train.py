@@ -803,8 +803,11 @@ def compute_loss(
         cached_tot_size=row_splits[-1].item()
     )
     
-    # Then create RaggedTensor using shape and values
-    ragged_y = k2.RaggedTensor(shape=shape, values=tokens.flatten())
+    # Ensure values tensor is properly formatted
+    values = tokens.flatten().to(dtype=torch.int32)
+    
+    # Create RaggedTensor with proper shape and values
+    ragged_y = k2.RaggedTensor(shape=shape, value=values)
     
     if not is_training:
         try:

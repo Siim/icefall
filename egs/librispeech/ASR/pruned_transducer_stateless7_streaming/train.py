@@ -804,12 +804,8 @@ def compute_loss(
             # If no valid samples, create a dummy batch with 2-second audio
             logging.warning("No valid samples in batch, using dummy 2-second sample")
             dummy_samples = 32000  # 2 seconds at 16kHz
-            if params.use_xlsr:
-                # For XLSR, input should be (batch, time)
-                feature = torch.zeros((1, dummy_samples), device=device)
-            else:
-                # For other encoders, keep the channel dimension
-                feature = torch.zeros((1, dummy_samples, feature.size(2)), device=device)
+            # Always create 3D input (batch, time, channels) - XLSR will squeeze internally if needed
+            feature = torch.zeros((1, dummy_samples, 1), device=device)
             feature_lens = torch.tensor([dummy_samples], device=device)
             texts = [""]
         else:

@@ -878,15 +878,19 @@ def compute_loss(
                     
                     # Get prediction
                     log_probs = torch.log_softmax(logits, dim=-1)
-                    pred = log_probs.argmax(dim=-1)  # Keep as tensor for now
-                    
-                    # Add token if not blank and not repeating
-                    if pred.item() != params.blank_id and (len(hyp) <= params.context_size or pred.item() != hyp[-1]):
-                        hyp.append(pred.item())
-                        
-                        # Update decoder state
-                        decoder_input = torch.tensor([hyp[-params.context_size:]], device=device)
-                        decoder_out = model.decoder(decoder_input)
+                    preds = log_probs.argmax(dim=-1)
+                    # Ensure hyp is a list of lists, one per sample in the batch
+                    if not isinstance(hyp, list) or (hyp and not isinstance(hyp[0], list)):
+                        # If hyp is not already a list of lists, initialize it for each sample in the batch
+                        hyp = [[token] if token != params.blank_id else [] for token in preds.tolist()]
+                    else:
+                        # Process each sample individually
+                        for i, p in enumerate(preds):
+                            # p is a tensor scalar for sample i
+                            token = p.item()
+                            # If the predicted token is not blank and either the hypothesis is empty or not repeating
+                            if token != params.blank_id and (len(hyp[i]) <= params.context_size or (hyp[i] and token != hyp[i][-1])):
+                                hyp[i].append(token)
                 
                 # Remove context tokens
                 hyps.append(hyp[params.context_size:])

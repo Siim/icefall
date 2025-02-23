@@ -110,26 +110,26 @@ class EstonianASRDataset(Dataset):
                 waveform.squeeze().numpy(),
                 sampling_rate=16000,
                 return_tensors="pt"
-            ).input_values
+            ).input_values.squeeze(0)  # Remove batch dimension from processor
             
             # Double check length constraints with some margin for resampling
             margin = 100  # Small safety margin
-            if input_values.size(1) < self.min_samples - margin:
-                raise ValueError(f"Audio too short after processing: {input_values.size(1)} samples")
-            if input_values.size(1) > self.max_samples + margin:
-                raise ValueError(f"Audio too long after processing: {input_values.size(1)} samples")
+            if input_values.size(0) < self.min_samples - margin:
+                raise ValueError(f"Audio too short after processing: {input_values.size(0)} samples")
+            if input_values.size(0) > self.max_samples + margin:
+                raise ValueError(f"Audio too long after processing: {input_values.size(0)} samples")
             
             # Validate audio duration vs text length
             min_chars_per_second = 3  # Estonian ~4.5 chars/sec avg
-            audio_duration = input_values.size(1) / 16000
+            audio_duration = input_values.size(0) / 16000
             if len(transcript) / audio_duration < min_chars_per_second:
                 self.logger.warning(f"Suspicious sample {wav_path} - {len(transcript)} chars in {audio_duration:.1f}s")
             
             # Return a dictionary with processed input values
             return {
-                'inputs': input_values,  # shape: (1, time)
+                'inputs': input_values.unsqueeze(0),  # Add channel dimension to make (1, time)
                 'supervisions': {
-                    'num_frames': input_values.size(1),
+                    'num_frames': input_values.size(0),
                     'text': transcript,
                     'audio_paths': wav_path
                 }
@@ -164,6 +164,9 @@ def collate_fn(batch: list) -> dict:
     
     # Stack to get a tensor of shape (batch, time)
     inputs = torch.cat(padded_waveforms, dim=0)  # (batch, time)
+    
+    # Add channel dimension to make it (batch, time, channel)
+    inputs = inputs.unsqueeze(-1)  # Add channel dimension at the end
     
     supervisions = {
         'num_frames': torch.tensor(num_frames, dtype=torch.int32),

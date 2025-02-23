@@ -804,7 +804,7 @@ def compute_loss(
     )
     
     # Get total number of elements from shape
-    total_elements = shape.NumElements()
+    total_elements = shape.num_elements()
     
     # Debug logging
     logging.debug(f"Shape expects {total_elements} elements")

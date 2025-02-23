@@ -70,7 +70,7 @@ from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from zipformer import Zipformer
-from xlsr_encoder import XLSREncoder, EncoderInterface
+from xlsr_encoder import XLSREncoder
 
 from icefall import diagnostics
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
@@ -553,7 +553,7 @@ def get_params() -> AttributeDict:
     return params
 
 
-def get_encoder_model(params: AttributeDict) -> EncoderInterface:
+def get_encoder_model(params: AttributeDict) -> nn.Module:
     if getattr(params, 'use_xlsr', False):
         # Create XLSR encoder with streaming capabilities built-in
         encoder = XLSREncoder(
@@ -568,6 +568,8 @@ def get_encoder_model(params: AttributeDict) -> EncoderInterface:
             max_chunk_size=20480,  # 1280ms at 16kHz (128 frames)
             left_context_chunks=params.left_context_chunks  # 1 chunk (paper's optimal)
         )
+        # Verify the encoder is properly initialized
+        assert isinstance(encoder, XLSREncoder), f"Expected XLSREncoder, got {type(encoder)}"
         return encoder
     else:
         # Original Zipformer code...

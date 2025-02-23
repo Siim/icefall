@@ -21,8 +21,7 @@ import k2
 import torch
 import torch.nn as nn
 from torch import amp
-from encoder_interface import EncoderInterface
-from xlsr_encoder import XLSREncoder
+from xlsr_encoder import XLSREncoder, EncoderInterface
 from scaling import penalize_abs_values_gt
 
 from icefall.utils import add_sos

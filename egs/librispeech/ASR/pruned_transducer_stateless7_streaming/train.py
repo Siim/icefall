@@ -794,30 +794,6 @@ def compute_loss(
     y = k2.RaggedTensor(y)
 
     with torch.set_grad_enabled(is_training):
-        # Get encoder output
-        encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
-        
-        # Get decoder output
-        row_splits = y.shape.row_splits(1)
-        y_lens = row_splits[1:] - row_splits[:-1]
-        
-        # Add blank at the beginning
-        blank_id = model.decoder.blank_id
-        sos_y = add_sos(y, sos_id=blank_id)
-        
-        # sos_y_padded: [B, S + 1], start with SOS.
-        sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
-        sos_y_padded = sos_y_padded.to(device)
-        
-        # decoder_out: [B, S + 1, decoder_dim]
-        decoder_out = model.decoder(sos_y_padded)
-        
-        # Create boundary tensor
-        batch_size = feature.size(0)
-        boundary = torch.zeros((batch_size, 4), dtype=torch.int64, device=device)
-        boundary[:, 2] = y_lens
-        boundary[:, 3] = encoder_out_lens
-        
         # Forward pass through model
         simple_loss, pruned_loss = model(
             x=feature,
@@ -826,8 +802,10 @@ def compute_loss(
             prune_range=params.prune_range,
             am_scale=params.am_scale,
             lm_scale=params.lm_scale,
-            boundary=boundary,  # Pass boundary tensor explicitly
         )
+
+        # Combine losses
+        loss = params.simple_loss_scale * simple_loss + (1 - params.simple_loss_scale) * pruned_loss
 
     assert loss.requires_grad == is_training
 

@@ -799,24 +799,6 @@ def compute_loss(
     y = k2.RaggedTensor(y)
 
     with torch.set_grad_enabled(is_training):
-        # Get encoder output
-        encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
-        
-        # Get decoder output
-        row_splits = y.shape.row_splits(1)
-        y_lens = row_splits[1:] - row_splits[:-1]
-        
-        # Add blank at the beginning
-        blank_id = model.decoder.blank_id
-        sos_y = add_sos(y, sos_id=blank_id)
-        
-        # sos_y_padded: [B, S + 1], start with SOS.
-        sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
-        sos_y_padded = sos_y_padded.to(device)
-        
-        # decoder_out: [B, S + 1, decoder_dim]
-        decoder_out = model.decoder(sos_y_padded)
-        
         # Forward pass through model
         simple_loss, pruned_loss = model(
             x=feature,
@@ -827,9 +809,15 @@ def compute_loss(
             lm_scale=params.lm_scale,
         )
 
+        # Combine losses with scaling
+        loss = params.simple_loss_scale * simple_loss + (1 - params.simple_loss_scale) * pruned_loss
+
         # Add streaming regularization if training
         if is_training and params.streaming_regularization > 0:
-            # Get chunk boundaries based on paper's configurations
+            # Get encoder output
+            encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
+            
+            # Process in chunks based on paper's configurations
             chunk_size = int(0.32 * 16000)  # 320ms at 16kHz
             overlap = chunk_size // 2
             
@@ -867,7 +855,7 @@ def compute_loss(
     info["loss"] = loss.detach().cpu().item()
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
-    if is_training and params.streaming_regularization > 0:
+    if is_training and params.streaming_regularization > 0 and len(chunk_outputs) > 1:
         info["streaming_loss"] = streaming_loss.detach().cpu().item()
 
     return loss, info

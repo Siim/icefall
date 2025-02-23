@@ -162,7 +162,8 @@ class Transducer(nn.Module):
         boundary[:, 0] = 0  # Start frame index
         boundary[:, 1] = 0  # Start label index  
         boundary[:, 2] = y_lens  # End label index
-        boundary[:, 3] = x_lens  # End frame index
+        # Use actual encoder output size for frame length
+        boundary[:, 3] = torch.minimum(x_lens, torch.tensor(encoder_out.size(1), device=x_lens.device))
         
         print(f"Boundary tensor: {boundary}")
         print(f"y_padded size: {y_padded.size()}, encoder_out size: {encoder_out.size()}")

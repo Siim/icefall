@@ -823,6 +823,22 @@ def compute_loss(
     # Calculate loss with proper gradient context
     if not is_training:
         with torch.no_grad():
+            # Add right context for streaming
+            feature_lens_pad = feature_lens + 30
+            feature_pad = torch.nn.functional.pad(
+                feature,
+                pad=(0, 0, 0, 30),
+                value=0.0,
+            )
+            
+            # Get encoder output
+            encoder_out, encoder_out_lens = model.encoder(x=feature_pad, x_lens=feature_lens_pad)
+            
+            # Project encoder output if using XLSR
+            if hasattr(model, "encoder_proj"):
+                encoder_out = model.encoder_proj(encoder_out)
+            
+            # Calculate loss
             simple_loss, pruned_loss = model(
                 x=feature,
                 x_lens=feature_lens,
@@ -831,7 +847,61 @@ def compute_loss(
                 am_scale=params.am_scale,
                 lm_scale=params.lm_scale,
             )
-            wer = float('inf')  # Don't calculate WER during validation for now
+            
+            # Calculate WER using greedy search
+            hyps = []
+            for i in range(encoder_out.size(0)):
+                # Get encoder output for this sequence
+                enc_out = encoder_out[i:i+1, :encoder_out_lens[i]]
+                
+                # Initialize decoder state
+                blank_id = model.decoder.blank_id
+                context_size = model.decoder.context_size
+                hyp = [blank_id] * context_size
+                
+                # Initialize decoder input
+                decoder_input = torch.tensor([hyp], device=device)
+                decoder_out = model.decoder(decoder_input)
+                
+                # Process each frame
+                for t in range(enc_out.size(1)):
+                    # Get encoder frame
+                    encoder_frame = enc_out[:, t:t+1]
+                    
+                    # Get logits from joiner
+                    logits = model.joiner(encoder_frame, decoder_out)
+                    
+                    # Get prediction
+                    log_probs = torch.log_softmax(logits, dim=-1)
+                    pred = log_probs.argmax(dim=-1).item()
+                    
+                    # Add token if not blank and not repeating
+                    if pred != blank_id and (len(hyp) <= context_size or pred != hyp[-1]):
+                        hyp.append(pred)
+                        
+                        # Update decoder state
+                        decoder_input = torch.tensor([hyp[-context_size:]], device=device)
+                        decoder_out = model.decoder(decoder_input)
+                
+                # Remove context tokens
+                hyps.append(hyp[context_size:])
+            
+            # Convert hypotheses to text
+            hyp_texts = []
+            for hyp in hyps:
+                try:
+                    text = sp.decode(hyp)
+                    hyp_texts.append(text)
+                except Exception as e:
+                    logging.warning(f"Failed to decode: {str(e)}")
+                    hyp_texts.append("")
+            
+            # Calculate WER
+            total_words = sum(len(text.split()) for text in texts)
+            total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
+                             for hyp, ref in zip(hyp_texts, texts))
+            wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
+            
     else:
         simple_loss, pruned_loss = model(
             x=feature,

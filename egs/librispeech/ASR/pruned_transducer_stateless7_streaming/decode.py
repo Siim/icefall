@@ -153,47 +153,45 @@ class StreamingEncoder:
     def __init__(
         self, 
         encoder: nn.Module, 
-        chunk_size: int = 8000, 
-        chunk_overlap: int = 4000,
-        adaptive_chunk_size: bool = True,
-        min_chunk_size: int = 4000,
-        max_chunk_size: int = 12000,
-        latency_tolerance: float = 0.1
+        chunk_size: int = 5120,  # 320ms at 16kHz (paper's best performing)
+        chunk_overlap: int = None,  # Will be set to chunk_size // 2
+        use_attention_sink: bool = True,
+        attention_sink_size: int = 16,  # Paper's optimal setting
+        frame_duration: float = 0.025,  # 25ms per frame
+        frame_stride: float = 0.020,  # 20ms stride
+        min_chunk_size: int = 2560,  # 160ms at 16kHz (16 frames)
+        max_chunk_size: int = 20480,  # 1280ms at 16kHz (128 frames)
+        left_context_chunks: int = 1,  # Paper's optimal setting
     ):
-        """
-        Args:
-            encoder: The XLSR or Zipformer encoder
-            chunk_size: Initial size of each chunk in samples
-            chunk_overlap: Overlap between consecutive chunks in samples
-            adaptive_chunk_size: Whether to use adaptive chunk sizing
-            min_chunk_size: Minimum allowed chunk size
-            max_chunk_size: Maximum allowed chunk size
-            latency_tolerance: Target latency in seconds
-        """
         self.encoder = encoder
         self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
-        self.adaptive_chunk_size = adaptive_chunk_size
+        self.chunk_overlap = chunk_overlap if chunk_overlap is not None else chunk_size // 2
+        self.use_attention_sink = use_attention_sink
+        self.attention_sink_size = attention_sink_size
+        self.frame_duration = frame_duration
+        self.frame_stride = frame_stride
         self.min_chunk_size = min_chunk_size
         self.max_chunk_size = max_chunk_size
-        self.latency_tolerance = latency_tolerance
+        self.left_context_chunks = left_context_chunks
         self.reset()
 
     def reset(self):
         """Reset the streaming state"""
         if hasattr(self.encoder, 'reset_streaming_state'):
             self.encoder.reset_streaming_state()
-        else:
-            # Fallback for non-XLSR encoders
-            self.cached_features = None
-            self.cached_len = 0
-            self.current_chunk_size = self.chunk_size
-            self.last_chunk_latency = 0
-            self.streaming_state = None
+        self.cached_features = None
+        self.cached_len = 0
+        self.current_chunk_size = self.chunk_size
+        self.last_chunk_latency = 0
+        self.streaming_state = None
+        self.attention_sink_cache = None
+        self.context_cache = None
+        self.last_chunk_output = None
+        self.left_context_buffer = []  # Store left context chunks
 
     def forward(self, x: torch.Tensor, x_lens: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Streaming forward pass with adaptive chunk size
+        Streaming forward pass with proper context and attention sink handling
         Args:
             x: Input tensor (batch=1, time)
             x_lens: Length of input (optional in streaming mode)
@@ -203,7 +201,7 @@ class StreamingEncoder:
         assert x.size(0) == 1, "Streaming only supports batch size 1"
         
         # Handle cached features if any
-        if hasattr(self, 'cached_features') and self.cached_features is not None:
+        if self.cached_features is not None:
             x = torch.cat([self.cached_features, x], dim=1)
             self.cached_features = None
 
@@ -213,38 +211,46 @@ class StreamingEncoder:
         while current_offset < x.size(1):
             chunk_start_time = time.time()
             
-            # Use current chunk size (might be adaptive)
-            if hasattr(self.encoder, 'current_chunk_size'):
-                chunk_size = self.encoder.current_chunk_size
-            else:
-                chunk_size = self.chunk_size
-                
-            end_idx = min(current_offset + chunk_size, x.size(1))
+            # Use current chunk size
+            end_idx = min(current_offset + self.current_chunk_size, x.size(1))
             chunk = x[:, current_offset:end_idx]
             
-            # Process chunk through encoder
-            if isinstance(self.encoder, XLSREncoder):
-                chunk_len = torch.tensor([chunk.size(1)], dtype=torch.int32)
-                chunk_out, _ = self.encoder(chunk.unsqueeze(-1), chunk_len)
-            else:
-                # Handle Zipformer or other encoders
-                chunk_out = self.encoder(chunk)
-
+            # Add left context if available
+            if self.left_context_buffer:
+                context = self.left_context_buffer[-self.left_context_chunks:]
+                chunk = torch.cat([*context, chunk], dim=1)
+            
+            # Add attention sink if enabled
+            if self.use_attention_sink and self.attention_sink_cache is not None:
+                chunk = torch.cat([self.attention_sink_cache, chunk], dim=1)
+            
+            # Process chunk
+            chunk_len = torch.tensor([chunk.shape[1]], dtype=torch.int32)
+            chunk_out, chunk_lens = self.encoder(chunk, chunk_len)
+            
+            # Update attention sink cache
+            if self.use_attention_sink:
+                sink_size = self.attention_sink_size * self.encoder.downsample_factor
+                self.attention_sink_cache = chunk[:, -sink_size:]
+            
+            # Update left context buffer
+            self.left_context_buffer.append(chunk.clone())
+            if len(self.left_context_buffer) > self.left_context_chunks:
+                self.left_context_buffer.pop(0)
+            
             # If not the last chunk, cache overlap portion
             if end_idx < x.size(1):
-                if hasattr(self, 'cached_features'):
-                    self.cached_features = x[:, end_idx - self.chunk_overlap:end_idx]
+                self.cached_features = x[:, end_idx - self.chunk_overlap:end_idx]
                 # Only keep non-overlapping portion of output
-                overlap_frames = self.chunk_overlap // getattr(self.encoder, 'downsample_factor', 320)
+                overlap_frames = self.chunk_overlap // self.encoder.downsample_factor
                 chunk_out = chunk_out[:, :-overlap_frames]
             
             outputs_list.append(chunk_out)
             current_offset = end_idx - self.chunk_overlap
             
-            # Measure chunk processing time and adjust if needed
+            # Measure chunk latency and adjust size if needed
             chunk_latency = time.time() - chunk_start_time
-            if hasattr(self.encoder, 'adjust_chunk_size'):
-                self.encoder.adjust_chunk_size(chunk_latency)
+            self.last_chunk_latency = chunk_latency
 
         # Concatenate all chunks
         if outputs_list:

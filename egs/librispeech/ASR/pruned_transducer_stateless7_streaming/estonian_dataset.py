@@ -15,8 +15,8 @@ class EstonianASRDataset(Dataset):
         self.transform = transform
         
         # Duration limits (in samples at 16kHz)
-        min_samples = max(16000, 400)  # 1 sec or 400 samples, whichever is larger
-        max_samples = 320000  # 20 sec
+        self.min_samples = 16000  # 1 sec minimum
+        self.max_samples = 320000  # 20 sec maximum
         
         # Ensure base_path ends with a slash if provided
         if base_path:
@@ -50,19 +50,19 @@ class EstonianASRDataset(Dataset):
                 info = torchaudio.info(wav_path)
                 num_samples = info.num_frames
                 
-                # Filter by duration
-                if num_samples < min_samples:
+                # Filter by duration (1-20 seconds)
+                if num_samples < self.min_samples:
                     filtered_short += 1
                     continue
-                if num_samples > max_samples:
+                if num_samples > self.max_samples:
                     filtered_long += 1
                     continue
                 
                 self.samples.append((wav_path, transcript))
         
         print(f"Loaded {len(self.samples)} samples from {txt_path}")
-        print(f"Filtered out {filtered_short} samples shorter than {min_samples/16000:.1f}s")
-        print(f"Filtered out {filtered_long} samples longer than {max_samples/16000:.1f}s")
+        print(f"Filtered out {filtered_short} samples shorter than {self.min_samples/16000:.1f}s")
+        print(f"Filtered out {filtered_long} samples longer than {self.max_samples/16000:.1f}s")
         print(f"Total acceptance rate: {len(self.samples)/total_files*100:.1f}%")
         print(f"Using base path: {base_path if base_path else 'None'}")
         # Print first few samples for verification
@@ -74,12 +74,14 @@ class EstonianASRDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         wav_path, transcript = self.samples[idx]
-        waveform, orig_freq = torchaudio.load(wav_path)  # shape: (channels, time)
         
-        # Ensure 16kHz sampling rate
-        if orig_freq != 16000:
-            waveform = torchaudio.functional.resample(waveform, orig_freq, 16000)
+        # Load audio
+        waveform, sample_rate = torchaudio.load(wav_path)
         
+        # Resample if needed
+        if sample_rate != 16000:
+            waveform = torchaudio.functional.resample(waveform, sample_rate, 16000)
+            
         # Convert to mono if stereo
         if waveform.size(0) > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
@@ -92,7 +94,12 @@ class EstonianASRDataset(Dataset):
         elif waveform.dtype == torch.uint8:
             waveform = (waveform.float() - 128) / 128.0
         
+        # Ensure values are clamped to [-1, 1]
         waveform = torch.clamp(waveform, min=-1.0, max=1.0)
+        
+        # Double check length constraints
+        assert waveform.size(1) >= self.min_samples, f"Audio too short: {waveform.size(1)} samples"
+        assert waveform.size(1) <= self.max_samples, f"Audio too long: {waveform.size(1)} samples"
         
         # Validate audio duration vs text length
         min_chars_per_second = 3  # Estonian ~4.5 chars/sec avg

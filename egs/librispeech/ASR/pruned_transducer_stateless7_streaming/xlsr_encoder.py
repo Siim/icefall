@@ -51,7 +51,7 @@ class EncoderInterface(nn.Module):
 class XLSREncoder(EncoderInterface):
     def __init__(
         self, 
-        model_name: str = "facebook/wav2vec2-xls-r-300m",
+        model_name: str = "TalTechNLP/xls-r-300m-et",
         decode_chunk_size: int = 5120,  # 320ms at 16kHz (paper's best performing)
         chunk_overlap: int = None,  # Will be set to decode_chunk_size // 2
         use_attention_sink: bool = True,

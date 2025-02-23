@@ -36,6 +36,7 @@ class Joiner(nn.Module):
         self,
         encoder_out: torch.Tensor,
         decoder_out: torch.Tensor,
+        project_input: bool = True,
     ) -> torch.Tensor:
         """
         Args:
@@ -43,6 +44,8 @@ class Joiner(nn.Module):
                 (batch_size, T, encoder_dim) or (batch_size, T, 1, encoder_dim)
             decoder_out: Output from the decoder, of shape
                 (batch_size, U, decoder_dim) or (batch_size, T, U, decoder_dim)
+            project_input: If True, apply input projections encoder_proj and decoder_proj.
+                If False, assume inputs are already projected.
         Returns:
             torch.Tensor: of shape (batch_size, T, U, vocab_size)
         """
@@ -61,8 +64,9 @@ class Joiner(nn.Module):
         assert decoder_out.ndim == 4
         
         # Now both are 4D: (batch_size, T, U, dim)
-        encoder_out = self.encoder_proj(encoder_out)
-        decoder_out = self.decoder_proj(decoder_out)
+        if project_input:
+            encoder_out = self.encoder_proj(encoder_out)
+            decoder_out = self.decoder_proj(decoder_out)
         
         # Add outputs together then apply final projection
         logits = encoder_out + decoder_out

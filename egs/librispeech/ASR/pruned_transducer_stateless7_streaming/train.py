@@ -939,6 +939,9 @@ def compute_validation_loss(
     # Initialize WER computer
     wer = WERComputer()
     
+    # Get device from model parameters
+    device = next(model.parameters()).device
+    
     for batch_idx, batch in enumerate(valid_dl):
         loss, loss_info = compute_loss(
             params=params,
@@ -951,8 +954,8 @@ def compute_validation_loss(
         # Compute WER for this batch
         if params.use_xlsr:
             # Get encoder output
-            feature = batch["inputs"].to(model.device)
-            feature_lens = batch["supervisions"]["num_frames"].to(model.device)
+            feature = batch["inputs"].to(device)
+            feature_lens = batch["supervisions"]["num_frames"].to(device)
             
             # Non-streaming forward pass for validation
             encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)

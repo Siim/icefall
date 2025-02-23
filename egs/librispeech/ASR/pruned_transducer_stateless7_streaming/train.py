@@ -861,15 +861,16 @@ def compute_loss(
                 
                 # Process each frame
                 for t in range(enc_out.size(1)):
-                    # Extract encoder frame and ensure it's 3D (N, 1, encoder_dim)
-                    encoder_frame = enc_out[:, t:t+1]  # Keep time dimension
+                    # Extract encoder frame and ensure it's 2D (N, encoder_dim)
+                    encoder_frame = enc_out[:, t:t+1]  # (N, 1, encoder_dim)
                     if hasattr(model, "encoder_proj"):
                         encoder_frame = model.encoder_proj(encoder_frame)
+                    encoder_frame = encoder_frame.squeeze(1)  # (N, encoder_dim)
                     
-                    # Ensure decoder output is 3D (N, 1, decoder_dim)
-                    decoder_current = decoder_out.unsqueeze(1)  # Add time dimension
+                    # Ensure decoder output is 2D (N, decoder_dim)
+                    decoder_current = decoder_out  # Already (N, decoder_dim)
                     
-                    # Now both inputs are 3D: (N, 1, dim)
+                    # Now both inputs are 2D: (N, dim)
                     logits = model.joiner(encoder_frame, decoder_current)
                     log_probs = torch.log_softmax(logits, dim=-1)
                     preds = log_probs.argmax(dim=-1)

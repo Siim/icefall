@@ -838,10 +838,14 @@ def compute_loss(
                 
                 # Ensure we have valid encoder output
                 if encoder_out.size(1) == 0 or encoder_out_lens.min() == 0:
-                    logging.warning("Empty encoder output, skipping WER calculation")
+                    logging.warning(f"Empty encoder output: shape={encoder_out.shape}, lens={encoder_out_lens}")
                     wer = float('inf')
                 else:
                     try:
+                        logging.info(f"\nAttempting WER calculation:")
+                        logging.info(f"Encoder output shape: {encoder_out.shape}")
+                        logging.info(f"Encoder output lens: {encoder_out_lens}")
+                        
                         # Use greedy search for quick WER calculation
                         hyps = greedy_search_batch(
                             model=model,
@@ -849,19 +853,30 @@ def compute_loss(
                             encoder_out_lens=encoder_out_lens,
                         )
                         
-                        # Ensure hyps is a list
+                        logging.info(f"Got hypotheses: {type(hyps)}")
                         if isinstance(hyps, torch.Tensor):
+                            logging.info(f"Hypothesis tensor shape: {hyps.shape}")
                             hyps = [hyps]
                         
                         # Convert hypotheses to text
                         hyp_texts = []
-                        for hyp in hyps:
+                        for i, hyp in enumerate(hyps):
                             try:
                                 text = sp.decode(hyp)
                                 hyp_texts.append(text)
+                                logging.info(f"Decoded hyp {i}: tokens={hyp}, text='{text}'")
                             except Exception as e:
-                                logging.warning(f"Failed to decode hypothesis: {str(e)}")
-                                hyp_texts.append("")  # Add empty string for failed decoding
+                                logging.warning(f"Failed to decode hypothesis {i}: {str(e)}")
+                                logging.info(f"Problem tokens: {hyp}")
+                                hyp_texts.append("")
+                        
+                        logging.info(f"\nReference texts ({len(texts)}):")
+                        for i, ref in enumerate(texts):
+                            logging.info(f"Ref {i}: '{ref}'")
+                            
+                        logging.info(f"\nHypothesis texts ({len(hyp_texts)}):")
+                        for i, hyp in enumerate(hyp_texts):
+                            logging.info(f"Hyp {i}: '{hyp}'")
                         
                         # Ensure we have same number of hypotheses as references
                         if len(hyp_texts) != len(texts):
@@ -881,15 +896,15 @@ def compute_loss(
                                          for hyp, ref in zip(hyp_texts, texts))
                         wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
                         
-                        # Log some examples periodically
-                        if batch_idx_train % 1000 == 0:
-                            logging.info("\nExample Predictions:")
-                            for i in range(min(2, len(texts))):  # Show first 2 examples
-                                logging.info(f"Reference: {texts[i]}")
-                                logging.info(f"Predicted: {hyp_texts[i]}")
-                                logging.info("-" * 50)
+                        logging.info(f"\nWER Calculation:")
+                        logging.info(f"Total words: {total_words}")
+                        logging.info(f"Total errors: {total_errors}")
+                        logging.info(f"WER: {wer:.1f}%")
+                        
                     except Exception as e:
                         logging.warning(f"WER calculation failed: {str(e)}")
+                        logging.warning(f"Encoder output shape: {encoder_out.shape}")
+                        logging.warning(f"Encoder output lens: {encoder_out_lens}")
                         wer = float('inf')
             except Exception as e:
                 logging.warning(f"WER calculation failed: {str(e)}")

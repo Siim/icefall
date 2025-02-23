@@ -846,82 +846,74 @@ def compute_loss(
     return loss, info
 
 
-def decode_batch(
+def decode_with_beam_search(
+    encoder_out: torch.Tensor,
+    encoder_out_lens: torch.Tensor,
     params: AttributeDict,
-    model: Union[nn.Module, DDP],
     sp: spm.SentencePieceProcessor,
-    batch: dict,
-    max_decode_samples: int = 4,
-) -> List[Tuple[str, str, float]]:
-    """Decode a random subset of the batch and compute WER for monitoring.
+    decoding_graph: Optional[k2.Fsa] = None,
+) -> List[str]:
+    """Decode with beam search and FSA.
     
     Args:
-        params: Training parameters
-        model: The model to use for decoding
-        sp: SentencePiece tokenizer
-        batch: Current batch of data
-        max_decode_samples: Maximum number of samples to decode
-        
+        encoder_out: Output from encoder (B, T, C)
+        encoder_out_lens: Length of each sequence
+        params: Parameters
+        sp: SentencePieceProcessor tokenizer
+        decoding_graph: Optional FSA graph for decoding
+    
     Returns:
-        List of tuples containing (reference, hypothesis, WER)
+        List of decoded texts
     """
-    model.eval()
-    device = next(model.parameters()).device
+    device = encoder_out.device
+    batch_size = encoder_out.size(0)
     
-    with torch.no_grad():
-        # Select up to max_decode_samples from the batch
-        indices = torch.randperm(len(batch["supervisions"]["text"]))[:max_decode_samples]
-        
-        # Prepare mini-batch for decoding
-        texts = [batch["supervisions"]["text"][i] for i in indices]
-        features = batch["inputs"][indices].to(device)
-        feature_lens = batch["supervisions"]["num_frames"][indices].to(device)
-        
-        encoder_out, encoder_out_lens = model.encoder(x=features, x_lens=feature_lens)
-        
-        # Log encoder output statistics
-        logging.info(f"\nEncoder output stats:")
-        logging.info(f"Shape: {encoder_out.shape}")
-        logging.info(f"Mean: {encoder_out.mean().item():.3f}")
-        logging.info(f"Std: {encoder_out.std().item():.3f}")
-        logging.info(f"Min: {encoder_out.min().item():.3f}")
-        logging.info(f"Max: {encoder_out.max().item():.3f}")
-        
-        hyps = []
-        # Use greedy search for quick monitoring
-        hyp_tokens = greedy_search_batch(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens
-        )
-        
-        total_words = 0
-        total_errors = 0
-        
-        for i, tokens in enumerate(hyp_tokens):
-            # Convert token IDs to text - tokens is already a list
-            text = sp.decode(tokens)
-            ref = texts[i]
-            hyp_words = text.split()
-            ref_words = ref.split()
-            # Compute WER for this sample
-            errors = editdistance.eval(ref_words, hyp_words)
-            wer = errors / len(ref_words) * 100 if ref_words else 0
-            
-            total_words += len(ref_words)
-            total_errors += errors
-            
-            logging.info(f"\nReference: {ref}")
-            logging.info(f"Hypothesis: {text}")
-            logging.info(f"Sample WER: {wer:.1f}%")
-            hyps.append((ref, text, wer))
-            
-        # Log overall WER for this batch
-        if total_words > 0:
-            batch_wer = (total_errors / total_words) * 100
-            logging.info(f"\nBatch WER: {batch_wer:.1f}% (Total words: {total_words}, Total errors: {total_errors})")
+    # Convert encoder output to log probabilities
+    log_probs = torch.nn.functional.log_softmax(encoder_out / params.temperature, dim=-1)
     
-    model.train()
+    # Create supervision segments in the format expected by k2
+    # Each segment needs: (segment_index, start_frame, duration)
+    supervision_segments = torch.tensor(
+        [[0, 0, encoder_out.size(1)]],  # Single segment covering entire sequence
+        dtype=torch.int32
+    )
+    
+    # Create DenseFsaVec - everything must be on CPU for k2 initialization
+    dense_fsa = k2.DenseFsaVec(log_probs.cpu(), supervision_segments)
+    dense_fsa = dense_fsa.to(device)  # Move back to device after creation
+    
+    # If no decoding graph provided, create a simple one
+    if decoding_graph is None:
+        decoding_graph = k2.trivial_graph(params.vocab_size, device=device)
+    
+    # Ensure graph is on correct device and sorted
+    if decoding_graph.device != device:
+        decoding_graph = decoding_graph.to(device)
+    decoding_graph = k2.arc_sort(decoding_graph)
+    
+    # Intersect with decoding graph
+    lattice = k2.intersect_dense_pruned(
+        decoding_graph,
+        dense_fsa,
+        search_beam=params.beam,
+        output_beam=params.beam,
+        min_active_states=params.min_active_states,
+        max_active_states=params.max_active_states
+    )
+    
+    # Get best path
+    best_path = k2.shortest_path(lattice, use_double_scores=True)
+    
+    # Extract tokens and convert to text
+    hyps = []
+    for i in range(batch_size):
+        tokens = []
+        for arc in best_path[i].arcs:
+            if arc.label != 0:  # Skip epsilon transitions
+                tokens.append(arc.label)
+        text = sp.decode(tokens)
+        hyps.append(text)
+    
     return hyps
 
 
@@ -1071,71 +1063,6 @@ class WERComputer:
             previous_row = current_row
         
         return previous_row[-1]
-
-def decode_with_beam_search(
-    encoder_out: torch.Tensor,
-    encoder_out_lens: torch.Tensor,
-    params: AttributeDict,
-    sp: spm.SentencePieceProcessor,
-    decoding_graph: Optional[k2.Fsa] = None,
-) -> List[str]:
-    """Decode with beam search and FSA.
-    
-    Args:
-        encoder_out: Output from encoder (B, T, C)
-        encoder_out_lens: Length of each sequence
-        params: Parameters
-        sp: SentencePieceProcessor tokenizer
-        decoding_graph: Optional FSA graph for decoding
-    
-    Returns:
-        List of decoded texts
-    """
-    device = encoder_out.device
-    batch_size = encoder_out.size(0)
-    
-    # Convert encoder output to log probabilities
-    log_probs = torch.nn.functional.log_softmax(encoder_out / params.temperature, dim=-1)
-    
-    # Create supervision for dense intersection - ensure it's on CPU with int32 dtype
-    supervision = torch.tensor([[0, encoder_out.size(1)]], dtype=torch.int32)  # Create on CPU
-    dense_fsa = k2.DenseFsaVec(log_probs.cpu(), supervision)  # Move log_probs to CPU for k2
-    dense_fsa = dense_fsa.to(device)  # Move back to device after creation
-    
-    # If no decoding graph provided, create a simple one
-    if decoding_graph is None:
-        decoding_graph = k2.trivial_graph(params.vocab_size, device=device)
-    
-    # Ensure graph is on correct device and sorted
-    if decoding_graph.device != device:
-        decoding_graph = decoding_graph.to(device)
-    decoding_graph = k2.arc_sort(decoding_graph)
-    
-    # Intersect with decoding graph
-    lattice = k2.intersect_dense_pruned(
-        decoding_graph,
-        dense_fsa,
-        search_beam=params.beam,
-        output_beam=params.beam,
-        min_active_states=params.min_active_states,
-        max_active_states=params.max_active_states
-    )
-    
-    # Get best path
-    best_path = k2.shortest_path(lattice, use_double_scores=True)
-    
-    # Extract tokens and convert to text
-    hyps = []
-    for i in range(batch_size):
-        tokens = []
-        for arc in best_path[i].arcs:
-            if arc.label != 0:  # Skip epsilon transitions
-                tokens.append(arc.label)
-        text = sp.decode(tokens)
-        hyps.append(text)
-    
-    return hyps
-
 
 def train_one_epoch(
     params: AttributeDict,

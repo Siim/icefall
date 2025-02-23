@@ -798,11 +798,13 @@ def compute_loss(
     if not valid_lens_mask.all():
         num_short = (sample_lens < min_samples).sum().item()
         num_long = (sample_lens > max_samples).sum().item()
-        logging.warning(f"Filtered out {num_short} samples < {min_samples/16000:.1f}s and {num_long} samples > 20s")
+        if num_short > 0 or num_long > 0:
+            logging.debug(f"Filtered out {num_short} samples < {min_samples/16000:.1f}s and {num_long} samples > 20s")
         
         if not valid_lens_mask.any():
             # If no valid samples, create a dummy batch with 2-second audio
-            logging.warning("No valid samples in batch, using dummy 2-second sample")
+            if params.batch_idx_train == 0:  # Only log on first batch
+                logging.info("No valid samples in batch, using dummy 2-second sample")
             dummy_samples = 32000  # 2 seconds at 16kHz
             # Always create 3D input (batch, time, channels) - XLSR will squeeze internally if needed
             feature = torch.zeros((1, dummy_samples, 1), device=device)

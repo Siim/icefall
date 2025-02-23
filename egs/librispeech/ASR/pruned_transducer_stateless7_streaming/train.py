@@ -917,6 +917,8 @@ def compute_loss(
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
     info["wer"] = wer
+    if not is_training:
+        info["hyp_texts"] = hyp_texts  # Add hypothesis texts to info
     
     return loss, info
 
@@ -1064,13 +1066,16 @@ def train_one_epoch(
                     )
                     model.train()
                     valid_wer = valid_info["wer"]
+                    
+                    # Log examples from validation batch
+                    texts = batch["supervisions"]["text"]
+                    for i in range(min(2, len(texts))):
+                        logging.info(f"\nExample {i+1}:")
+                        logging.info(f"REF: {texts[i]}")
+                        if "hyp_texts" in valid_info:
+                            logging.info(f"HYP: {valid_info['hyp_texts'][i]}")
             else:
                 valid_wer = None
-
-            # Log a few examples
-            for i in range(min(2, len(hyp_texts))):
-                logging.info(f"REF: {texts[i]}")
-                logging.info(f"HYP: {hyp_texts[i]}")
 
             logging.info(
                 f"Epoch {params.cur_epoch}, "

@@ -116,7 +116,8 @@ class Transducer(nn.Module):
         assert x.size(0) == x_lens.size(0) == y.dim0, f"Batch size mismatch: x={x.size(0)}, x_lens={x_lens.size(0)}, y={y.dim0}"
 
         # Print input shapes and values for debugging
-        print(f"Input shapes - x: {x.shape}, x_lens: {x_lens}, y dims: {y.dim0}, {y.dim1}")
+        print(f"Input shapes - x: {x.shape}, x_lens: {x_lens}")
+        print(f"RaggedTensor y - num_axes: {y.num_axes}, dim0: {y.dim0}, row_splits: {y.shape.row_splits(1)}")
         print(f"x_lens values: {x_lens}")
 
         # Get encoder output

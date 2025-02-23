@@ -473,7 +473,7 @@ def get_params() -> AttributeDict:
             "xlsr_model_name": "facebook/wav2vec2-xls-r-300m",
             "frame_duration": 0.025,  # 25ms per frame
             "frame_stride": 0.020,  # 20ms stride
-            "downsample_factor": 320,  # For wav2vec2/XLSR models
+            "subsampling_factor": 320,  # For wav2vec2/XLSR models
             
             # Chunk configurations from paper
             "decode_chunk_size": 5120,  # 320ms at 16kHz (best performing)

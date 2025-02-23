@@ -70,6 +70,7 @@ from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from zipformer import Zipformer
+from xlsr_encoder import XLSREncoder, EncoderInterface
 
 from icefall import diagnostics
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
@@ -552,9 +553,8 @@ def get_params() -> AttributeDict:
     return params
 
 
-def get_encoder_model(params: AttributeDict) -> nn.Module:
-    if params.use_xlsr:
-        from xlsr_encoder import XLSREncoder
+def get_encoder_model(params: AttributeDict) -> EncoderInterface:
+    if getattr(params, 'use_xlsr', False):
         # Create XLSR encoder with streaming capabilities built-in
         encoder = XLSREncoder(
             model_name=params.xlsr_model_name,
@@ -569,27 +569,27 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
             left_context_chunks=params.left_context_chunks  # 1 chunk (paper's optimal)
         )
         return encoder
-        
-    # Original Zipformer encoder for non-XLSR case
-    def to_int_tuple(s: str):
-        return tuple(map(int, s.split(",")))
+    else:
+        # Original Zipformer code...
+        def to_int_tuple(s: str):
+            return tuple(map(int, s.split(",")))
 
-    encoder = Zipformer(
-        num_features=params.feature_dim,
-        output_downsampling_factor=2,
-        zipformer_downsampling_factors=to_int_tuple(params.zipformer_downsampling_factors),
-        encoder_dims=to_int_tuple(params.encoder_dims),
-        attention_dim=to_int_tuple(params.attention_dims),
-        encoder_unmasked_dims=to_int_tuple(params.encoder_unmasked_dims),
-        nhead=to_int_tuple(params.nhead),
-        feedforward_dim=to_int_tuple(params.feedforward_dims),
-        cnn_module_kernels=to_int_tuple(params.cnn_module_kernels),
-        num_encoder_layers=to_int_tuple(params.num_encoder_layers),
-        num_left_chunks=params.num_left_chunks,
-        short_chunk_size=params.short_chunk_size,
-        decode_chunk_size=params.decode_chunk_len // 2,
-    )
-    return encoder
+        encoder = Zipformer(
+            num_features=params.feature_dim,
+            output_downsampling_factor=2,
+            zipformer_downsampling_factors=to_int_tuple(params.zipformer_downsampling_factors),
+            encoder_dims=to_int_tuple(params.encoder_dims),
+            attention_dim=to_int_tuple(params.attention_dims),
+            encoder_unmasked_dims=to_int_tuple(params.encoder_unmasked_dims),
+            nhead=to_int_tuple(params.nhead),
+            feedforward_dim=to_int_tuple(params.feedforward_dims),
+            cnn_module_kernels=to_int_tuple(params.cnn_module_kernels),
+            num_encoder_layers=to_int_tuple(params.num_encoder_layers),
+            num_left_chunks=params.num_left_chunks,
+            short_chunk_size=params.short_chunk_size,
+            decode_chunk_size=params.decode_chunk_len // 2,
+        )
+        return encoder
 
 
 def get_decoder_model(params: AttributeDict) -> nn.Module:

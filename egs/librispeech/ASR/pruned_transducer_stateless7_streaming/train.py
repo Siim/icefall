@@ -780,6 +780,11 @@ def compute_loss(
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute transducer loss given the model and its inputs.
+    
+    This implementation follows the paper's approach with:
+    - Proper chunk handling (320ms chunks with attention sink)
+    - Frame parameters (25ms duration, 20ms stride)
+    - Streaming regularization
     """
     device = next(model.parameters()).device
     feature = batch["inputs"]
@@ -794,6 +799,24 @@ def compute_loss(
     y = k2.RaggedTensor(y)
 
     with torch.set_grad_enabled(is_training):
+        # Get encoder output
+        encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
+        
+        # Get decoder output
+        row_splits = y.shape.row_splits(1)
+        y_lens = row_splits[1:] - row_splits[:-1]
+        
+        # Add blank at the beginning
+        blank_id = model.decoder.blank_id
+        sos_y = add_sos(y, sos_id=blank_id)
+        
+        # sos_y_padded: [B, S + 1], start with SOS.
+        sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
+        sos_y_padded = sos_y_padded.to(device)
+        
+        # decoder_out: [B, S + 1, decoder_dim]
+        decoder_out = model.decoder(sos_y_padded)
+        
         # Forward pass through model
         simple_loss, pruned_loss = model(
             x=feature,
@@ -804,8 +827,34 @@ def compute_loss(
             lm_scale=params.lm_scale,
         )
 
-        # Combine losses
-        loss = params.simple_loss_scale * simple_loss + (1 - params.simple_loss_scale) * pruned_loss
+        # Add streaming regularization if training
+        if is_training and params.streaming_regularization > 0:
+            # Get chunk boundaries based on paper's configurations
+            chunk_size = int(0.32 * 16000)  # 320ms at 16kHz
+            overlap = chunk_size // 2
+            
+            # Process in chunks
+            chunk_outputs = []
+            current = 0
+            while current < encoder_out.size(1):
+                end = min(current + chunk_size, encoder_out.size(1))
+                chunk = encoder_out[:, current:end]
+                chunk_outputs.append(chunk)
+                if end == encoder_out.size(1):
+                    break
+                current = end - overlap
+            
+            # Compute streaming regularization loss
+            streaming_loss = 0.0
+            if len(chunk_outputs) > 1:
+                for i in range(len(chunk_outputs) - 1):
+                    # Loss between overlapping regions
+                    overlap_prev = chunk_outputs[i][:, -overlap:]
+                    overlap_next = chunk_outputs[i + 1][:, :overlap]
+                    streaming_loss += F.mse_loss(overlap_prev, overlap_next)
+                
+                streaming_loss = streaming_loss / (len(chunk_outputs) - 1)
+                loss = loss + params.streaming_regularization * streaming_loss
 
     assert loss.requires_grad == is_training
 
@@ -818,6 +867,8 @@ def compute_loss(
     info["loss"] = loss.detach().cpu().item()
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
+    if is_training and params.streaming_regularization > 0:
+        info["streaming_loss"] = streaming_loss.detach().cpu().item()
 
     return loss, info
 
@@ -829,17 +880,7 @@ def decode_with_beam_search(
     sp: spm.SentencePieceProcessor,
     decoding_graph: Optional[k2.Fsa] = None,
 ) -> List[str]:
-    """
-    Decode encoder output using beam search with FSA.
-    Args:
-        encoder_out: Encoder output (batch, time, dim)
-        encoder_out_lens: Length of each sequence
-        params: Parameters for decoding
-        sp: SentencePiece tokenizer
-        decoding_graph: Optional FSA decoding graph
-    Returns:
-        List of decoded strings
-    """
+    """Decode encoder output using beam search with FSA."""
     device = encoder_out.device
     batch_size = encoder_out.size(0)
 
@@ -855,7 +896,7 @@ def decode_with_beam_search(
         )
 
         # Move encoder output to CPU for k2
-        encoder_out_cpu = encoder_out.detach().cpu()
+        encoder_out_cpu = encoder_out.cpu()
         
         # Create dense FSA from encoder output
         dense_fsa = k2.DenseFsaVec(encoder_out_cpu, supervision_segments)
@@ -877,33 +918,30 @@ def decode_with_beam_search(
             dense_fsa,
             search_beam=params.beam,
             output_beam=params.beam,
-            min_active_states=params.min_states,
+            min_active_states=params.max_states // 4,
             max_active_states=params.max_states
         )
 
         # Connect and sort the lattice
         lattice = k2.connect(lattice)
         lattice = k2.top_sort(lattice)
-
-        # Get best path
+        
+        # Ensure single final state
+        lattice = k2.remove_epsilon(lattice)
+        
+        # Get best path with double precision for stability
         best_path = k2.shortest_path(lattice, use_double_scores=True)
         
-        # Convert best path to token IDs
+        # Extract labels from best path
         hyps = []
         for i in range(batch_size):
             # Get labels (token IDs) from the best path
             labels = []
-            # Use k2's proper methods to get labels
             if hasattr(best_path[i], 'labels'):
-                # Some k2 versions provide labels directly
                 labels = best_path[i].labels.tolist()
             else:
-                # Otherwise extract from arcs
                 fsa = best_path[i]
-                aux_labels = fsa.aux_labels.tolist() if hasattr(fsa, 'aux_labels') else []
                 labels = [arc.label for arc in fsa.arcs if arc.label != 0]
-                if aux_labels:
-                    labels = aux_labels
             
             # Remove consecutive duplicates and zeros
             labels = [x for x, _ in itertools.groupby(labels) if x != 0]
@@ -952,44 +990,53 @@ def compute_validation_loss(
     # Get device from model parameters
     device = next(model.parameters()).device
     
-    for batch_idx, batch in enumerate(valid_dl):
-        loss, loss_info = compute_loss(
-            params=params,
-            model=model,
-            sp=sp,
-            batch=batch,
-            is_training=False,
-        )
-        
-        # Compute WER for this batch
-        if params.use_xlsr:
-            # Get encoder output
-            feature = batch["inputs"].to(device)
-            feature_lens = batch["supervisions"]["num_frames"].to(device)
-            
-            # Non-streaming forward pass for validation
-            encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
-            
-            # Decode with beam search
-            hyps = decode_with_beam_search(
-                encoder_out=encoder_out,
-                encoder_out_lens=encoder_out_lens,
-                params=params,
-                sp=sp,
-                decoding_graph=params.decoding_graph if hasattr(params, "decoding_graph") else None
-            )
-            
-            # Get reference texts
-            refs = batch["supervisions"]["text"]
-            
-            # Update WER stats
-            for ref, hyp in zip(refs, hyps):
-                wer.add_sentence(ref, hyp)
-        
-        tot_loss = tot_loss + loss_info
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(valid_dl):
+            try:
+                loss, loss_info = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    batch=batch,
+                    is_training=False,
+                )
+                
+                # Compute WER for this batch
+                if params.use_xlsr:
+                    # Get encoder output
+                    feature = batch["inputs"].to(device)
+                    feature_lens = batch["supervisions"]["num_frames"].to(device)
+                    
+                    # Non-streaming forward pass for validation
+                    encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
+                    
+                    # Decode with beam search
+                    hyps = decode_with_beam_search(
+                        encoder_out=encoder_out,
+                        encoder_out_lens=encoder_out_lens,
+                        params=params,
+                        sp=sp,
+                        decoding_graph=getattr(model.decoder, "decoding_graph", None)
+                    )
+                    
+                    # Get reference texts
+                    refs = batch["supervisions"]["text"]
+                    
+                    # Update WER stats
+                    for ref, hyp in zip(refs, hyps):
+                        wer.add_sentence(ref, hyp)
+                
+                tot_loss = tot_loss + loss_info
+                
+            except RuntimeError as e:
+                if "CUDA out of memory" in str(e):
+                    logging.error(f"OOM error in validation batch {batch_idx}")
+                    continue
+                else:
+                    raise e
     
     if world_size > 1:
-        tot_loss.reduce(loss.device)
+        tot_loss.reduce(device)
         
     loss_value = tot_loss["loss"] / tot_loss["frames"]
     

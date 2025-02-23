@@ -47,6 +47,7 @@ import argparse
 import copy
 import logging
 import warnings
+import editdistance
 from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, Optional, Tuple, Union
@@ -84,6 +85,20 @@ from icefall.env import get_env_info
 from icefall.err import raise_grad_scale_is_too_small_error
 from icefall.hooks import register_inf_check_hooks
 from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
+from beam_search import (
+    beam_search,
+    fast_beam_search_nbest,
+    fast_beam_search_nbest_LG,
+    fast_beam_search_nbest_oracle,
+    fast_beam_search_one_best,
+    greedy_search,
+    greedy_search_batch,
+    modified_beam_search,
+    modified_beam_search_lm_rescore,
+    modified_beam_search_lm_rescore_LODR,
+    modified_beam_search_lm_shallow_fusion,
+    modified_beam_search_LODR,
+)
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -761,26 +776,10 @@ def compute_loss(
     is_training: bool,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
-    Compute transducer loss given the model and its inputs.
-
-    Args:
-      params:
-        Parameters for training. See :func:`get_params`.
-      model:
-        The model for training. It is an instance of Zipformer in our case.
-      batch:
-        A batch of data. See `lhotse.dataset.K2SpeechRecognitionDataset()`
-        for the content in it.
-      is_training:
-        True for training. False for validation. When it is True, this
-        function enables autograd during computation; when it is False, it
-        disables autograd.
-     warmup: a floating point value which increases throughout training;
-        values >= 1.0 are fully warmed up and have all modules present.
+    Compute transducer loss and WER given the model and its inputs.
     """
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
     feature = batch["inputs"]
-    # at entry, feature is (N, T, C)
     assert feature.ndim == 3
     feature = feature.to(device)
 
@@ -805,8 +804,6 @@ def compute_loss(
         )
 
         s = params.simple_loss_scale
-        # take down the scale on the simple loss from 1.0 at the start
-        # to params.simple_loss scale by warm_step.
         simple_loss_scale = (
             s
             if batch_idx_train >= warm_step
@@ -820,6 +817,26 @@ def compute_loss(
 
         loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
 
+        # Calculate WER if not training
+        if not is_training:
+            with torch.no_grad():
+                encoder_out, _ = model.encoder(feature, feature_lens)
+                # Use greedy search for quick WER calculation
+                hyps = greedy_search_batch(
+                    model=model,
+                    encoder_out=encoder_out,
+                    encoder_out_lens=feature_lens,
+                )
+                hyp_texts = [sp.decode(hyp.tolist()) for hyp in hyps]
+                
+                # Calculate WER
+                total_words = sum(len(text.split()) for text in texts)
+                errors = sum(editdistance.eval(hyp.split(), ref.split()) 
+                           for hyp, ref in zip(hyp_texts, texts))
+                wer = 100.0 * errors / total_words if total_words > 0 else 0.0
+        else:
+            wer = 0.0  # Don't calculate WER during training to save time
+
     assert loss.requires_grad == is_training
 
     info = MetricsTracker()
@@ -827,10 +844,10 @@ def compute_loss(
         warnings.simplefilter("ignore")
         info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
 
-    # Note: We use reduction=sum while computing the loss.
     info["loss"] = loss.detach().cpu().item()
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
+    info["wer"] = wer
 
     return loss, info
 
@@ -883,37 +900,7 @@ def train_one_epoch(
     world_size: int = 1,
     rank: int = 0,
 ) -> None:
-    """Train the model for one epoch.
-
-    The training loss from the mean of all frames is saved in
-    `params.train_loss`. It runs the validation process every
-    `params.valid_interval` batches.
-
-    Args:
-      params:
-        It is returned by :func:`get_params`.
-      model:
-        The model for training.
-      optimizer:
-        The optimizer we are using.
-      scheduler:
-        The learning rate scheduler, we call step() every step.
-      train_dl:
-        Dataloader for the training dataset.
-      valid_dl:
-        Dataloader for the validation dataset.
-      scaler:
-        The scaler used for mix precision training.
-      model_avg:
-        The stored model averaged from the start of training.
-      tb_writer:
-        Writer to write log messages to tensorboard.
-      world_size:
-        Number of nodes in DDP training. If it is 1, DDP is disabled.
-      rank:
-        The rank of the node in DDP training. If no DDP is used, it should
-        be set to 0.
-    """
+    """Train the model for one epoch."""
     model.train()
 
     tot_loss = MetricsTracker()
@@ -934,8 +921,6 @@ def train_one_epoch(
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
 
-            # NOTE: We use reduction==sum and loss is computed over utterances
-            # in the batch and there is no normalization to it so far.
             scaler.scale(loss).backward()
             set_batch_count(model, params.batch_idx_train)
             scheduler.step_batch(params.batch_idx_train)
@@ -984,9 +969,7 @@ def train_one_epoch(
             )
 
         if batch_idx % 100 == 0 and params.use_fp16:
-            # If the grad scale was less than 1, try increasing it.    The _growth_interval
-            # of the grad scaler is configurable, but we can't configure it to have different
-            # behavior depending on the current grad scale.
+            # If the grad scale was less than 1, try increasing it
             cur_grad_scale = scaler._scale.item()
             if cur_grad_scale < 1.0 or (cur_grad_scale < 8.0 and batch_idx % 400 == 0):
                 scaler.update(cur_grad_scale * 2.0)
@@ -999,18 +982,39 @@ def train_one_epoch(
             cur_lr = scheduler.get_last_lr()[0]
             cur_grad_scale = scaler._scale.item() if params.use_fp16 else 1.0
 
+            # Calculate validation WER periodically
+            if batch_idx % (params.log_interval * 5) == 0:
+                with torch.no_grad():
+                    model.eval()
+                    valid_loss, valid_info = compute_loss(
+                        params=params,
+                        model=model,
+                        sp=sp,
+                        batch=next(iter(valid_dl)),
+                        is_training=False,
+                    )
+                    model.train()
+                    valid_wer = valid_info["wer"]
+            else:
+                valid_wer = None
+
             logging.info(
                 f"Epoch {params.cur_epoch}, "
                 f"batch {batch_idx}, loss[{loss_info}], "
                 f"tot_loss[{tot_loss}], batch size: {batch_size}, "
                 f"lr: {cur_lr:.2e}, "
-                + (f"grad_scale: {scaler._scale.item()}" if params.use_fp16 else "")
+                + (f"grad_scale: {scaler._scale.item()}, " if params.use_fp16 else "")
+                + (f"valid_wer: {valid_wer:.1f}%" if valid_wer is not None else "")
             )
 
             if tb_writer is not None:
                 tb_writer.add_scalar(
                     "train/learning_rate", cur_lr, params.batch_idx_train
                 )
+                if valid_wer is not None:
+                    tb_writer.add_scalar(
+                        "train/valid_wer", valid_wer, params.batch_idx_train
+                    )
 
                 loss_info.write_summary(
                     tb_writer, "train/current_", params.batch_idx_train

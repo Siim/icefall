@@ -856,8 +856,6 @@ def compute_loss(
                 
                 # Initialize decoder state
                 hyp = [params.blank_id] * params.context_size
-                
-                # Initialize decoder input
                 decoder_input = torch.tensor([hyp], device=device)
                 decoder_out = model.decoder(decoder_input)
                 
@@ -870,21 +868,17 @@ def compute_loss(
                     if hasattr(model, "encoder_proj"):
                         encoder_frame = model.encoder_proj(encoder_frame)
                     
-                    # Reshape encoder frame for joiner (N=1, T=1, encoder_dim)
-                    encoder_frame = encoder_frame.unsqueeze(1)
-                    
-                    # Reshape decoder output for joiner (N=1, U=1, decoder_dim)
-                    decoder_out = decoder_out.unsqueeze(1)
+                    # Reshape for joiner
+                    encoder_frame = encoder_frame.unsqueeze(1)  # (N=1, T=1, encoder_dim)
+                    decoder_out = decoder_out.unsqueeze(1)  # (N=1, U=1, decoder_dim)
                     
                     # Get logits from joiner
                     logits = model.joiner(encoder_frame, decoder_out)
-                    
-                    # Remove extra dimensions (N=1, T=1, U=1, vocab_size) -> (N=1, vocab_size)
-                    logits = logits.squeeze(1).squeeze(1)
+                    logits = logits.squeeze(1).squeeze(1)  # Remove T=1, U=1 dimensions
                     
                     # Get prediction
                     log_probs = torch.log_softmax(logits, dim=-1)
-                    pred = log_probs[0].argmax().item()  # Take first item since batch size is 1
+                    pred = log_probs.argmax(dim=-1).item()
                     
                     # Add token if not blank and not repeating
                     if pred != params.blank_id and (len(hyp) <= params.context_size or pred != hyp[-1]):

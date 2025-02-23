@@ -177,8 +177,8 @@ def test_xlsr_encoder():
     
     # Initialize encoder with paper's specifications
     encoder = XLSREncoder(
-        model_name="facebook/wav2vec2-xls-r-300m",
-        decode_chunk_size=8000,  # 0.5s at 16kHz
+        model_name="anton-l/wav2vec2-large-xlsr-53-estonian",
+        decode_chunk_size=5180,  # 0.5s at 16kHz
         chunk_overlap=4000,      # 0.25s overlap
         use_attention_sink=True,
         attention_sink_size=4,   # From paper's diagrams
@@ -251,7 +251,7 @@ def test_fsa_decoding():
     # Initialize encoder with paper's specifications
     encoder = XLSREncoder(
         model_name="facebook/wav2vec2-xls-r-300m",
-        decode_chunk_size=8000,  # 0.5s at 16kHz
+        decode_chunk_size=5180,  # 0.5s at 16kHz
         chunk_overlap=4000,      # 0.25s overlap
         use_attention_sink=True,
         attention_sink_size=4,   # From paper's diagrams
@@ -321,7 +321,7 @@ def test_loss_computation():
     # Initialize encoder with paper's specifications
     encoder = XLSREncoder(
         model_name="facebook/wav2vec2-xls-r-300m",
-        decode_chunk_size=8000,  # 0.5s at 16kHz
+        decode_chunk_size=5180,  # 0.5s at 16kHz
         chunk_overlap=4000,      # 0.25s overlap
         use_attention_sink=True,
         attention_sink_size=4,   # From paper's diagrams

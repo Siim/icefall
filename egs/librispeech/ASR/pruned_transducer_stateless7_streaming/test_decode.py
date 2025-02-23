@@ -5,21 +5,33 @@ import logging
 import torch
 import torchaudio
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import numpy as np
-import k2
 from icefall.utils import str2bool
+from transformers import (
+    Wav2Vec2Config,
+    Wav2Vec2Model,
+    Wav2Vec2FeatureExtractor,
+    Wav2Vec2CTCTokenizer,
+    Wav2Vec2Processor,
+    Wav2Vec2ForCTC
+)
 
 from xlsr_encoder import XLSREncoder
-from estonian_decoder import create_estonian_token_table, create_estonian_decoding_graph
 
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--audio-file",
+        "--model-name",
+        type=str,
+        default="TalTechNLP/xls-r-300m-et",
+        help="Model name or path",
+    )
+    parser.add_argument(
+        "--audio-path",
         type=str,
         required=True,
-        help="Path to the audio file to test",
+        help="Path to audio file",
     )
     parser.add_argument(
         "--vocab-file",
@@ -30,114 +42,108 @@ def get_args():
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=5120,  # 320ms at 16kHz - paper's best performing setting
-        help="Chunk size for streaming test",
-    )
-    parser.add_argument(
-        "--plot",
-        action="store_true",
-        help="Plot chunk outputs for visualization",
+        default=5120,  # 320ms at 16kHz
+        help="Chunk size for streaming inference",
     )
     parser.add_argument(
         "--use-attention-sink",
         type=str2bool,
         default=True,
-        help="Whether to use attention sink mechanism",
+        help="Whether to use attention sink",
     )
     parser.add_argument(
-        "--attention-sink-size",
-        type=int,
-        default=16,  # Paper's optimal setting
-        help="Number of attention sink frames",
-    )
-    # FSA decoding parameters
-    parser.add_argument(
-        "--beam",
-        type=float,
-        default=40.0,
-        help="Beam size for FSA decoding",
-    )
-    parser.add_argument(
-        "--max-states",
-        type=int,
-        default=128,
-        help="Maximum number of FSA states to keep",
-    )
-    parser.add_argument(
-        "--max-contexts",
-        type=int,
-        default=16,
-        help="Maximum number of contexts to keep",
-    )
-    # Streaming validation options
-    parser.add_argument(
-        "--show-progressive",
-        action="store_true",
-        help="Show decoded text for each chunk",
-    )
-    parser.add_argument(
-        "--compare-modes",
-        action="store_true",
-        help="Compare streaming vs non-streaming outputs in detail",
-    )
-    parser.add_argument(
-        "--save-attention",
-        action="store_true",
-        help="Save attention patterns for visualization",
-    )
-    parser.add_argument(
-        "--min-chunk-size",
-        type=int,
-        default=2560,  # 160ms at 16kHz (16 frames)
-        help="Minimum chunk size to test with",
-    )
-    parser.add_argument(
-        "--max-chunk-size",
-        type=int,
-        default=20480,  # 1280ms at 16kHz (128 frames)
-        help="Maximum chunk size to test with",
-    )
-    parser.add_argument(
-        "--left-context-chunks",
-        type=int,
-        default=1,  # Paper's optimal setting
-        help="Number of left context chunks to use",
-    )
-    parser.add_argument(
-        "--adaptive-chunking",
+        "--plot",
         type=str2bool,
         default=True,
-        help="Whether to use adaptive chunk sizing based on compute latency",
+        help="Whether to plot output comparison",
+    )
+    parser.add_argument(
+        "--show-progressive",
+        type=str2bool,
+        default=False,
+        help="Show decoded text for each chunk",
     )
     return parser.parse_args()
 
 def load_audio(audio_path: str) -> Tuple[torch.Tensor, int]:
-    """Load and preprocess audio file."""
+    """Load and preprocess audio file.
+    
+    Args:
+        audio_path: Path to audio file
+        
+    Returns:
+        Tuple of (audio_tensor, sample_rate)
+    """
+    # Load audio
     waveform, sample_rate = torchaudio.load(audio_path)
     
     # Resample if needed
     if sample_rate != 16000:
         resampler = torchaudio.transforms.Resample(sample_rate, 16000)
         waveform = resampler(waveform)
+        sample_rate = 16000
     
-    # Convert to mono if stereo
+    # Convert to mono if needed
     if waveform.shape[0] > 1:
         waveform = torch.mean(waveform, dim=0, keepdim=True)
     
-    # Ensure shape is (batch, time)
-    waveform = waveform.transpose(0, 1)  # (time, channel) -> (channel, time)
-    waveform = waveform.unsqueeze(0)  # Add batch dimension
-    waveform = waveform.squeeze(1)  # Remove channel dimension
+    return waveform, sample_rate
+
+def create_processor(vocab_file: str) -> Wav2Vec2Processor:
+    """Create Wav2Vec2 processor from TalTechNLP's Estonian model.
     
-    return waveform, 16000
+    Args:
+        vocab_file: Path to vocabulary file (not used, kept for compatibility)
+        
+    Returns:
+        Wav2Vec2Processor instance
+    """
+    # Load TalTechNLP's Estonian processor
+    processor = Wav2Vec2Processor.from_pretrained("TalTechNLP/xls-r-300m-et")
+    return processor
+
+def create_model(model_name: str) -> Wav2Vec2ForCTC:
+    """Create Wav2Vec2ForCTC model with CTC head.
+    
+    Args:
+        model_name: Name or path of the model to load
+        
+    Returns:
+        Wav2Vec2ForCTC model instance
+    """
+    # Load model with CTC head
+    model = Wav2Vec2ForCTC.from_pretrained(model_name)
+    
+    # Disable feature extraction updates
+    model.freeze_feature_encoder()
+    
+    return model
+
+def decode_ctc(logits: torch.Tensor, processor: Wav2Vec2Processor) -> str:
+    """Decode CTC logits to text using the processor's built-in decoding.
+    
+    Args:
+        logits: Output logits from model, shape (batch, time, vocab_size)
+        processor: Wav2Vec2Processor instance
+        
+    Returns:
+        Decoded text string
+    """
+    # Get predicted ids directly from logits
+    pred_ids = torch.argmax(logits, dim=-1)
+    
+    # Use processor's built-in decoding
+    transcription = processor.decode(pred_ids[0])  # Take first batch item
+    
+    return transcription
 
 def plot_outputs(streaming_out: torch.Tensor, non_streaming_out: torch.Tensor, save_path: str = "chunk_comparison.png"):
     """Plot streaming vs non-streaming outputs for visualization"""
     import matplotlib.pyplot as plt
     
-    # Take mean across feature dimension
-    streaming_mean = streaming_out[0].mean(dim=1).cpu().numpy()
-    non_streaming_mean = non_streaming_out[0].mean(dim=1).cpu().numpy()
+    # Take mean across feature dimension and detach before converting to numpy
+    streaming_mean = streaming_out[0].mean(dim=1).detach().cpu().numpy()
+    non_streaming_mean = non_streaming_out[0].mean(dim=1).detach().cpu().numpy()
     
     plt.figure(figsize=(15, 5))
     plt.plot(streaming_mean, label='Streaming', alpha=0.7)
@@ -150,126 +156,6 @@ def plot_outputs(streaming_out: torch.Tensor, non_streaming_out: torch.Tensor, s
     plt.savefig(save_path)
     plt.close()
 
-def clean_token_text(token_ids: List[int], token_table: k2.SymbolTable) -> str:
-    """Clean up token sequence and format nicely.
-    
-    Args:
-        token_ids: List of token IDs from decoder
-        token_table: Symbol table for token lookup
-    Returns:
-        Cleaned and formatted text
-    """
-    # Get raw tokens
-    tokens = [token_table[i].replace('▁', ' ').strip() for i in token_ids]
-    
-    # Remove consecutive duplicates
-    cleaned = []
-    prev = None
-    for token in tokens:
-        # Skip if same as previous or empty
-        if token == prev or not token:
-            continue
-        cleaned.append(token)
-        prev = token
-    
-    # Join with proper spacing
-    text = ' '.join(cleaned).strip()
-    
-    # Clean up any remaining artifacts
-    text = text.replace('  ', ' ')  # Remove double spaces
-    text = text.replace(' ,', ',')  # Fix comma spacing
-    text = text.replace(' .', '.')  # Fix period spacing
-    
-    return text
-
-def decode_with_beam_search(
-    encoder_out: torch.Tensor,
-    decoding_graph: k2.Fsa,
-    beam: float = 40.0,
-    max_states: int = 128,
-    max_contexts: int = 16,
-    temperature: float = 1.0,  # Added temperature parameter
-) -> List[int]:
-    """
-    Decode encoder output using beam search with FSA.
-    Args:
-        encoder_out: Encoder output (batch, time, dim)
-        decoding_graph: FSA graph for decoding
-        beam: Beam size for pruning
-        max_states: Maximum number of FSA states to keep
-        max_contexts: Maximum number of contexts to keep
-        temperature: Temperature for softmax scaling
-    Returns:
-        List of token IDs
-    """
-    assert encoder_out.ndim == 3, encoder_out.shape
-    B, T, C = encoder_out.shape
-    assert B == 1, "Only support batch size 1 for now"
-
-    # Apply temperature scaling and convert to log probabilities
-    logits = encoder_out / temperature
-    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-
-    # Ensure decoding graph is on correct device and properly sorted
-    if decoding_graph.device != encoder_out.device:
-        decoding_graph = decoding_graph.to(encoder_out.device)
-    decoding_graph = k2.arc_sort(decoding_graph)
-
-    # Create supervision for dense intersection
-    supervision = torch.tensor([[0, T]], device=encoder_out.device)
-    dense_fsa = k2.DenseFsaVec(log_probs, supervision)
-
-    try:
-        # Intersect with decoding graph and prune
-        lattice = k2.intersect_dense_pruned(
-            decoding_graph,
-            dense_fsa,
-            search_beam=beam,
-            output_beam=beam,
-            min_active_states=max_states // 4,
-            max_active_states=max_states
-        )
-
-        # Ensure lattice is connected and has exactly one final state
-        lattice = k2.connect(lattice)
-        lattice = k2.top_sort(lattice)
-
-        # Find best path with double precision for stability
-        best_path = k2.shortest_path(lattice, use_double_scores=True)
-        
-        # Extract labels from best path
-        token_ids = []
-        for arc in best_path.arcs:
-            if arc.label != 0:  # Skip blank tokens
-                token_ids.append(arc.label)
-
-        return token_ids
-
-    except RuntimeError as e:
-        if "FSA has no final states" in str(e):
-            logging.warning("FSA decoding failed due to no final states, falling back to greedy decoding")
-            return decode_with_greedy_ctc(encoder_out)
-        raise  # Re-raise other runtime errors
-
-def decode_with_greedy_ctc(encoder_out: torch.Tensor) -> List[int]:
-    """
-    A simple argmax-based, CTC-style decoding that skips the FSA intersection.
-    Note: This does not remove repeated tokens or handle blanks beyond ignoring ID 0.
-    """
-    assert encoder_out.ndim == 3, encoder_out.shape
-    batch_size, time_steps, vocab_size = encoder_out.shape
-    assert batch_size == 1, "Greedy decode only supports batch_size=1 for now"
-
-    # Convert to log-softmax if your model doesn't already output it.
-    encoder_out = torch.nn.functional.log_softmax(encoder_out, dim=-1)
-
-    # Argmax over the vocabulary dimension and optionally remove blanks.
-    argmax_ids = encoder_out.argmax(dim=-1).squeeze(0).tolist()
-    # Example of filtering out blank if needed:
-    # argmax_ids = [x for x in argmax_ids if x != 0]
-
-    return argmax_ids
-
 def main():
     args = get_args()
     logging.basicConfig(
@@ -277,116 +163,136 @@ def main():
         level=logging.INFO,
     )
     
-    # Initialize XLSR encoder
+    # Load and preprocess audio
+    waveform, sample_rate = load_audio(args.audio_path)
+    
+    # Create processor and model
+    processor = create_processor(args.vocab_file)
+    model = create_model(args.model_name)
+    
+    # Process audio input properly
+    input_values = processor(
+        waveform.squeeze().numpy(),
+        sampling_rate=sample_rate,
+        return_tensors="pt"
+    ).input_values
+    
+    # Create encoder for streaming
     encoder = XLSREncoder(
-        model_name="facebook/wav2vec2-xls-r-300m",
+        model_name=args.model_name,
         decode_chunk_size=args.chunk_size,
-        chunk_overlap=args.chunk_size // 2,
-        use_attention_sink=args.use_attention_sink,
-        attention_sink_size=args.attention_sink_size
+        use_attention_sink=args.use_attention_sink
     )
     
-    # Create token table for vocabulary
-    token_table = create_estonian_token_table(args.vocab_file)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Create generic FSA using k2.trivial_graph
-    # We subtract 1 from vocab_size because k2's trivial_graph doesn't need the blank token
-    decoding_graph = k2.trivial_graph(
-        max_token=len(token_table) - 1,  # -1 for blank token
-        device=device
-    )
-    
-    # Add epsilon self-loops for CTC-like decoding
-    decoding_graph = k2.add_epsilon_self_loops(decoding_graph)
-    decoding_graph = k2.arc_sort(decoding_graph)
-    
-    # Move encoder to device
-    encoder = encoder.to(device)
+    # Set to eval mode
+    model.eval()
     encoder.eval()
     
-    # Load and preprocess audio
-    audio, sample_rate = load_audio(args.audio_file)
-    audio = audio.to(device)
-    audio_len = torch.tensor([audio.shape[1]], dtype=torch.int32, device=device)
+    # Move to GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    encoder = encoder.to(device)
+    input_values = input_values.to(device)
     
-    logging.info(f"Testing streaming decoding with chunk size {args.chunk_size} samples ({args.chunk_size/16000:.3f}s)")
-    logging.info(f"Audio duration: {audio.shape[1]/16000:.2f}s")
-    logging.info(f"Using attention sink: {args.use_attention_sink}, size: {args.attention_sink_size} frames")
-    
-    # Test streaming decoding
+    # Process audio
     with torch.no_grad():
         # First get non-streaming output for reference
-        non_streaming_out, non_streaming_lens = encoder(audio, audio_len)
+        non_streaming_out, non_streaming_lens = encoder(input_values, torch.tensor([input_values.shape[1]], device=device))
+        
+        # Get CTC logits from model
+        non_streaming_logits = model.forward(input_values).logits
+        
         logging.info(f"Non-streaming output shape: {non_streaming_out.shape}")
         
         # Decode non-streaming output
-        non_streaming_hyps = decode_with_greedy_ctc(non_streaming_out)
-        non_streaming_text = clean_token_text(non_streaming_hyps, token_table)
-        logging.info(f"\nNon-streaming decoded text (greedy ONLY):")
+        logging.info("\nNon-streaming decoding:")
+        non_streaming_text = decode_ctc(non_streaming_logits, processor)
+        logging.info("\nNon-streaming decoded text:")
         logging.info("-" * 50)
         logging.info(f"{non_streaming_text}")
         logging.info("-" * 50)
         
-        # Initialize streaming state
+        # Initialize streaming with warmup
         states = encoder.get_init_state(device)
+        warmup_size = args.chunk_size  # Use one full chunk for warmup
         
         # Process audio in chunks
-        current = 0
-        encoder_out_chunks = []
-        chunk_overlap = args.chunk_size // 2
+        current_pos = 0
+        streaming_chunks = []
+        streaming_logits = []
+        chunk_size = args.chunk_size
+        chunk_overlap = chunk_size // 2
+        effective_chunk_size = chunk_size - chunk_overlap
         
-        # Calculate expected number of chunks
-        total_samples = audio.shape[1]
-        effective_chunk_size = args.chunk_size - chunk_overlap
-        num_chunks = int(np.ceil(total_samples / effective_chunk_size))
-        logging.info(f"\nProcessing {num_chunks} chunks...")
+        # Calculate number of chunks
+        num_chunks = int(np.ceil((input_values.shape[1] - warmup_size) / effective_chunk_size))
+        logging.info(f"\nProcessing {num_chunks} chunks with warmup...")
         
-        while current < audio.shape[1]:
-            end = min(current + args.chunk_size, audio.shape[1])
-            chunk = audio[:, current:end]
-            chunk_len = torch.tensor([chunk.shape[1]], dtype=torch.int32, device=device)
+        # Warmup phase
+        if warmup_size > 0:
+            warmup_chunk = input_values[:, :warmup_size]
+            warmup_len = torch.tensor([warmup_chunk.shape[1]], device=device)
+            _, _, states = encoder.streaming_forward(warmup_chunk, warmup_len, states)
+            logging.info("Completed warmup phase")
+            current_pos = warmup_size - chunk_overlap  # Start with overlap from warmup
+        
+        for i in range(num_chunks):
+            # Get chunk boundaries
+            chunk_start = current_pos
+            chunk_end = min(chunk_start + chunk_size, input_values.shape[1])
             
-            # Process chunk
+            # Extract chunk
+            chunk = input_values[:, chunk_start:chunk_end]
+            chunk_len = torch.tensor([chunk.shape[1]], device=device)
+            
+            # Process chunk through encoder and model
             chunk_out, chunk_lens, states = encoder.streaming_forward(chunk, chunk_len, states)
-            encoder_out_chunks.append(chunk_out)
+            chunk_logits = model.forward(chunk).logits
             
-            # Optionally decode each chunk for progressive output
+            # Only append after warmup
+            if i > 0 or warmup_size == 0:
+                streaming_chunks.append(chunk_out)
+                streaming_logits.append(chunk_logits)
+            
+            # Show progressive output if requested
             if args.show_progressive:
-                chunk_hyps = decode_with_greedy_ctc(chunk_out)
-                chunk_text = clean_token_text(chunk_hyps, token_table)
-                logging.info(f"Chunk {len(encoder_out_chunks)}/{num_chunks} text: {chunk_text}")
+                logging.info(f"\nChunk {i+1}/{num_chunks} decoding:")
+                chunk_text = decode_ctc(chunk_logits, processor)
+                logging.info(f"Chunk text: {chunk_text}")
             else:
-                logging.info(f"Processed chunk {len(encoder_out_chunks)}/{num_chunks}: {chunk.shape[1]/16000:.3f}s")
+                logging.info(f"Processed chunk {i+1}/{num_chunks}: {chunk_end/sample_rate:.3f}s")
             
-            # Move to next chunk, considering overlap
-            if end == audio.shape[1]:  # Last chunk
-                break
-            current = end - chunk_overlap
+            # Move to next chunk position, considering overlap
+            current_pos = chunk_start + effective_chunk_size
+            
+            # Clear GPU cache periodically
+            if i % 10 == 0:
+                torch.cuda.empty_cache()
         
-        # Concatenate chunks
-        encoder_out = torch.cat(encoder_out_chunks, dim=1)
-        logging.info(f"\nFinal encoder output shape: {encoder_out.shape}")
-        
-        # Verify output dimensions
-        expected_frames = ((audio_len.float() / encoder.downsample_factor).floor() - 1).to(torch.int64)
-        logging.info(f"Expected output frames: {expected_frames.item()}")
-        logging.info(f"Got output frames: {encoder_out.shape[1]}")
+        # Concatenate streaming outputs
+        streaming_out = torch.cat(streaming_chunks, dim=1)
+        streaming_logits = torch.cat(streaming_logits, dim=1)
+        logging.info(f"\nFinal encoder output shape: {streaming_out.shape}")
         
         # Decode streaming output
-        streaming_hyps = decode_with_greedy_ctc(encoder_out)
-        streaming_text = clean_token_text(streaming_hyps, token_table)
-        logging.info(f"\nStreaming decoded text:")
+        logging.info("\nStreaming decoding:")
+        streaming_text = decode_ctc(streaming_logits, processor)
+        logging.info("\nStreaming decoded text:")
         logging.info("-" * 50)
         logging.info(f"{streaming_text}")
         logging.info("-" * 50)
-        
+
         # Compare outputs
-        min_len = min(encoder_out.shape[1], non_streaming_out.shape[1])
-        streaming_out = encoder_out[:, :min_len]
-        non_streaming_out = non_streaming_out[:, :min_len]
-        
+        expected_frames = non_streaming_out.shape[1]
+        actual_frames = streaming_out.shape[1]
+        logging.info(f"Expected output frames: {expected_frames}")
+        logging.info(f"Got output frames: {actual_frames}")
+
         # Calculate differences
+        min_len = min(streaming_out.shape[1], non_streaming_out.shape[1])
+        streaming_out = streaming_out[:, :min_len, :]
+        non_streaming_out = non_streaming_out[:, :min_len, :]
+        
         abs_diff = (streaming_out - non_streaming_out).abs()
         max_diff = abs_diff.max().item()
         mean_diff = abs_diff.mean().item()
@@ -407,6 +313,13 @@ def main():
         if args.plot:
             plot_outputs(streaming_out, non_streaming_out)
             logging.info("\nSaved output visualization to chunk_comparison.png")
+
+        # Clean up
+        del streaming_chunks
+        del streaming_logits
+        del streaming_out
+        del non_streaming_out
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     main() 

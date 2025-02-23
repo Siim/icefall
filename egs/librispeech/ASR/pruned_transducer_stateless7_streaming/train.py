@@ -853,67 +853,70 @@ def decode_with_beam_search(
     sp: spm.SentencePieceProcessor,
     decoding_graph: Optional[k2.Fsa] = None,
 ) -> List[str]:
-    """Decode with beam search and FSA.
-    
+    """
+    Decode encoder output using beam search with FSA.
     Args:
-        encoder_out: Output from encoder (B, T, C)
+        encoder_out: Encoder output (batch, time, dim)
         encoder_out_lens: Length of each sequence
-        params: Parameters
-        sp: SentencePieceProcessor tokenizer
-        decoding_graph: Optional FSA graph for decoding
-    
+        params: Parameters for decoding
+        sp: SentencePiece tokenizer
+        decoding_graph: Optional FSA decoding graph
     Returns:
-        List of decoded texts
+        List of decoded strings
     """
     device = encoder_out.device
     batch_size = encoder_out.size(0)
-    
+
     # Convert encoder output to log probabilities
-    log_probs = torch.nn.functional.log_softmax(encoder_out / params.temperature, dim=-1)
-    
-    # Create supervision segments in the format expected by k2
-    # Each segment needs: (segment_index, start_frame, duration)
+    encoder_out = torch.nn.functional.log_softmax(encoder_out, dim=-1)
+
+    # Create supervision segments for k2
     supervision_segments = torch.tensor(
-        [[0, 0, encoder_out.size(1)]],  # Single segment covering entire sequence
-        dtype=torch.int32
+        [[i, 0, encoder_out_lens[i].item()] for i in range(batch_size)],
+        dtype=torch.int32,
+        device=device,
     )
-    
-    # Create DenseFsaVec - everything must be on CPU for k2 initialization
-    dense_fsa = k2.DenseFsaVec(log_probs.cpu(), supervision_segments)
-    dense_fsa = dense_fsa.to(device)  # Move back to device after creation
-    
-    # If no decoding graph provided, create a simple one
+
+    # Create dense FSA from encoder output
+    dense_fsa = k2.DenseFsaVec(encoder_out, supervision_segments)
+
     if decoding_graph is None:
-        decoding_graph = k2.trivial_graph(params.vocab_size, device=device)
-    
-    # Ensure graph is on correct device and sorted
-    if decoding_graph.device != device:
-        decoding_graph = decoding_graph.to(device)
+        # Create a simple CTC-like decoding graph
+        decoding_graph = k2.trivial_graph(
+            params.vocab_size - 1,  # -1 since k2 doesn't need the blank token
+            device=device
+        )
+
+    # Ensure decoding graph is on the correct device
+    decoding_graph = decoding_graph.to(device)
     decoding_graph = k2.arc_sort(decoding_graph)
-    
-    # Intersect with decoding graph
+
+    # Intersect with decoding graph and find best path
     lattice = k2.intersect_dense_pruned(
         decoding_graph,
         dense_fsa,
         search_beam=params.beam,
         output_beam=params.beam,
-        min_active_states=params.min_active_states,
-        max_active_states=params.max_active_states
+        min_active_states=params.max_states // 4,
+        max_active_states=params.max_states
     )
-    
+
     # Get best path
     best_path = k2.shortest_path(lattice, use_double_scores=True)
     
-    # Extract tokens and convert to text
+    # Convert best path to token IDs
     hyps = []
     for i in range(batch_size):
-        tokens = []
-        for arc in best_path[i].arcs:
-            if arc.label != 0:  # Skip epsilon transitions
-                tokens.append(arc.label)
-        text = sp.decode(tokens)
-        hyps.append(text)
-    
+        # Get labels (token IDs) from the best path
+        labels = []
+        for arc in best_path[i]:  # k2 handles iteration internally
+            if arc.label != 0:  # Skip blank tokens
+                labels.append(arc.label)
+        
+        # Convert token IDs to text using sentencepiece
+        hyp = sp.decode(labels)
+        hyps.append(hyp)
+
     return hyps
 
 

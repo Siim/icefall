@@ -870,7 +870,11 @@ def compute_loss(
                     # Ensure decoder output is 2D (N, decoder_dim)
                     decoder_current = decoder_out  # Already (N, decoder_dim)
                     
-                    # Now both inputs are 2D: (N, dim)
+                    # Add sequence dimension for joiner compatibility
+                    encoder_frame = encoder_frame.unsqueeze(1)  # (N, 1, encoder_dim)
+                    decoder_current = decoder_current.unsqueeze(1)  # (N, 1, decoder_dim)
+                    
+                    # Now both inputs are 3D: (N, 1, dim)
                     logits = model.joiner(encoder_frame, decoder_current)
                     log_probs = torch.log_softmax(logits, dim=-1)
                     preds = log_probs.argmax(dim=-1)

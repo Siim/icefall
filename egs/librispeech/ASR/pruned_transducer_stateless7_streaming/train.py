@@ -778,7 +778,7 @@ def compute_loss(
     batch: dict,
     is_training: bool,
 ) -> Tuple[Tensor, MetricsTracker]:
-    """Compute transducer loss and WER given the model and its inputs.
+    """Compute transducer loss given the model and batch.
     """
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
     feature = batch["inputs"]
@@ -788,6 +788,8 @@ def compute_loss(
     supervisions = batch["supervisions"]
     feature_lens = supervisions["num_frames"].to(device)
     texts = supervisions["text"]
+    tokens = supervisions["tokens"].to(device)
+    token_lens = supervisions["token_lens"].to(device)
     
     if not is_training:
         try:
@@ -829,16 +831,15 @@ def compute_loss(
                         
                         # Initialize decoder input
                         decoder_input = torch.tensor([hyp], device=device)
-                        decoder_out, decoder_state = model.decoder(decoder_input, need_pad=False)
+                        decoder_out = model.decoder(decoder_input)
                         
                         # Process each frame
                         for t in range(enc_out.size(1)):
                             # Get encoder frame
-                            encoder_frame = enc_out[:, t:t+1].unsqueeze(1)
+                            encoder_frame = enc_out[:, t:t+1]
                             
                             # Get logits from joiner
-                            logits = model.joiner(encoder_frame, decoder_out.unsqueeze(1))
-                            logits = logits.squeeze(1).squeeze(1)
+                            logits = model.joiner(encoder_frame, decoder_out)
                             
                             # Get prediction
                             log_probs = torch.log_softmax(logits, dim=-1)
@@ -850,11 +851,7 @@ def compute_loss(
                                 
                                 # Update decoder state
                                 decoder_input = torch.tensor([hyp[-context_size:]], device=device)
-                                decoder_out, decoder_state = model.decoder(
-                                    decoder_input,
-                                    need_pad=False,
-                                    state=decoder_state
-                                )
+                                decoder_out = model.decoder(decoder_input)
                         
                         # Remove context tokens
                         hyps.append(hyp[context_size:])
@@ -901,12 +898,19 @@ def compute_loss(
     else:
         wer = 0.0  # Don't calculate WER during training
     
+    # Create RaggedTensor from tokens
+    row_splits = torch.zeros(token_lens.size(0) + 1, dtype=torch.int32, device=device)
+    row_splits[1:] = torch.cumsum(token_lens, dim=0)
+    ragged_y = k2.RaggedTensor(row_splits=row_splits, values=tokens.flatten())
+    
     # Calculate loss
     simple_loss, pruned_loss = model(
         x=feature,
         x_lens=feature_lens,
-        y_tokens=batch["supervisions"]["tokens"].to(device),
-        y_lens=batch["supervisions"]["token_lens"].to(device),
+        y=ragged_y,
+        prune_range=params.prune_range,
+        am_scale=params.am_scale,
+        lm_scale=params.lm_scale,
     )
     
     s = params.simple_loss_scale

@@ -1085,7 +1085,7 @@ def decode_with_beam_search(
         encoder_out: Output from encoder (B, T, C)
         encoder_out_lens: Length of each sequence
         params: Parameters
-        sp: SentencePiece tokenizer
+        sp: SentencePieceProcessor tokenizer
         decoding_graph: Optional FSA graph for decoding
     
     Returns:
@@ -1097,9 +1097,10 @@ def decode_with_beam_search(
     # Convert encoder output to log probabilities
     log_probs = torch.nn.functional.log_softmax(encoder_out / params.temperature, dim=-1)
     
-    # Create supervision for dense intersection - ensure int32 dtype
-    supervision = torch.tensor([[0, encoder_out.size(1)]], device=device, dtype=torch.int32)
-    dense_fsa = k2.DenseFsaVec(log_probs, supervision)
+    # Create supervision for dense intersection - ensure it's on CPU with int32 dtype
+    supervision = torch.tensor([[0, encoder_out.size(1)]], dtype=torch.int32)  # Create on CPU
+    dense_fsa = k2.DenseFsaVec(log_probs.cpu(), supervision)  # Move log_probs to CPU for k2
+    dense_fsa = dense_fsa.to(device)  # Move back to device after creation
     
     # If no decoding graph provided, create a simple one
     if decoding_graph is None:

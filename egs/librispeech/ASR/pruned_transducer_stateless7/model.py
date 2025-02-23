@@ -96,32 +96,27 @@ class Transducer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-          x:
-            A 3-D tensor of shape (N, T, C).
-          x_lens:
-            A 1-D tensor of shape (N,). It contains the number of frames in `x`
-            before padding.
-          y:
-            A ragged tensor with 2 axes [utt][label]. It contains labels of each
-            utterance.
-          prune_range:
-            The prune range for rnnt loss, it means how many symbols(context)
-            we are considering for each frame to compute the loss.
-          am_scale:
-            The scale to smooth the loss with am (output of encoder network)
-            part
-          lm_scale:
-            The scale to smooth the loss with lm (output of predictor network)
-            part
+            x: Input tensor (batch, time) or (batch, time, 1)
+            x_lens: Length of each sequence in batch
+            y: Target labels as k2.RaggedTensor
+            prune_range: Range for pruning
+            am_scale: Scale for acoustic model scores
+            lm_scale: Scale for language model scores
         Returns:
-          Return the transducer loss.
+            (simple_loss, pruned_loss)
         """
         assert x.ndim == 3, x.shape
         assert x_lens.ndim == 1, x_lens.shape
         assert y.num_axes == 2, y.num_axes
-
         assert x.size(0) == x_lens.size(0) == y.dim0
 
+        # Get device from model
+        device = next(self.parameters()).device
+        
+        # Move inputs to device
+        x = x.to(device)
+        x_lens = x_lens.to(device)
+        
         # Get encoder output
         encoder_out, x_lens = self.encoder(x, x_lens)
         
@@ -139,6 +134,7 @@ class Transducer(nn.Module):
 
         # sos_y_padded: [B, S + 1], start with SOS.
         sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
+        sos_y_padded = sos_y_padded.to(device)
 
         # decoder_out: [B, S + 1, decoder_dim]
         decoder_out = self.decoder(sos_y_padded)
@@ -146,9 +142,10 @@ class Transducer(nn.Module):
         # Note: y does not start with SOS
         # y_padded : [B, S]
         y_padded = y.pad(mode="constant", padding_value=0)
-
+        y_padded = y_padded.to(device)
         y_padded = y_padded.to(torch.int64)
-        boundary = torch.zeros((x.size(0), 4), dtype=torch.int64, device=x.device)
+
+        boundary = torch.zeros((x.size(0), 4), dtype=torch.int64, device=device)
         boundary[:, 2] = y_lens
         boundary[:, 3] = x_lens
 

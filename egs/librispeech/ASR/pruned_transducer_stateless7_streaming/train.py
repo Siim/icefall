@@ -803,8 +803,8 @@ def compute_loss(
         cached_tot_size=row_splits[-1].item()
     )
     
-    # Get total number of elements from shape
-    total_elements = shape.tot_size()
+    # Get total number of elements (using axis=1 for flattened size)
+    total_elements = shape.tot_size(1)  # Get total size along token dimension
     
     # Debug logging
     logging.debug(f"Shape expects {total_elements} elements")

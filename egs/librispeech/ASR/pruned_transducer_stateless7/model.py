@@ -115,22 +115,14 @@ class Transducer(nn.Module):
         assert y.num_axes == 2, f"Expected y to have 2 axes, got {y.num_axes}"
         assert x.size(0) == x_lens.size(0) == y.dim0, f"Batch size mismatch: x={x.size(0)}, x_lens={x_lens.size(0)}, y={y.dim0}"
 
-        # Print input shapes and values for debugging
-        print(f"Input shapes - x: {x.shape}, x_lens: {x_lens}")
-        print(f"RaggedTensor y - num_axes: {y.num_axes}, dim0: {y.dim0}, row_splits: {y.shape.row_splits(1)}")
-        print(f"x_lens values: {x_lens}")
-
         # Get encoder output
         encoder_out, x_lens = self.encoder(x, x_lens)
-        print(f"Encoder output shape: {encoder_out.shape}, x_lens after encoding: {x_lens}")
         
         # Ensure x_lens matches actual encoder output size
         x_lens = torch.minimum(x_lens, torch.tensor(encoder_out.size(1), device=x_lens.device))
-        print(f"Adjusted x_lens: {x_lens}")
         
         # Project XLSR output if needed
         encoder_out = self.encoder_proj(encoder_out)
-        print(f"Projected encoder output shape: {encoder_out.shape}")
         
         assert torch.all(x_lens > 0), f"All x_lens must be positive, got {x_lens}"
         assert torch.all(x_lens <= encoder_out.size(1)), f"x_lens must not exceed encoder output size, got x_lens={x_lens}, output_size={encoder_out.size(1)}"
@@ -138,22 +130,18 @@ class Transducer(nn.Module):
         # Get label lengths
         row_splits = y.shape.row_splits(1)
         y_lens = row_splits[1:] - row_splits[:-1]
-        print(f"Label lengths: {y_lens}")
 
         # Decoder preparation
         blank_id = self.decoder.blank_id
         sos_y = add_sos(y, sos_id=blank_id)
         sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
-        print(f"SOS padded shape: {sos_y_padded.shape}")
 
         # Get decoder output
         decoder_out = self.decoder(sos_y_padded)
-        print(f"Decoder output shape: {decoder_out.shape}")
 
         # Prepare labels
         y_padded = y.pad(mode="constant", padding_value=0)
         y_padded = y_padded.to(torch.int64)
-        print(f"Padded labels shape: {y_padded.shape}")
 
         # Create and validate boundary tensor
         batch_size = x.size(0)
@@ -167,11 +155,7 @@ class Transducer(nn.Module):
         boundary[:, 0] = 0  # Start frame index
         boundary[:, 1] = 0  # Start label index  
         boundary[:, 2] = y_lens  # End label index
-        # Use actual encoder output size for frame length
-        boundary[:, 3] = torch.minimum(x_lens, torch.tensor(encoder_out.size(1), device=x_lens.device))
-        
-        print(f"Boundary tensor: {boundary}")
-        print(f"y_padded size: {y_padded.size()}, encoder_out size: {encoder_out.size()}")
+        boundary[:, 3] = x_lens  # End frame index
         
         # Validate boundary conditions
         assert torch.all(boundary[:, 2] <= y_padded.size(1)), \
@@ -182,7 +166,6 @@ class Transducer(nn.Module):
         # Project to vocabulary space
         lm = self.simple_lm_proj(decoder_out)
         am = self.simple_am_proj(encoder_out)
-        print(f"LM projection shape: {lm.shape}, AM projection shape: {am.shape}")
 
         # Compute losses
         with torch.amp.autocast('cuda', enabled=False):

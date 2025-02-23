@@ -124,11 +124,16 @@ class Transducer(nn.Module):
         encoder_out, x_lens = self.encoder(x, x_lens)
         print(f"Encoder output shape: {encoder_out.shape}, x_lens after encoding: {x_lens}")
         
+        # Ensure x_lens matches actual encoder output size
+        x_lens = torch.minimum(x_lens, torch.tensor(encoder_out.size(1), device=x_lens.device))
+        print(f"Adjusted x_lens: {x_lens}")
+        
         # Project XLSR output if needed
         encoder_out = self.encoder_proj(encoder_out)
         print(f"Projected encoder output shape: {encoder_out.shape}")
         
         assert torch.all(x_lens > 0), f"All x_lens must be positive, got {x_lens}"
+        assert torch.all(x_lens <= encoder_out.size(1)), f"x_lens must not exceed encoder output size, got x_lens={x_lens}, output_size={encoder_out.size(1)}"
 
         # Get label lengths
         row_splits = y.shape.row_splits(1)
@@ -180,7 +185,7 @@ class Transducer(nn.Module):
         print(f"LM projection shape: {lm.shape}, AM projection shape: {am.shape}")
 
         # Compute losses
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             try:
                 simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
                     lm=lm.float(),
@@ -217,7 +222,7 @@ class Transducer(nn.Module):
         logits = self.joiner(am_pruned, lm_pruned, project_input=False)
 
         # Compute pruned loss
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             pruned_loss = k2.rnnt_loss_pruned(
                 logits=logits.float(),
                 symbols=y_padded,

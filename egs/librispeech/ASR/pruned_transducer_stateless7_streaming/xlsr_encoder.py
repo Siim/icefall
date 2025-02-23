@@ -9,7 +9,44 @@ import numpy as np
 from typing import Optional, List, Tuple
 from icefall.utils import make_pad_mask
 import math
-from encoder_interface import EncoderInterface
+
+class EncoderInterface(nn.Module):
+    """Interface for encoders used in transducer models"""
+    def __init__(self) -> None:
+        super().__init__()
+        self.output_dim = 0  # Must be set by implementing class
+        
+    def forward(self, x: torch.Tensor, x_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: Input tensor (batch, time) or (batch, time, 1)
+            x_lens: Length of each sequence in the batch
+        Returns:
+            (output, output_lens)
+            output: (batch, time', output_dim)
+            output_lens: (batch,)
+        """
+        raise NotImplementedError
+
+    def streaming_forward(
+        self,
+        x: torch.Tensor,
+        x_lens: torch.Tensor,
+        states: Optional[List[torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """Streaming forward pass
+        Args:
+            x: Input tensor (batch, time) or (batch, time, 1)
+            x_lens: Length of each sequence in batch
+            states: Optional cached states from previous chunk
+        Returns:
+            (encoder_out, encoder_out_lens, next_states)
+        """
+        raise NotImplementedError
+
+    def get_init_state(self, device: Optional[torch.device] = None) -> List[Optional[torch.Tensor]]:
+        """Get initial states for streaming inference"""
+        raise NotImplementedError
 
 class XLSREncoder(EncoderInterface):
     def __init__(
@@ -192,15 +229,17 @@ class XLSREncoder(EncoderInterface):
     def streaming_forward(
         self,
         x: torch.Tensor,
-        cache: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        x_lens: torch.Tensor,
+        states: Optional[List[torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         """
         Streaming forward pass with proper context and attention sink handling
         Args:
-            x: Input tensor (batch=1, time)
-            cache: Optional cached state from previous chunk
+            x: Input tensor (batch, time) or (batch, time, 1)
+            x_lens: Length of each sequence in batch
+            states: Optional cached states from previous chunk
         Returns:
-            (output, new_cache)
+            (encoder_out, encoder_out_lens, next_states)
         """
         # Ensure input is float and in correct shape
         x = x.float()
@@ -211,7 +250,32 @@ class XLSREncoder(EncoderInterface):
         # Clamp values silently since inputs are already normalized
         x = torch.clamp(x, min=-1.0, max=1.0)
         
-        # Add attention sink if enabled
+        # Calculate expected output length before adding context
+        # Account for overlap and context frames precisely
+        chunk_overlap = self.decode_chunk_size // 2
+        context_frames = self.attention_sink_size if self.use_attention_sink else 0
+        if self.left_context_chunks > 0:
+            context_frames += self.left_context_chunks * (self.decode_chunk_size // self.downsample_factor)
+            
+        # Calculate effective input length considering overlap and context
+        if states is not None:
+            # For subsequent chunks, adjust for overlap
+            effective_input_len = x_lens - chunk_overlap
+            # Add small correction factor for chunk boundary alignment
+            boundary_correction = self.downsample_factor // 16  # 20 samples at 16kHz
+            effective_input_len = effective_input_len + boundary_correction
+        else:
+            # For first chunk, use full length
+            effective_input_len = x_lens
+            
+        # Calculate expected frames precisely using ceil instead of floor
+        expected_frames = ((effective_input_len.float() / self.downsample_factor).ceil()).to(torch.int64)
+        expected_frames = torch.maximum(expected_frames, torch.ones_like(expected_frames))
+        
+        # Add left context if available
+        x = self.prepare_left_context(x)
+        
+        # Add attention sink
         x, new_sink_cache = self.prepare_attention_sink(x, self.attention_sink_cache)
         
         # Process through XLSR model
@@ -223,6 +287,40 @@ class XLSREncoder(EncoderInterface):
             return_dict=False
         )[0]
         
+        # Update left context buffer
+        self.left_context_buffer.append(x.clone())
+        if len(self.left_context_buffer) > self.left_context_chunks:
+            self.left_context_buffer.pop(0)
+        
+        # Remove context frames from output
+        if context_frames > 0:
+            outputs = outputs[:, context_frames:]
+        
+        # Ensure outputs match expected length precisely
+        max_len = expected_frames.max().item()
+        if outputs.size(1) > max_len:
+            # Calculate optimal start position to minimize edge effects
+            extra = outputs.size(1) - max_len
+            # Bias towards keeping more recent frames for streaming
+            start = (extra * 2) // 3  # Take more frames from the end
+            outputs = outputs[:, start:start + max_len]
+        elif outputs.size(1) < max_len and outputs.size(1) > 0:  # Only pad if we have some frames
+            # Calculate required padding
+            pad_len = max_len - outputs.size(1)
+            # Add padding at the end to maintain temporal order
+            outputs = torch.nn.functional.pad(
+                outputs,
+                (0, 0, 0, pad_len),
+                mode='replicate'  # Replicate last frame instead of zeros
+            )
+        elif outputs.size(1) == 0:  # Handle empty tensor case
+            # Create a tensor of the expected size filled with zeros
+            outputs = torch.zeros(
+                (outputs.size(0), max_len, outputs.size(2)),
+                device=outputs.device,
+                dtype=outputs.dtype
+            )
+        
         # Apply smooth transition if we have previous output
         if self.last_chunk_output is not None:
             outputs = self.smooth_transition(outputs, self.last_chunk_output)
@@ -230,7 +328,10 @@ class XLSREncoder(EncoderInterface):
         # Cache current output for next chunk
         self.last_chunk_output = outputs.clone()
         
-        return outputs, new_sink_cache
+        # Update states for next chunk
+        next_states = [x, new_sink_cache]
+        
+        return outputs, expected_frames, next_states
 
     def forward(self, x: torch.Tensor, x_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Non-streaming forward pass"""

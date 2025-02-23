@@ -825,29 +825,43 @@ def compute_loss(
                 if hasattr(model, "encoder_proj"):
                     encoder_out = model.encoder_proj(encoder_out)
                 
-                # Use greedy search for quick WER calculation
-                hyps = greedy_search_batch(
-                    model=model,
-                    encoder_out=encoder_out,
-                    encoder_out_lens=encoder_out_lens,
-                )
-                
-                # Convert hypotheses to text
-                hyp_texts = [sp.decode(hyp) for hyp in hyps]
-                
-                # Calculate WER
-                total_words = sum(len(text.split()) for text in texts)
-                total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
-                                 for hyp, ref in zip(hyp_texts, texts))
-                wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
-                
-                # Log some examples periodically
-                if batch_idx_train % 1000 == 0:
-                    logging.info("\nExample Predictions:")
-                    for i in range(min(2, len(texts))):  # Show first 2 examples
-                        logging.info(f"Reference: {texts[i]}")
-                        logging.info(f"Predicted: {hyp_texts[i]}")
-                        logging.info("-" * 50)
+                # Ensure we have valid encoder output
+                if encoder_out.size(1) == 0 or encoder_out_lens.min() == 0:
+                    logging.warning("Empty encoder output, skipping WER calculation")
+                    wer = float('inf')
+                else:
+                    # Use greedy search for quick WER calculation
+                    hyps = greedy_search_batch(
+                        model=model,
+                        encoder_out=encoder_out,
+                        encoder_out_lens=encoder_out_lens,
+                    )
+                    
+                    if not hyps:  # If no hypotheses were generated
+                        logging.warning("No hypotheses generated, skipping WER calculation")
+                        wer = float('inf')
+                    else:
+                        # Convert hypotheses to text
+                        hyp_texts = [sp.decode(hyp) for hyp in hyps]
+                        
+                        # Calculate WER only if we have matching number of hypotheses and references
+                        if len(hyp_texts) != len(texts):
+                            logging.warning(f"Mismatch between hypotheses ({len(hyp_texts)}) and references ({len(texts)}), skipping WER calculation")
+                            wer = float('inf')
+                        else:
+                            # Calculate WER
+                            total_words = sum(len(text.split()) for text in texts)
+                            total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
+                                             for hyp, ref in zip(hyp_texts, texts))
+                            wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
+                            
+                            # Log some examples periodically
+                            if batch_idx_train % 1000 == 0:
+                                logging.info("\nExample Predictions:")
+                                for i in range(min(2, len(texts))):  # Show first 2 examples
+                                    logging.info(f"Reference: {texts[i]}")
+                                    logging.info(f"Predicted: {hyp_texts[i]}")
+                                    logging.info("-" * 50)
             except Exception as e:
                 logging.warning(f"WER calculation failed: {str(e)}")
                 wer = float('inf')

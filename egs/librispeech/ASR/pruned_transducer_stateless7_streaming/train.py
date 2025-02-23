@@ -823,22 +823,6 @@ def compute_loss(
     # Calculate loss with proper gradient context
     if not is_training:
         with torch.no_grad():
-            # Add right context for streaming
-            feature_lens_pad = feature_lens + 30
-            feature_pad = torch.nn.functional.pad(
-                feature,
-                pad=(0, 0, 0, 30),
-                value=0.0,
-            )
-            
-            # Get encoder output
-            encoder_out, encoder_out_lens = model.encoder(x=feature_pad, x_lens=feature_lens_pad)
-            
-            # Project encoder output if using XLSR
-            if hasattr(model, "encoder_proj"):
-                encoder_out = model.encoder_proj(encoder_out)
-            
-            # Calculate loss
             simple_loss, pruned_loss = model(
                 x=feature,
                 x_lens=feature_lens,
@@ -847,69 +831,7 @@ def compute_loss(
                 am_scale=params.am_scale,
                 lm_scale=params.lm_scale,
             )
-            
-            # Calculate WER using greedy search
-            hyps = []
-            for i in range(encoder_out.size(0)):
-                # Get encoder output for this sequence
-                enc_out = encoder_out[i:i+1, :encoder_out_lens[i]]
-                
-                # Initialize decoder state
-                hyp = [params.blank_id] * params.context_size
-                decoder_input = torch.tensor([hyp], device=device)
-                decoder_out = model.decoder(decoder_input)
-                
-                # Process each frame
-                for t in range(enc_out.size(1)):
-                    # Extract encoder frame and ensure it's 2D (N, encoder_dim)
-                    encoder_frame = enc_out[:, t:t+1]  # (N, 1, encoder_dim)
-                    if hasattr(model, "encoder_proj"):
-                        encoder_frame = model.encoder_proj(encoder_frame)
-                    encoder_frame = encoder_frame.squeeze(1)  # (N, encoder_dim)
-                    
-                    # Ensure decoder output is 2D (N, decoder_dim)
-                    decoder_current = decoder_out  # Already (N, decoder_dim)
-                    
-                    # Add sequence dimension for joiner compatibility
-                    encoder_frame = encoder_frame.unsqueeze(1)  # (N, 1, encoder_dim)
-                    decoder_current = decoder_current.unsqueeze(1)  # (N, 1, decoder_dim)
-                    
-                    # Now both inputs are 3D: (N, 1, dim)
-                    logits = model.joiner(encoder_frame, decoder_current)
-                    log_probs = torch.log_softmax(logits, dim=-1)
-                    preds = log_probs.argmax(dim=-1)
-                    # Ensure hyp is a list of lists, one per sample in the batch
-                    if not isinstance(hyp, list) or (hyp and not isinstance(hyp[0], list)):
-                        # If hyp is not already a list of lists, initialize it for each sample in the batch
-                        hyp = [[token] if token != params.blank_id else [] for token in preds.tolist()]
-                    else:
-                        # Process each sample individually
-                        for i, p in enumerate(preds):
-                            # p is a tensor scalar for sample i
-                            token = p.item()
-                            # If the predicted token is not blank and either the hypothesis is empty or not repeating
-                            if token != params.blank_id and (len(hyp[i]) <= params.context_size or (hyp[i] and token != hyp[i][-1])):
-                                hyp[i].append(token)
-                
-                # Remove context tokens
-                hyps.append(hyp[params.context_size:])
-            
-            # Convert hypotheses to text
-            hyp_texts = []
-            for hyp in hyps:
-                try:
-                    text = sp.decode(hyp)
-                    hyp_texts.append(text)
-                except Exception as e:
-                    logging.warning(f"Failed to decode: {str(e)}")
-                    hyp_texts.append("")
-            
-            # Calculate WER
-            total_words = sum(len(text.split()) for text in texts)
-            total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
-                             for hyp, ref in zip(hyp_texts, texts))
-            wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
-            
+            wer = float('inf')  # Don't calculate WER during validation for now
     else:
         simple_loss, pruned_loss = model(
             x=feature,

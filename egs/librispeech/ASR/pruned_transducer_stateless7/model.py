@@ -109,44 +109,53 @@ class Transducer(nn.Module):
         Returns:
           Return the transducer loss.
         """
-        assert x.ndim == 3, x.shape
-        assert x_lens.ndim == 1, x_lens.shape
-        assert y.num_axes == 2, y.num_axes
+        # Input validation
+        assert x.ndim == 3, f"Expected x to have 3 dimensions, got shape {x.shape}"
+        assert x_lens.ndim == 1, f"Expected x_lens to have 1 dimension, got shape {x_lens.shape}"
+        assert y.num_axes == 2, f"Expected y to have 2 axes, got {y.num_axes}"
+        assert x.size(0) == x_lens.size(0) == y.dim0, f"Batch size mismatch: x={x.size(0)}, x_lens={x_lens.size(0)}, y={y.dim0}"
 
-        assert x.size(0) == x_lens.size(0) == y.dim0
+        # Print input shapes and values for debugging
+        print(f"Input shapes - x: {x.shape}, x_lens: {x_lens}, y dims: {y.dim0}, {y.dim1}")
+        print(f"x_lens values: {x_lens}")
 
+        # Get encoder output
         encoder_out, x_lens = self.encoder(x, x_lens)
+        print(f"Encoder output shape: {encoder_out.shape}, x_lens after encoding: {x_lens}")
         
         # Project XLSR output if needed
         encoder_out = self.encoder_proj(encoder_out)
+        print(f"Projected encoder output shape: {encoder_out.shape}")
         
-        assert torch.all(x_lens > 0)
+        assert torch.all(x_lens > 0), f"All x_lens must be positive, got {x_lens}"
 
-        # Now for the decoder, i.e., the prediction network
+        # Get label lengths
         row_splits = y.shape.row_splits(1)
         y_lens = row_splits[1:] - row_splits[:-1]
+        print(f"Label lengths: {y_lens}")
 
+        # Decoder preparation
         blank_id = self.decoder.blank_id
         sos_y = add_sos(y, sos_id=blank_id)
-
-        # sos_y_padded: [B, S + 1], start with SOS.
         sos_y_padded = sos_y.pad(mode="constant", padding_value=blank_id)
+        print(f"SOS padded shape: {sos_y_padded.shape}")
 
-        # decoder_out: [B, S + 1, decoder_dim]
+        # Get decoder output
         decoder_out = self.decoder(sos_y_padded)
+        print(f"Decoder output shape: {decoder_out.shape}")
 
-        # Note: y does not start with SOS
-        # y_padded : [B, S]
+        # Prepare labels
         y_padded = y.pad(mode="constant", padding_value=0)
         y_padded = y_padded.to(torch.int64)
+        print(f"Padded labels shape: {y_padded.shape}")
 
         # Create and validate boundary tensor
         batch_size = x.size(0)
         boundary = torch.zeros((batch_size, 4), dtype=torch.int64, device=x.device)
         
         # First validate lengths
-        assert torch.all(y_lens >= 0), "Label lengths must be non-negative"
-        assert torch.all(x_lens >= 0), "Frame lengths must be non-negative"
+        assert torch.all(y_lens >= 0), f"Label lengths must be non-negative, got {y_lens}"
+        assert torch.all(x_lens >= 0), f"Frame lengths must be non-negative, got {x_lens}"
         
         # Set boundary values
         boundary[:, 0] = 0  # Start frame index
@@ -154,27 +163,41 @@ class Transducer(nn.Module):
         boundary[:, 2] = y_lens  # End label index
         boundary[:, 3] = x_lens  # End frame index
         
+        print(f"Boundary tensor: {boundary}")
+        print(f"y_padded size: {y_padded.size()}, encoder_out size: {encoder_out.size()}")
+        
         # Validate boundary conditions
-        assert torch.all(boundary[:, 2] <= y_padded.size(1)), "Label length exceeds padded size"
-        assert torch.all(boundary[:, 3] <= encoder_out.size(1)), "Frame length exceeds encoder output size"
+        assert torch.all(boundary[:, 2] <= y_padded.size(1)), \
+            f"Label length exceeds padded size: max_len={boundary[:, 2].max()}, padded_size={y_padded.size(1)}"
+        assert torch.all(boundary[:, 3] <= encoder_out.size(1)), \
+            f"Frame length exceeds encoder output size: max_len={boundary[:, 3].max()}, output_size={encoder_out.size(1)}"
 
+        # Project to vocabulary space
         lm = self.simple_lm_proj(decoder_out)
         am = self.simple_am_proj(encoder_out)
+        print(f"LM projection shape: {lm.shape}, AM projection shape: {am.shape}")
 
+        # Compute losses
         with torch.cuda.amp.autocast(enabled=False):
-            simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
-                lm=lm.float(),
-                am=am.float(),
-                symbols=y_padded,
-                termination_symbol=blank_id,
-                lm_only_scale=lm_scale,
-                am_only_scale=am_scale,
-                boundary=boundary,
-                reduction="sum",
-                return_grad=True,
-            )
+            try:
+                simple_loss, (px_grad, py_grad) = k2.rnnt_loss_smoothed(
+                    lm=lm.float(),
+                    am=am.float(),
+                    symbols=y_padded,
+                    termination_symbol=blank_id,
+                    lm_only_scale=lm_scale,
+                    am_only_scale=am_scale,
+                    boundary=boundary,
+                    reduction="sum",
+                    return_grad=True,
+                )
+            except Exception as e:
+                print(f"Error in rnnt_loss_smoothed: {str(e)}")
+                print(f"lm shape: {lm.shape}, am shape: {am.shape}")
+                print(f"symbols shape: {y_padded.shape}, boundary: {boundary}")
+                raise
 
-        # ranges : [B, T, prune_range]
+        # Get pruning ranges
         ranges = k2.get_rnnt_prune_ranges(
             px_grad=px_grad,
             py_grad=py_grad,
@@ -182,17 +205,16 @@ class Transducer(nn.Module):
             s_range=prune_range,
         )
 
-        # am_pruned : [B, T, prune_range, encoder_dim]
-        # lm_pruned : [B, T, prune_range, decoder_dim]
+        # Prune and get final logits
         am_pruned, lm_pruned = k2.do_rnnt_pruning(
             am=self.joiner.encoder_proj(encoder_out),
             lm=self.joiner.decoder_proj(decoder_out),
             ranges=ranges,
         )
 
-        # logits : [B, T, prune_range, vocab_size]
         logits = self.joiner(am_pruned, lm_pruned, project_input=False)
 
+        # Compute pruned loss
         with torch.cuda.amp.autocast(enabled=False):
             pruned_loss = k2.rnnt_loss_pruned(
                 logits=logits.float(),

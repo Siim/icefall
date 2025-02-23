@@ -110,12 +110,16 @@ class EstonianDecoder(nn.Module):
         Returns:
             A 3-D tensor of shape (N, U, decoder_dim)
         """
+        # Move input to same device as embedding weights
+        device = self.embedding.weight.device
+        y = y.to(device)
+        
         # Handle padding if needed
         if need_pad and y.shape[1] < self.context_size:
             padding = torch.full(
                 (y.shape[0], self.context_size - y.shape[1]),
                 self.blank_id,
-                device=y.device,
+                device=device,
                 dtype=y.dtype
             )
             y = torch.cat([padding, y], dim=1)

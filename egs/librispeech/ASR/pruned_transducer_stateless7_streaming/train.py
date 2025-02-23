@@ -826,6 +826,10 @@ def compute_loss(
                     x_lens=feature_lens,
                 )
                 
+                # Project encoder output if using XLSR
+                if hasattr(model, "encoder_proj"):
+                    encoder_out = model.encoder_proj(encoder_out)
+                
                 # Use greedy search for quick WER calculation
                 hyps = greedy_search_batch(
                     model=model,
@@ -833,7 +837,7 @@ def compute_loss(
                     encoder_out_lens=encoder_out_lens,
                 )
                 
-                # Convert hypotheses to text - hyps is already a list of lists
+                # Convert hypotheses to text
                 hyp_texts = [sp.decode(hyp) for hyp in hyps]
                 
                 # Calculate WER

@@ -496,6 +496,9 @@ def get_params() -> AttributeDict:
             "weight_decay": 1e-6,
             "warm_step": 2000,
             "batch_idx_train": 0,  # Initialize batch index counter
+            "reset_interval": 200,  # Reset interval for loss statistics
+            "log_interval": 50,  # Log interval for training progress
+            "valid_interval": 2000,  # Validation interval
             
             # Progressive unfreezing schedule
             "unfreeze_schedule": [
@@ -515,8 +518,6 @@ def get_params() -> AttributeDict:
             "context_size": 2,
             "max_duration": 200.0,
             "random_seed": 42,
-            "log_interval": 50,
-            "valid_interval": 2000,
             "save_every_n": 2000,
             "keep_last_k": 20,
             "average_period": 100,

@@ -788,6 +788,9 @@ def compute_loss(
     # Get supervisions
     supervisions = batch["supervisions"]
     
+    # Get feature lengths from supervisions
+    feature_lens = supervisions["num_frames"].to(device)
+    
     # Get supervision segments
     texts = supervisions["text"]
     tokens = supervisions["tokens"].to(device)

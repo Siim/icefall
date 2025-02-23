@@ -68,13 +68,21 @@ class EstonianDecoder(nn.Module):
         # Embedding layer for tokens
         self.embedding = nn.Embedding(vocab_size, decoder_dim)
         
-        # Decoder layers
-        self.layers = nn.ModuleList([
+        # LSTM for sequence modeling
+        self.lstm = nn.LSTM(
+            input_size=decoder_dim,
+            hidden_size=decoder_dim,
+            num_layers=2,
+            batch_first=True
+        )
+        
+        # Projection layer
+        self.projection = nn.Sequential(
             nn.Linear(decoder_dim, decoder_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(decoder_dim, decoder_dim)
-        ])
+        )
         
         # Initialize FSA objects as None
         self._decoding_graph = None
@@ -101,14 +109,17 @@ class EstonianDecoder(nn.Module):
     def forward(
         self,
         y: torch.Tensor,
-        need_pad: bool = False
-    ) -> torch.Tensor:
+        need_pad: bool = False,
+        state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         """
         Args:
             y: A 2-D tensor of shape (N, U) with U <= context_size
             need_pad: If True, pad y with blank_id to ensure context_size
+            state: Optional previous LSTM state
         Returns:
-            A 2-D tensor of shape (N, decoder_dim)
+            decoder_out: A 2-D tensor of shape (N, decoder_dim)
+            new_state: New LSTM state
         """
         # Handle padding if needed
         if need_pad and y.shape[1] < self.context_size:
@@ -121,16 +132,21 @@ class EstonianDecoder(nn.Module):
             y = torch.cat([padding, y], dim=1)
         
         # Embed tokens
-        embedded = self.embedding(y)
+        embedded = self.embedding(y)  # (N, U, decoder_dim)
         
-        # Average embeddings
-        decoder_out = torch.mean(embedded, dim=1)
+        # Process through LSTM
+        if state is None:
+            lstm_out, new_state = self.lstm(embedded)
+        else:
+            lstm_out, new_state = self.lstm(embedded, state)
         
-        # Apply decoder layers
-        for layer in self.layers:
-            decoder_out = layer(decoder_out)
+        # Take last hidden state
+        decoder_out = lstm_out[:, -1]  # (N, decoder_dim)
         
-        return decoder_out
+        # Apply projection
+        decoder_out = self.projection(decoder_out)
+        
+        return decoder_out, new_state
 
     @property
     def decoding_graph(self):

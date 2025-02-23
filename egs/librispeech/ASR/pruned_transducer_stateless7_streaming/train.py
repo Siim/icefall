@@ -855,9 +855,7 @@ def compute_loss(
                 enc_out = encoder_out[i:i+1, :encoder_out_lens[i]]
                 
                 # Initialize decoder state
-                blank_id = model.decoder.blank_id
-                context_size = model.decoder.context_size
-                hyp = [blank_id] * context_size
+                hyp = [params.blank_id] * params.context_size
                 
                 # Initialize decoder input
                 decoder_input = torch.tensor([hyp], device=device)
@@ -872,32 +870,32 @@ def compute_loss(
                     if hasattr(model, "encoder_proj"):
                         encoder_frame = model.encoder_proj(encoder_frame)
                     
-                    # Reshape encoder frame for joiner (N, T=1, encoder_dim)
+                    # Reshape encoder frame for joiner (N=1, T=1, encoder_dim)
                     encoder_frame = encoder_frame.unsqueeze(1)
                     
-                    # Reshape decoder output for joiner (N, U=1, decoder_dim)
+                    # Reshape decoder output for joiner (N=1, U=1, decoder_dim)
                     decoder_out = decoder_out.unsqueeze(1)
                     
                     # Get logits from joiner
                     logits = model.joiner(encoder_frame, decoder_out)
                     
-                    # Remove extra dimensions (N, T=1, U=1, vocab_size) -> (N, vocab_size)
+                    # Remove extra dimensions (N=1, T=1, U=1, vocab_size) -> (N=1, vocab_size)
                     logits = logits.squeeze(1).squeeze(1)
                     
                     # Get prediction
                     log_probs = torch.log_softmax(logits, dim=-1)
-                    pred = log_probs.argmax(dim=-1).item()
+                    pred = log_probs[0].argmax().item()  # Take first item since batch size is 1
                     
                     # Add token if not blank and not repeating
-                    if pred != blank_id and (len(hyp) <= context_size or pred != hyp[-1]):
+                    if pred != params.blank_id and (len(hyp) <= params.context_size or pred != hyp[-1]):
                         hyp.append(pred)
                         
                         # Update decoder state
-                        decoder_input = torch.tensor([hyp[-context_size:]], device=device)
+                        decoder_input = torch.tensor([hyp[-params.context_size:]], device=device)
                         decoder_out = model.decoder(decoder_input)
                 
                 # Remove context tokens
-                hyps.append(hyp[context_size:])
+                hyps.append(hyp[params.context_size:])
             
             # Convert hypotheses to text
             hyp_texts = []

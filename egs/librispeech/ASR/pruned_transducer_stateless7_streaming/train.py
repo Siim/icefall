@@ -873,8 +873,12 @@ def decode_with_beam_search(
     batch_size = encoder_out.size(0)
 
     try:
-        # Convert encoder output to log probabilities
-        encoder_out = torch.nn.functional.log_softmax(encoder_out, dim=-1)
+        # Apply temperature scaling and convert to log probabilities
+        logits = encoder_out / params.temperature if hasattr(params, 'temperature') else encoder_out
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        
+        # Clamp values to avoid numerical instability
+        log_probs = torch.clamp(log_probs, min=-1e4, max=0)
 
         # Create supervision segments on CPU as required by k2
         supervision_segments = torch.tensor(
@@ -884,10 +888,10 @@ def decode_with_beam_search(
         )
 
         # Move encoder output to CPU for k2
-        encoder_out_cpu = encoder_out.cpu()
+        log_probs_cpu = log_probs.cpu()
         
         # Create dense FSA from encoder output
-        dense_fsa = k2.DenseFsaVec(encoder_out_cpu, supervision_segments)
+        dense_fsa = k2.DenseFsaVec(log_probs_cpu, supervision_segments)
 
         if decoding_graph is None:
             # Create a simple CTC-like decoding graph
@@ -900,57 +904,73 @@ def decode_with_beam_search(
         decoding_graph = decoding_graph.to("cpu")
         decoding_graph = k2.arc_sort(decoding_graph)
 
-        # Intersect with decoding graph and find best path
-        lattice = k2.intersect_dense_pruned(
-            decoding_graph,
-            dense_fsa,
-            search_beam=params.beam,
-            output_beam=params.beam,
-            min_active_states=params.max_states // 4,
-            max_active_states=params.max_states
-        )
+        # Set reasonable defaults for beam search parameters
+        beam = getattr(params, 'beam', 20.0)
+        max_states = getattr(params, 'max_states', 64)
+        max_contexts = getattr(params, 'max_contexts', 8)
 
-        # Connect and sort the lattice
-        lattice = k2.connect(lattice)
-        lattice = k2.top_sort(lattice)
-        
-        # Ensure single final state
-        lattice = k2.remove_epsilon(lattice)
-        
-        # Get best path with double precision for stability
-        best_path = k2.shortest_path(lattice, use_double_scores=True)
-        
-        # Extract labels from best path
-        hyps = []
-        for i in range(batch_size):
-            # Get labels (token IDs) from the best path
-            labels = []
-            if hasattr(best_path[i], 'labels'):
-                labels = best_path[i].labels.tolist()
-            else:
-                fsa = best_path[i]
-                labels = [arc.label for arc in fsa.arcs if arc.label != 0]
-            
-            # Remove consecutive duplicates and zeros
-            labels = [x for x, _ in itertools.groupby(labels) if x != 0]
-            
-            # Convert token IDs to text using sentencepiece
-            hyp = sp.decode(labels)
-            hyps.append(hyp)
+        try:
+            # Intersect with decoding graph and find best path
+            lattice = k2.intersect_dense_pruned(
+                decoding_graph,
+                dense_fsa,
+                search_beam=beam,
+                output_beam=beam,
+                min_active_states=max_states // 4,
+                max_active_states=max_states,
+                max_contexts=max_contexts
+            )
 
-        return hyps
+            # Connect and sort the lattice
+            lattice = k2.connect(lattice)
+            lattice = k2.top_sort(lattice)
+            
+            # Get best path with double precision for stability
+            best_path = k2.shortest_path(lattice, use_double_scores=True)
+            
+            # Extract labels from best path
+            hyps = []
+            for i in range(batch_size):
+                # Get labels (token IDs) from the best path
+                labels = []
+                if hasattr(best_path[i], 'labels'):
+                    labels = best_path[i].labels.tolist()
+                else:
+                    fsa = best_path[i]
+                    labels = [arc.label for arc in fsa.arcs if arc.label != 0]
+                
+                # Remove consecutive duplicates and zeros
+                labels = [x for x, _ in itertools.groupby(labels) if x != 0]
+                
+                # Convert token IDs to text using sentencepiece
+                hyp = sp.decode(labels)
+                hyps.append(hyp)
+
+            return hyps
+
+        except RuntimeError as e:
+            logging.warning(f"FSA decoding failed: {e}, falling back to greedy decoding")
+            return greedy_decode_batch(log_probs, encoder_out_lens, sp)
 
     except Exception as e:
-        logging.warning(f"FSA decoding failed: {e}, falling back to greedy decoding")
-        # Simple greedy decoding fallback
-        hyps = []
+        logging.error(f"Unexpected error in beam search decoding: {e}")
+        # Return empty transcripts as fallback
+        return ["" for _ in range(batch_size)]
+
+def greedy_decode_batch(
+    log_probs: torch.Tensor,
+    lengths: torch.Tensor,
+    sp: spm.SentencePieceProcessor
+) -> List[str]:
+    """Simple greedy decoding fallback."""
+    with torch.no_grad():
         # Get most likely token at each timestep
-        predictions = encoder_out.argmax(dim=-1)  # [batch, time]
+        predictions = log_probs.argmax(dim=-1)  # [batch, time]
         
-        # Convert predictions to text for each sequence in batch
-        for i in range(batch_size):
+        hyps = []
+        for i in range(predictions.size(0)):
             # Get sequence up to its length
-            sequence = predictions[i, :encoder_out_lens[i]]
+            sequence = predictions[i, :lengths[i]]
             # Remove consecutive duplicates and zeros (CTC blank)
             sequence = [t.item() for t in sequence]
             sequence = [x for x, _ in itertools.groupby(sequence) if x != 0]

@@ -196,6 +196,41 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         help="The chunk size for decoding (in frames before subsampling)",
     )
 
+    parser.add_argument(
+        "--use-xlsr",
+        type=str2bool,
+        default=True,
+        help="Whether to use XLSR encoder instead of Zipformer",
+    )
+    
+    parser.add_argument(
+        "--xlsr-model",
+        type=str,
+        default="facebook/wav2vec2-xls-r-300m",
+        help="XLSR model name from HuggingFace",
+    )
+    
+    parser.add_argument(
+        "--decode-chunk-size",
+        type=int,
+        default=5120,  # 320ms at 16kHz
+        help="Chunk size for streaming decoding (in samples)",
+    )
+    
+    parser.add_argument(
+        "--attention-sink-size",
+        type=int,
+        default=16,
+        help="Number of frames for attention sink",
+    )
+    
+    parser.add_argument(
+        "--left-context-chunks",
+        type=int,
+        default=1,
+        help="Number of left context chunks to use",
+    )
+
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -450,12 +485,33 @@ def get_params() -> AttributeDict:
             "batch_idx_train": 0,
             "log_interval": 50,
             "reset_interval": 200,
-            "valid_interval": 3000,  # For the 100h subset, use 800
+            "valid_interval": 3000,
             # parameters for zipformer
             "feature_dim": 80,
             "subsampling_factor": 4,  # not passed in, this is fixed.
             "warm_step": 2000,
             "env_info": get_env_info(),
+            
+            # XLSR specific parameters
+            "use_xlsr": True,
+            "xlsr_model": "facebook/wav2vec2-xls-r-300m",
+            "decode_chunk_size": 5120,  # 320ms at 16kHz (paper's best performing)
+            "attention_sink_size": 16,   # Paper's optimal setting
+            "left_context_chunks": 1,    # Paper's optimal setting
+            "frame_duration": 0.025,     # 25ms per frame (from paper)
+            "frame_stride": 0.020,       # 20ms stride (from paper)
+            
+            # Estonian specific parameters
+            "vocab_size": 2503,  # Will be updated based on tokenizer
+            "blank_id": 0,       # Will be updated based on tokenizer
+            "unk_id": 1,
+            "pad_id": 2,
+            
+            # Training parameters
+            "batch_size": 8,     # Adjust based on GPU memory
+            "accum_grad": 4,     # Gradient accumulation steps
+            "lr_epochs": 3.5,    # Learning rate schedule epochs
+            "lr_batches": 5000,  # Learning rate schedule batches
         }
     )
 
@@ -463,16 +519,27 @@ def get_params() -> AttributeDict:
 
 
 def get_encoder_model(params: AttributeDict) -> nn.Module:
-    # TODO: We can add an option to switch between Zipformer and Transformer
+    if params.use_xlsr:
+        from xlsr_encoder import XLSREncoder
+        encoder = XLSREncoder(
+            model_name=params.xlsr_model,
+            decode_chunk_size=params.decode_chunk_size,
+            use_attention_sink=True,
+            attention_sink_size=params.attention_sink_size,
+            frame_duration=params.frame_duration,
+            frame_stride=params.frame_stride,
+            left_context_chunks=params.left_context_chunks,
+        )
+        return encoder
+        
+    # Original Zipformer encoder for non-XLSR case
     def to_int_tuple(s: str):
         return tuple(map(int, s.split(",")))
 
     encoder = Zipformer(
         num_features=params.feature_dim,
         output_downsampling_factor=2,
-        zipformer_downsampling_factors=to_int_tuple(
-            params.zipformer_downsampling_factors
-        ),
+        zipformer_downsampling_factors=to_int_tuple(params.zipformer_downsampling_factors),
         encoder_dims=to_int_tuple(params.encoder_dims),
         attention_dim=to_int_tuple(params.attention_dims),
         encoder_unmasked_dims=to_int_tuple(params.encoder_unmasked_dims),

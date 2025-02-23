@@ -861,19 +861,16 @@ def compute_loss(
                 
                 # Process each frame
                 for t in range(enc_out.size(1)):
-                    # Get encoder frame
+                    # Get encoder frame (shape: (N, 1, encoder_dim))
                     encoder_frame = enc_out[:, t:t+1]
-                    
-                    # Project encoder output if needed
                     if hasattr(model, "encoder_proj"):
                         encoder_frame = model.encoder_proj(encoder_frame)
-                    
-                    # Reshape for joiner
-                    encoder_frame = encoder_frame.unsqueeze(1)  # (N=1, T=1, encoder_dim)
-                    decoder_out = decoder_out.unsqueeze(1)  # (N=1, U=1, decoder_dim)
-                    
-                    # Get logits from joiner
-                    logits = model.joiner(encoder_frame, decoder_out)
+
+                    # Ensure decoder output has a time dimension (shape: (N, 1, decoder_dim))
+                    decoder_current = decoder_out.unsqueeze(1)
+
+                    # Now joiner inputs both have 3 dimensions
+                    logits = model.joiner(encoder_frame, decoder_current)
                     logits = logits.squeeze(1).squeeze(1)  # Remove T=1, U=1 dimensions
                     
                     # Get prediction

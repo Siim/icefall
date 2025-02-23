@@ -483,10 +483,11 @@ def get_params() -> AttributeDict:
             "left_context_chunks": 1,  # Paper's optimal setting
             
             # Decoding parameters
-            "temperature": 1.0,  # Temperature for softmax scaling
-            "min_active_states": 30,  # Minimum active FSA states
-            "max_active_states": 10000,  # Maximum active FSA states
+            "max_states": 64,  # Maximum active FSA states
+            "min_states": 16,  # Minimum active FSA states (max_states // 4)
             "beam": 20.0,  # Beam size for pruning
+            "max_contexts": 8,  # Maximum right contexts
+            "temperature": 1.0,  # Temperature for softmax scaling
             
             # Training parameters
             "streaming_regularization": 0.1,  # Weight for streaming regularization loss
@@ -901,7 +902,7 @@ def decode_with_beam_search(
             dense_fsa,
             search_beam=params.beam,
             output_beam=params.beam,
-            min_active_states=params.max_states // 4,
+            min_active_states=params.min_states,
             max_active_states=params.max_states
         )
 
@@ -929,13 +930,23 @@ def decode_with_beam_search(
 
     except Exception as e:
         logging.warning(f"FSA decoding failed: {e}, falling back to greedy decoding")
-        # Fallback to greedy search
-        hyps = greedy_search_batch(
-            model=None,  # Not needed for CTC-style decoding
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens
-        )
-        return [sp.decode(h.tolist()) for h in hyps]
+        # Simple greedy decoding fallback
+        hyps = []
+        # Get most likely token at each timestep
+        predictions = encoder_out.argmax(dim=-1)  # [batch, time]
+        
+        # Convert predictions to text for each sequence in batch
+        for i in range(batch_size):
+            # Get sequence up to its length
+            sequence = predictions[i, :encoder_out_lens[i]]
+            # Remove consecutive duplicates and zeros (CTC blank)
+            sequence = [t for t in sequence.tolist()]
+            sequence = [t for t, _ in itertools.groupby(sequence) if t != 0]
+            # Decode to text
+            hyp = sp.decode(sequence)
+            hyps.append(hyp)
+            
+        return hyps
 
 
 def compute_validation_loss(

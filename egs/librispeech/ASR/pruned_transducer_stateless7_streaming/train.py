@@ -803,9 +803,9 @@ def compute_loss(
         if not valid_lens_mask.any():
             # If no valid samples, create a dummy batch with 2-second audio
             logging.warning("No valid samples in batch, using dummy 2-second sample")
-            dummy_frames = int(32000 / frame_shift)  # 2 seconds
-            feature = torch.zeros((1, dummy_frames, feature.size(2)), device=device)
-            feature_lens = torch.tensor([dummy_frames], device=device)
+            dummy_samples = 32000  # 2 seconds at 16kHz
+            feature = torch.zeros((1, dummy_samples, 1), device=device)  # Raw audio shape
+            feature_lens = torch.tensor([dummy_samples], device=device)  # Use sample length
             texts = [""]
         else:
             # Keep only valid samples

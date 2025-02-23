@@ -923,7 +923,7 @@ def train_one_epoch(
         batch_size = len(batch["supervisions"]["text"])
 
         try:
-            with torch.cuda.amp.autocast(enabled=params.use_fp16):
+            with torch.amp.autocast('cuda', enabled=params.use_fp16):
                 loss, loss_info = compute_loss(
                     params=params,
                     model=model,

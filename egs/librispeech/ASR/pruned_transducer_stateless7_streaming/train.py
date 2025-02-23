@@ -84,7 +84,7 @@ from icefall.dist import cleanup_dist, setup_dist
 from icefall.env import get_env_info
 from icefall.err import raise_grad_scale_is_too_small_error
 from icefall.hooks import register_inf_check_hooks
-from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
+from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool, add_sos
 from torch import amp
 import editdistance
 import random

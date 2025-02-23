@@ -787,8 +787,8 @@ def compute_loss(
     feature_lens = supervisions["num_frames"].to(device)
 
     # Filter samples between 1 sec and 20 sec (at 16kHz)
-    # Convert frames to samples: multiply by frame_shift (160 samples at 16kHz)
-    min_samples = 16000  # 1 sec
+    # Also ensure minimum length is at least 400 samples for XLSR conv layers
+    min_samples = max(16000, 400)  # 1 sec or 400 samples, whichever is larger
     max_samples = 320000  # 20 sec
     frame_shift = 160  # 10ms at 16kHz
     
@@ -798,7 +798,7 @@ def compute_loss(
     if not valid_lens_mask.all():
         num_short = (sample_lens < min_samples).sum().item()
         num_long = (sample_lens > max_samples).sum().item()
-        logging.warning(f"Filtered out {num_short} samples < 1s and {num_long} samples > 20s")
+        logging.warning(f"Filtered out {num_short} samples < {min_samples/16000:.1f}s and {num_long} samples > 20s")
         
         if not valid_lens_mask.any():
             # If no valid samples, create a dummy batch with 2-second audio

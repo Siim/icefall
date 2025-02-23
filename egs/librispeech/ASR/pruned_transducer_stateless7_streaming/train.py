@@ -838,14 +838,33 @@ def compute_loss(
             if hasattr(model, 'encoder_proj'):
                 encoder_out = model.encoder_proj(encoder_out)
             
-            # Import greedy_search_batch if not already imported
-            from beam_search import greedy_search_batch
+            # Process each sample individually to avoid shape mismatches
+            hyp_tokens = []
+            blank_id = model.decoder.blank_id if hasattr(model.decoder, 'blank_id') else 0
+            batch_size = encoder_out.size(0)
             
-            hyp_tokens = greedy_search_batch(
-                model=model,
-                encoder_out=encoder_out,
-                encoder_out_lens=encoder_out_lens,
-            )
+            for i in range(batch_size):
+                cur_len = encoder_out_lens[i].item()
+                if cur_len <= 0:
+                    hyp_tokens.append([blank_id])
+                    continue
+                    
+                # Get encoder output for this sample
+                cur_encoder_out = encoder_out[i:i+1, :cur_len]  # Keep batch dim
+                cur_encoder_lens = torch.tensor([cur_len], device=device, dtype=torch.int32)
+                
+                # Use greedy search on single sample
+                from beam_search import greedy_search
+                try:
+                    cur_hyp = greedy_search(
+                        model=model,
+                        encoder_out=cur_encoder_out,
+                        max_sym_per_frame=1,
+                    )
+                    hyp_tokens.append(cur_hyp if len(cur_hyp) > 0 else [blank_id])
+                except Exception as e:
+                    logging.warning(f"Greedy search failed for sample {i}: {str(e)}")
+                    hyp_tokens.append([blank_id])
             
             # Decode token sequences to texts
             hyp_texts = [sp.decode(tokens) for tokens in hyp_tokens]

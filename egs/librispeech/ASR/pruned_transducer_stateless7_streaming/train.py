@@ -777,14 +777,9 @@ def compute_loss(
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
-) -> Tuple[Tensor, MetricsTracker, Dict]:
+) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute transducer loss given the model and batch.
-    Returns:
-        (loss, info, aux_info) where:
-        - loss is the loss tensor
-        - info is the MetricsTracker with numeric metrics
-        - aux_info is a dict with non-numeric info like hypothesis texts
     """
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
     feature = batch["inputs"]
@@ -922,16 +917,8 @@ def compute_loss(
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
     info["wer"] = wer
-    if not is_training:
-        info["hyp_texts"] = hyp_texts  # Add hypothesis texts to info
     
-    # Create auxiliary info dict
-    aux_info = {}
-    if not is_training:
-        aux_info["hyp_texts"] = hyp_texts
-        aux_info["ref_texts"] = texts
-
-    return loss, info, aux_info
+    return loss, info
 
 
 def compute_validation_loss(
@@ -940,15 +927,14 @@ def compute_validation_loss(
     sp: spm.SentencePieceProcessor,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
-) -> Tuple[MetricsTracker, Dict]:
+) -> MetricsTracker:
     """Run the validation process."""
     model.eval()
 
     tot_loss = MetricsTracker()
-    all_aux_info = {"hyp_texts": [], "ref_texts": []}
 
     for batch_idx, batch in enumerate(valid_dl):
-        loss, loss_info, aux_info = compute_loss(
+        loss, loss_info = compute_loss(
             params=params,
             model=model,
             sp=sp,
@@ -957,13 +943,6 @@ def compute_validation_loss(
         )
         assert loss.requires_grad is False
         tot_loss = tot_loss + loss_info
-        
-        # Collect auxiliary information
-        if aux_info:
-            for key in aux_info:
-                if key not in all_aux_info:
-                    all_aux_info[key] = []
-                all_aux_info[key].extend(aux_info[key])
 
     if world_size > 1:
         tot_loss.reduce(loss.device)
@@ -973,7 +952,7 @@ def compute_validation_loss(
         params.best_valid_epoch = params.cur_epoch
         params.best_valid_loss = loss_value
 
-    return tot_loss, all_aux_info
+    return tot_loss
 
 
 def train_one_epoch(
@@ -1001,7 +980,7 @@ def train_one_epoch(
 
         try:
             with torch.amp.autocast('cuda', enabled=params.use_fp16):
-                loss, loss_info, _ = compute_loss(
+                loss, loss_info = compute_loss(
                     params=params,
                     model=model,
                     sp=sp,
@@ -1076,25 +1055,22 @@ def train_one_epoch(
             if batch_idx % (params.log_interval * 5) == 0:
                 with torch.no_grad():
                     model.eval()
-                    valid_info, valid_aux = compute_validation_loss(
+                    valid_loss, valid_info = compute_loss(
                         params=params,
                         model=model,
                         sp=sp,
-                        valid_dl=valid_dl,
-                        world_size=world_size,
+                        batch=next(iter(valid_dl)),
+                        is_training=False,
                     )
                     model.train()
                     valid_wer = valid_info["wer"]
-                    
-                    # Log examples from validation batch
-                    texts = batch["supervisions"]["text"]
-                    for i in range(min(2, len(texts))):
-                        logging.info(f"\nExample {i+1}:")
-                        logging.info(f"REF: {texts[i]}")
-                        if "hyp_texts" in valid_aux:
-                            logging.info(f"HYP: {valid_aux['hyp_texts'][i]}")
             else:
                 valid_wer = None
+
+            # Log a few examples
+            for i in range(min(2, len(hyp_texts))):
+                logging.info(f"REF: {texts[i]}")
+                logging.info(f"HYP: {hyp_texts[i]}")
 
             logging.info(
                 f"Epoch {params.cur_epoch}, "
@@ -1127,7 +1103,7 @@ def train_one_epoch(
 
         if batch_idx % params.valid_interval == 0 and not params.print_diagnostics:
             logging.info("Computing validation loss")
-            valid_info, valid_aux = compute_validation_loss(
+            valid_info = compute_validation_loss(
                 params=params,
                 model=model,
                 sp=sp,
@@ -1401,7 +1377,7 @@ def scan_pessimistic_batches_for_oom(
         batch = train_dl.dataset[cuts]
         try:
             with torch.cuda.amp.autocast(enabled=params.use_fp16):
-                loss, _, _ = compute_loss(
+                loss, _ = compute_loss(
                     params=params,
                     model=model,
                     sp=sp,

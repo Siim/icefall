@@ -929,14 +929,15 @@ def compute_validation_loss(
     sp: spm.SentencePieceProcessor,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
-) -> MetricsTracker:
+) -> Tuple[MetricsTracker, Dict]:
     """Run the validation process."""
     model.eval()
 
     tot_loss = MetricsTracker()
+    all_aux_info = {"hyp_texts": [], "ref_texts": []}
 
     for batch_idx, batch in enumerate(valid_dl):
-        loss, loss_info = compute_loss(
+        loss, (loss_info, aux_info) = compute_loss(
             params=params,
             model=model,
             sp=sp,
@@ -945,6 +946,11 @@ def compute_validation_loss(
         )
         assert loss.requires_grad is False
         tot_loss = tot_loss + loss_info
+        
+        # Collect auxiliary information
+        if aux_info:
+            for key in aux_info:
+                all_aux_info[key].extend(aux_info[key])
 
     if world_size > 1:
         tot_loss.reduce(loss.device)
@@ -954,7 +960,7 @@ def compute_validation_loss(
         params.best_valid_epoch = params.cur_epoch
         params.best_valid_loss = loss_value
 
-    return tot_loss
+    return tot_loss, all_aux_info
 
 
 def train_one_epoch(
@@ -1057,12 +1063,12 @@ def train_one_epoch(
             if batch_idx % (params.log_interval * 5) == 0:
                 with torch.no_grad():
                     model.eval()
-                    valid_loss, valid_info = compute_loss(
+                    valid_info, valid_aux = compute_validation_loss(
                         params=params,
                         model=model,
                         sp=sp,
-                        batch=next(iter(valid_dl)),
-                        is_training=False,
+                        valid_dl=valid_dl,
+                        world_size=world_size,
                     )
                     model.train()
                     valid_wer = valid_info["wer"]
@@ -1072,8 +1078,8 @@ def train_one_epoch(
                     for i in range(min(2, len(texts))):
                         logging.info(f"\nExample {i+1}:")
                         logging.info(f"REF: {texts[i]}")
-                        if "hyp_texts" in valid_info:
-                            logging.info(f"HYP: {valid_info['hyp_texts'][i]}")
+                        if "hyp_texts" in valid_aux:
+                            logging.info(f"HYP: {valid_aux['hyp_texts'][i]}")
             else:
                 valid_wer = None
 
@@ -1108,7 +1114,7 @@ def train_one_epoch(
 
         if batch_idx % params.valid_interval == 0 and not params.print_diagnostics:
             logging.info("Computing validation loss")
-            valid_info = compute_validation_loss(
+            valid_info, valid_aux = compute_validation_loss(
                 params=params,
                 model=model,
                 sp=sp,

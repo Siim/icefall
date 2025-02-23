@@ -1067,6 +1067,11 @@ def train_one_epoch(
             else:
                 valid_wer = None
 
+            # Log a few examples
+            for i in range(min(2, len(hyp_texts))):
+                logging.info(f"REF: {texts[i]}")
+                logging.info(f"HYP: {hyp_texts[i]}")
+
             logging.info(
                 f"Epoch {params.cur_epoch}, "
                 f"batch {batch_idx}, loss[{loss_info}], "

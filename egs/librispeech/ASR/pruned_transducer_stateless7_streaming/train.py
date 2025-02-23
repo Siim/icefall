@@ -820,12 +820,37 @@ def compute_loss(
         # Calculate WER if not training
         if not is_training:
             with torch.no_grad():
-                encoder_out, _ = model.encoder(feature, feature_lens)
-                # For now, just track loss values instead of WER
-                # WER calculation requires careful handling of batch dimensions
-                wer = 0.0  # Placeholder for now
+                # Get encoder output with proper streaming settings
+                encoder_out, encoder_out_lens = model.encoder(
+                    x=feature,
+                    x_lens=feature_lens,
+                )
+                
+                # Use greedy search for quick WER calculation
+                hyps = greedy_search_batch(
+                    model=model,
+                    encoder_out=encoder_out,
+                    encoder_out_lens=encoder_out_lens,
+                )
+                
+                # Convert hypotheses to text
+                hyp_texts = [sp.decode(hyp.tolist()) for hyp in hyps]
+                
+                # Calculate WER
+                total_words = sum(len(text.split()) for text in texts)
+                total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
+                                 for hyp, ref in zip(hyp_texts, texts))
+                wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
+                
+                # Log some examples periodically
+                if batch_idx_train % 1000 == 0:
+                    logging.info("\nExample Predictions:")
+                    for i in range(min(2, len(texts))):  # Show first 2 examples
+                        logging.info(f"Reference: {texts[i]}")
+                        logging.info(f"Predicted: {hyp_texts[i]}")
+                        logging.info("-" * 50)
         else:
-            wer = 0.0  # Don't calculate WER during training to save time
+            wer = 0.0  # Don't calculate WER during training
 
     assert loss.requires_grad == is_training
 

@@ -1250,7 +1250,7 @@ def run(rank, world_size, args):
         from estonian_dataset import EstonianASRDataset, collate_fn
         logging.info("Using Estonian dataset")
         
-        train_dataset = EstonianASRDataset(params.train_txt, base_path=params.audio_base_path)
+        train_dataset = EstonianASRDataset(params.train_txt, base_path=params.audio_base_path, sp=sp)
         train_dl = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=params.batch_size,
@@ -1259,7 +1259,7 @@ def run(rank, world_size, args):
             num_workers=2,
         )
         
-        valid_dataset = EstonianASRDataset(params.val_txt, base_path=params.audio_base_path)
+        valid_dataset = EstonianASRDataset(params.val_txt, base_path=params.audio_base_path, sp=sp)
         valid_dl = torch.utils.data.DataLoader(
             valid_dataset,
             batch_size=params.batch_size,

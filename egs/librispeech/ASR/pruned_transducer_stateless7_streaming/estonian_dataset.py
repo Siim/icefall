@@ -5,15 +5,20 @@ from torch.utils.data import Dataset
 import logging
 
 class EstonianASRDataset(Dataset):
-    def __init__(self, txt_path: str, base_path: str = None, transform=None) -> None:
+    def __init__(self, txt_path: str, base_path: str = None, transform=None, sp=None) -> None:
         """
         Args:
             txt_path: Path to the text file containing wav paths and transcripts
             base_path: Base path to prepend to the audio file paths
             transform: Optional transform to apply to the audio
+            sp: SentencePiece processor for tokenization
         """
         self.samples = []  # list of tuples (wav_path, transcript)
         self.transform = transform
+        self.sp = sp  # Store SentencePiece processor
+        
+        if self.sp is None:
+            raise ValueError("SentencePiece processor (sp) must be provided")
         
         # Duration limits (in samples at 16kHz)
         self.min_samples = 16000  # 1 sec minimum
@@ -72,7 +77,17 @@ class EstonianASRDataset(Dataset):
                         self.logger.debug(f"File too long: {wav_path} ({expected_samples} samples)")
                         continue
                     
-                    self.samples.append((wav_path, transcript))
+                    # Tokenize the transcript
+                    try:
+                        tokens = self.sp.encode(transcript, out_type=int)
+                        if len(tokens) == 0:
+                            self.logger.warning(f"Empty tokens for transcript: {transcript}")
+                            continue
+                        self.samples.append((wav_path, transcript, tokens))
+                    except Exception as e:
+                        self.logger.warning(f"Failed to tokenize: {transcript} - {str(e)}")
+                        continue
+                        
                 except Exception as e:
                     self.logger.warning(f"Error checking file {wav_path}: {str(e)}")
                     continue
@@ -83,14 +98,14 @@ class EstonianASRDataset(Dataset):
         self.logger.info(f"Total acceptance rate: {len(self.samples)/total_files*100:.1f}%")
         self.logger.info(f"Using base path: {base_path if base_path else 'None'}")
         # Print first few samples for verification
-        for i, (wav_path, transcript) in enumerate(self.samples[:3]):
-            self.logger.info(f"Sample {i}: {wav_path} | {transcript[:50]}...")
+        for i, (wav_path, transcript, tokens) in enumerate(self.samples[:3]):
+            self.logger.info(f"Sample {i}: {wav_path} | {transcript[:50]}... | tokens: {tokens[:10]}...")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> dict:
-        wav_path, transcript = self.samples[idx]
+        wav_path, transcript, tokens = self.samples[idx]
         
         try:
             # Load audio
@@ -125,13 +140,18 @@ class EstonianASRDataset(Dataset):
             if len(transcript) / audio_duration < min_chars_per_second:
                 self.logger.warning(f"Suspicious sample {wav_path} - {len(transcript)} chars in {audio_duration:.1f}s")
             
+            # Convert tokens to tensor
+            tokens_tensor = torch.tensor(tokens, dtype=torch.int32)
+            
             # Return a dictionary with processed input values
             return {
                 'inputs': input_values.unsqueeze(0),  # Add channel dimension to make (1, time)
                 'supervisions': {
                     'num_frames': input_values.size(0),
                     'text': transcript,
-                    'audio_paths': wav_path
+                    'audio_paths': wav_path,
+                    'tokens': tokens_tensor,
+                    'token_lens': torch.tensor([len(tokens)], dtype=torch.int32)
                 }
             }
             
@@ -145,12 +165,17 @@ class EstonianASRDataset(Dataset):
 def collate_fn(batch: list) -> dict:
     # Collate function pads raw waveforms along the time dimension
     max_len = max(item['inputs'].size(1) for item in batch)
+    max_token_len = max(item['supervisions']['tokens'].size(0) for item in batch)
+    
     padded_waveforms = []
+    padded_tokens = []
     num_frames = []
+    token_lens = []
     texts = []
     audio_paths = []
     
     for item in batch:
+        # Handle waveform padding
         waveform = item['inputs']  # shape: (1, time)
         pad_len = max_len - waveform.size(1)
         if pad_len > 0:
@@ -158,20 +183,34 @@ def collate_fn(batch: list) -> dict:
             pad = torch.zeros(1, pad_len, dtype=waveform.dtype)
             waveform = torch.cat([waveform, pad], dim=1)
         padded_waveforms.append(waveform)
+        
+        # Handle token padding
+        tokens = item['supervisions']['tokens']
+        token_pad_len = max_token_len - tokens.size(0)
+        if token_pad_len > 0:
+            # Pad with zeros
+            token_pad = torch.zeros(token_pad_len, dtype=tokens.dtype)
+            tokens = torch.cat([tokens, token_pad])
+        padded_tokens.append(tokens)
+        
+        # Collect other supervision data
         num_frames.append(item['supervisions']['num_frames'])
+        token_lens.append(item['supervisions']['token_lens'])
         texts.append(item['supervisions']['text'])
         audio_paths.append(item['supervisions']['audio_paths'])
     
-    # Stack to get a tensor of shape (batch, time)
+    # Stack to get tensors
     inputs = torch.cat(padded_waveforms, dim=0)  # (batch, time)
-    
-    # Add channel dimension to make it (batch, time, channel)
     inputs = inputs.unsqueeze(-1)  # Add channel dimension at the end
+    tokens = torch.stack(padded_tokens)  # (batch, max_token_len)
+    token_lens = torch.cat(token_lens)  # (batch,)
     
     supervisions = {
         'num_frames': torch.tensor(num_frames, dtype=torch.int32),
         'text': texts,
-        'audio_paths': audio_paths
+        'audio_paths': audio_paths,
+        'tokens': tokens,
+        'token_lens': token_lens
     }
     
     return {'inputs': inputs, 'supervisions': supervisions} 

@@ -129,6 +129,8 @@ class XLSREncoder(EncoderInterface):
         self.context_cache = None
         self.last_chunk_output = None
         self.left_context_buffer = []  # Store left context chunks
+        self.past_context = None  # Add past context for streaming
+        self.is_streaming = False  # Track streaming state
 
     def prepare_chunk_with_context(self, chunk: torch.Tensor, left_context: torch.Tensor = None, right_context: torch.Tensor = None) -> torch.Tensor:
         """Prepare chunk with left and right context for better boundary handling"""
@@ -398,6 +400,8 @@ class XLSREncoder(EncoderInterface):
                     # Process in chunks
                     chunk_outputs = []
                     pos = 0
+                    self.past_context = None  # Reset past context for each sequence
+                    
                     while pos < seq_len:
                         # Get current chunk
                         chunk_size = min(self.decode_chunk_size, seq_len - pos)
@@ -419,7 +423,7 @@ class XLSREncoder(EncoderInterface):
                         # Add attention sink if enabled
                         if self.use_attention_sink:
                             chunk_output = torch.cat([
-                                self.attention_sink.unsqueeze(0).expand(1, -1, -1),
+                                self.attention_sink_cache.unsqueeze(0).expand(1, -1, -1) if self.attention_sink_cache is not None else chunk_output[:, :self.attention_sink_size],
                                 chunk_output
                             ], dim=1)
                         

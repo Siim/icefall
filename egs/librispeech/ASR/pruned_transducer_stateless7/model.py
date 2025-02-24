@@ -69,13 +69,18 @@ class Transducer(nn.Module):
         # Add projection layer for XLSR encoder if needed
         if isinstance(encoder, XLSREncoder):
             self.encoder_proj = nn.Linear(1024, encoder_dim)
+            # Initialize simple_am_proj with our vocab size
+            self.simple_am_proj = nn.Sequential(
+                nn.Linear(1024, encoder_dim),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(encoder_dim, vocab_size)
+            )
         else:
             self.encoder_proj = nn.Identity()
+            # For non-XLSR encoder, use direct projection
+            self.simple_am_proj = nn.Linear(encoder_dim, vocab_size)
 
-        self.simple_am_proj = nn.Linear(
-            encoder_dim,
-            vocab_size,
-        )
         self.simple_lm_proj = nn.Linear(decoder_dim, vocab_size)
 
     def forward(

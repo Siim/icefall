@@ -5,22 +5,20 @@ from torch.utils.data import Dataset
 import logging
 
 class EstonianASRDataset(Dataset):
-    def __init__(self, txt_path: str, base_path: str = None, transform=None, sp=None, processor=None) -> None:
+    def __init__(self, txt_path: str, base_path: str = None, transform=None, sp=None) -> None:
         """
         Args:
             txt_path: Path to the text file containing wav paths and transcripts
             base_path: Base path to prepend to the audio file paths
             transform: Optional transform to apply to the audio
-            sp: SentencePieceProcessor for tokenization
-            processor: Wav2Vec2Processor for audio processing
+            sp: SentencePiece processor for tokenization
         """
         self.samples = []  # list of tuples (wav_path, transcript)
         self.transform = transform
-        self.sp = sp  # Store SentencePieceProcessor
-        self.processor = processor  # Store Wav2Vec2Processor
+        self.sp = sp  # Store SentencePiece processor
         
         if self.sp is None:
-            raise ValueError("SentencePieceProcessor (sp) must be provided")
+            raise ValueError("SentencePiece processor (sp) must be provided")
         
         # Duration limits (in samples at 16kHz)
         self.min_samples = 16000  # 1 sec minimum
@@ -28,6 +26,10 @@ class EstonianASRDataset(Dataset):
         
         # Add logging
         self.logger = logging.getLogger(__name__)
+        
+        # Initialize processor
+        from transformers import Wav2Vec2Processor
+        self.processor = Wav2Vec2Processor.from_pretrained("TalTechNLP/xls-r-300m-et")
         
         # Ensure base_path ends with a slash if provided
         if base_path:
@@ -118,19 +120,12 @@ class EstonianASRDataset(Dataset):
             if waveform.size(0) > 1:
                 waveform = torch.mean(waveform, dim=0, keepdim=True)
             
-            # Process using XLSR processor if available, otherwise use basic normalization
-            if self.processor is not None:
-                input_values = self.processor(
-                    waveform.squeeze().numpy(),
-                    sampling_rate=16000,
-                    return_tensors="pt"
-                ).input_values.squeeze(0)  # Remove batch dimension from processor
-            else:
-                # Basic normalization if no processor
-                input_values = waveform.squeeze(0)
-                # Normalize to [-1, 1]
-                if input_values.abs().max() > 0:
-                    input_values = input_values / input_values.abs().max()
+            # Process using HuggingFace processor (same as xl_exp.py)
+            input_values = self.processor(
+                waveform.squeeze().numpy(),
+                sampling_rate=16000,
+                return_tensors="pt"
+            ).input_values.squeeze(0)  # Remove batch dimension from processor
             
             # Double check length constraints with some margin for resampling
             margin = 100  # Small safety margin
@@ -168,14 +163,6 @@ class EstonianASRDataset(Dataset):
 
 
 def collate_fn(batch: list) -> dict:
-    """Collate function for DataLoader that properly handles padding and shapes.
-    
-    Args:
-        batch: List of samples from EstonianASRDataset
-        
-    Returns:
-        Dictionary with batched data
-    """
     # Collate function pads raw waveforms along the time dimension
     max_len = max(item['inputs'].size(1) for item in batch)
     max_token_len = max(item['supervisions']['tokens'].size(0) for item in batch)
@@ -214,6 +201,7 @@ def collate_fn(batch: list) -> dict:
     
     # Stack to get tensors
     inputs = torch.cat(padded_waveforms, dim=0)  # (batch, time)
+    inputs = inputs.unsqueeze(-1)  # Add channel dimension at the end
     tokens = torch.stack(padded_tokens)  # (batch, max_token_len)
     token_lens = torch.cat(token_lens)  # (batch,)
     

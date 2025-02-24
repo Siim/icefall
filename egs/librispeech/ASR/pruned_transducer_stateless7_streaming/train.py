@@ -73,7 +73,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from zipformer import Zipformer
 from xlsr_encoder import XLSREncoder
-from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
 from icefall import diagnostics
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
@@ -249,6 +248,27 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         type=int,
         default=1,
         help="Number of left context chunks to use (paper's optimal setting).",
+    )
+
+    parser.add_argument(
+        "--pre-train-epochs",
+        type=int,
+        default=5,
+        help="Number of epochs to pre-train without streaming before introducing chunks",
+    )
+
+    parser.add_argument(
+        "--pre-train-lr",
+        type=float,
+        default=0.0001,
+        help="Learning rate during pre-training phase",
+    )
+
+    parser.add_argument(
+        "--streaming-start-epoch",
+        type=int,
+        default=6,
+        help="Epoch to start using streaming (after pre-training)",
     )
 
 
@@ -489,13 +509,6 @@ def get_parser():
         help="Weight for streaming regularization loss",
     )
 
-    parser.add_argument(
-        "--ctc-epochs",
-        type=int,
-        default=5,
-        help="Number of epochs for CTC pre-training",
-    )
-
     add_model_arguments(parser)
 
     return parser
@@ -557,9 +570,15 @@ def get_params() -> AttributeDict:
             "reset_interval": 200,
             "valid_interval": 3000,
             
+            # Pre-training parameters
+            "is_pre_training": True,  # Will be set to False after pre-training phase
+            "pre_train_epochs": 5,
+            "pre_train_lr": 0.0001,
+            "streaming_start_epoch": 6,
+            
             # XLSR specific parameters
             "use_xlsr": True,
-            "xlsr_model_name": "TalTechNLP/xls-r-300m-et",
+            "xlsr_model_name": "facebook/wav2vec2-xls-r-300m",
             "attention_sink_size": 16,  # Paper's optimal setting
             "decode_chunk_size": 5120,  # 320ms at 16kHz
             "left_context_chunks": 1,   # Paper's optimal setting
@@ -573,7 +592,6 @@ def get_params() -> AttributeDict:
             "subsampling_factor": 4,  # not passed in, this is fixed.
             "warm_step": 2000,
             "env_info": get_env_info(),
-            "ctc_epochs": 5,
         }
     )
 
@@ -582,48 +600,21 @@ def get_params() -> AttributeDict:
 
 def get_encoder_model(params: AttributeDict) -> nn.Module:
     if getattr(params, 'use_xlsr', False):
-        from xlsr_encoder import XLSREncoder
-        from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
-
-        # Initialize cur_epoch if not present
-        if not hasattr(params, 'cur_epoch'):
-            params.cur_epoch = 0
-
-        # Initialize ctc_epochs if not present
-        if not hasattr(params, 'ctc_epochs'):
-            params.ctc_epochs = 5  # Default to 5 epochs of CTC pre-training
-
-        # Load processor first
-        try:
-            processor = Wav2Vec2Processor.from_pretrained(params.xlsr_model_name)
-            logging.info(f"Successfully loaded XLSR processor")
-            params.wav2vec2_processor = processor
-        except Exception as e:
-            logging.warning(f"Could not load processor: {str(e)}")
-
-        # Load appropriate model based on training phase
-        if params.cur_epoch <= params.ctc_epochs:
-            # During CTC pre-training, use Wav2Vec2ForCTC
-            model = Wav2Vec2ForCTC.from_pretrained(params.xlsr_model_name)
-            logging.info(f"Using Wav2Vec2ForCTC for pre-training (epoch {params.cur_epoch}/{params.ctc_epochs})")
-        else:
-            # After pre-training, use base model
-            model = Wav2Vec2Model.from_pretrained(params.xlsr_model_name)
-            logging.info(f"Using base Wav2Vec2Model for transducer training")
-
-        # Create XLSR encoder with streaming capabilities
+        # Create XLSR encoder with streaming capabilities built-in
         encoder = XLSREncoder(
-            model=model,
-            decode_chunk_size=params.decode_chunk_len,
-            chunk_overlap=params.decode_chunk_len // 2,
+            model_name=params.xlsr_model_name,
+            decode_chunk_size=params.decode_chunk_size,  # 320ms at 16kHz
+            chunk_overlap=params.decode_chunk_size // 2,  # Half of chunk size
             use_attention_sink=True,
-            attention_sink_size=16,  # Paper's optimal setting
-            frame_duration=0.025,    # 25ms per frame
-            frame_stride=0.020,      # 20ms stride
-            min_chunk_size=2560,     # 160ms at 16kHz
-            max_chunk_size=20480,    # 1280ms at 16kHz
-            left_context_chunks=1     # Paper's optimal setting
+            attention_sink_size=params.attention_sink_size,  # 16 frames (paper's optimal)
+            frame_duration=params.frame_duration,  # 25ms per frame
+            frame_stride=params.frame_stride,    # 20ms stride
+            min_chunk_size=2560,   # 160ms at 16kHz (16 frames)
+            max_chunk_size=20480,  # 1280ms at 16kHz (128 frames)
+            left_context_chunks=params.left_context_chunks  # 1 chunk (paper's optimal)
         )
+        # Verify the encoder is properly initialized
+        assert isinstance(encoder, XLSREncoder), f"Expected XLSREncoder, got {type(encoder)}"
         return encoder
     else:
         # Original Zipformer code...
@@ -827,157 +818,127 @@ def compute_loss(
     feature = batch["inputs"]
     feature = feature.to(device)
     
-    # Fix input shape for XLSR - remove extra dimensions
-    if feature.ndim == 4:  # [batch, channel, time, extra_dim]
-        feature = feature.squeeze(-1)  # Remove last dimension
-    if feature.ndim == 3:  # [batch, channel, time]
-        feature = feature.squeeze(1)  # Remove channel dimension
-    assert feature.ndim == 2, f"Expected 2D input (batch, time), got shape {feature.shape}"
-    
     # Get supervisions
     supervisions = batch["supervisions"]
+    
+    # Get feature lengths from supervisions
     feature_lens = supervisions["num_frames"].to(device)
+    
+    # Get supervision segments
     texts = supervisions["text"]
     tokens = supervisions["tokens"].to(device)
     token_lens = supervisions["token_lens"].to(device)
     
-    # Calculate output lengths after XLSR's downsampling
-    xlsr_downsample = 320  # XLSR/wav2vec2 downsampling factor
-    output_lens = torch.div(feature_lens, xlsr_downsample, rounding_mode='floor')
-    output_lens = torch.maximum(output_lens, torch.ones_like(output_lens))  # Ensure at least 1 frame
+    # Create row splits from token lengths
+    row_splits = torch.zeros(token_lens.size(0) + 1, dtype=torch.int32, device=device)
+    row_splits[1:] = torch.cumsum(token_lens, dim=0)
     
-    # Compute with appropriate gradient context
-    with torch.set_grad_enabled(is_training):
-        # Use CTC loss for pre-training if in early epochs
-        if params.cur_epoch <= params.ctc_epochs:
-            # Get CTC outputs directly from Wav2Vec2ForCTC
-            if isinstance(model.encoder.model, Wav2Vec2ForCTC):
-                # Create attention mask for proper padding
-                attention_mask = torch.ones_like(feature, dtype=torch.long)
-                for i in range(attention_mask.size(0)):
-                    attention_mask[i, feature_lens[i]:] = 0
-                
-                # Forward through CTC model to get logits
-                outputs = model.encoder.model(
-                    feature,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True
-                )
-                
-                # Get logits and project to our vocabulary size if needed
-                logits = outputs.logits  # [batch, time, wav2vec2_vocab_size]
-                
-                # Project to our vocabulary size using the model's projection layer
-                if isinstance(model, DDP):
-                    logits = model.module.simple_am_proj(outputs.hidden_states[-1])
-                else:
-                    logits = model.simple_am_proj(outputs.hidden_states[-1])
-                
-                # Ensure output lengths don't exceed logits length
-                max_logit_len = logits.size(1)
-                output_lens = torch.minimum(output_lens, torch.tensor(max_logit_len, device=output_lens.device))
-                
-                if is_training:
-                    # During training, compute CTC loss
-                    log_probs = torch.log_softmax(logits, dim=-1)
-                    ctc_loss = torch.nn.functional.ctc_loss(
-                        log_probs.transpose(0, 1),  # (T, B, V)
-                        tokens,
-                        output_lens,
-                        token_lens,
-                        blank=params.blank_id,
-                        reduction='sum',
-                        zero_infinity=True
-                    )
-                    simple_loss = ctc_loss
-                    pruned_loss = ctc_loss
-                    wer = 0.0  # Don't compute WER during training
-                else:
-                    # During validation, compute WER
-                    with torch.no_grad():
-                        # Get predictions
-                        predictions = torch.argmax(logits, dim=-1)
-                        
-                        # Convert predictions to text for WER calculation
-                        hyp_texts = []
-                        for i, length in enumerate(output_lens):
-                            # Get sequence without padding
-                            pred = predictions[i, :length].tolist()
-                            
-                            # CTC decoding - remove repeated and blanks
-                            decoded = []
-                            prev = -1
-                            for token in pred:
-                                if token != params.blank_id and token != prev:
-                                    decoded.append(token)
-                                prev = token
-                            
-                            # Convert to text
-                            text = sp.decode(decoded)
-                            hyp_texts.append(text)
-                        
-                        # Calculate WER
-                        total_words = sum(len(ref.split()) for ref in texts)
-                        total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
-                                        for hyp, ref in zip(hyp_texts, texts))
-                        wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
-                        
-                        # Compute loss for validation metrics
-                        log_probs = torch.log_softmax(logits, dim=-1)
-                        ctc_loss = torch.nn.functional.ctc_loss(
-                            log_probs.transpose(0, 1),  # (T, B, V)
-                            tokens,
-                            output_lens,
-                            token_lens,
-                            blank=params.blank_id,
-                            reduction='sum',
-                            zero_infinity=True
-                        )
-                        simple_loss = ctc_loss
-                        pruned_loss = ctc_loss
-            else:
-                raise ValueError("Encoder model must be Wav2Vec2ForCTC during pre-training epochs")
-        else:
-            # Use transducer loss after pre-training
-            encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
-            
+    # Create RaggedShape using create_ragged_shape2
+    shape = k2.ragged.create_ragged_shape2(
+        row_splits=row_splits,
+        cached_tot_size=row_splits[-1].item()
+    )
+    
+    # Get total number of elements (using axis=1 for flattened size)
+    total_elements = shape.tot_size(1)  # Get total size along token dimension
+    
+    # Ensure values tensor matches shape's elements
+    values = tokens.flatten()[:total_elements].to(dtype=torch.int32)
+    
+    # Create RaggedTensor with proper shape and values
+    ragged_y = k2.RaggedTensor(shape=shape, value=values)
+    
+    # Calculate loss with proper gradient context
+    if not is_training:
+        with torch.no_grad():
+            # Get encoder output for decoding
             if isinstance(model, DDP):
+                encoder_out, encoder_out_lens = model.module.encoder(
+                    feature, 
+                    feature_lens,
+                    is_pre_training=params.is_pre_training
+                )
                 encoder_out = model.module.encoder_proj(encoder_out)
             else:
+                encoder_out, encoder_out_lens = model.encoder(
+                    feature, 
+                    feature_lens,
+                    is_pre_training=params.is_pre_training
+                )
                 encoder_out = model.encoder_proj(encoder_out)
-                
+            
+            # Use greedy search batch for decoding
+            hyp_tokens = greedy_search_batch(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+            )
+            
+            # Convert predictions to text
+            hyp_texts = []
+            for tokens in hyp_tokens:
+                if isinstance(tokens, torch.Tensor):
+                    tokens = tokens.tolist()
+                elif not isinstance(tokens, list):
+                    tokens = list(tokens)
+                text = sp.decode(tokens)
+                hyp_texts.append(text)
+            
+            # Compute WER
+            total_words = sum(len(ref.split()) for ref in texts)
+            total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
+                             for hyp, ref in zip(hyp_texts, texts))
+            wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
+            
+            # Compute loss
             simple_loss, pruned_loss = model(
                 x=feature,
                 x_lens=feature_lens,
-                y=k2.RaggedTensor(tokens),
+                y=ragged_y,
                 prune_range=params.prune_range,
                 am_scale=params.am_scale,
                 lm_scale=params.lm_scale,
             )
-            wer = 0.0  # Don't compute WER during training
-        
-        # Scale losses
-        s = params.simple_loss_scale
-        simple_loss_scale = (
+    else:
+        # During training, pass pre-training flag to model
+        if isinstance(model, DDP):
+            model.module.encoder.is_pre_training = params.is_pre_training
+        else:
+            model.encoder.is_pre_training = params.is_pre_training
+            
+        simple_loss, pruned_loss = model(
+            x=feature,
+            x_lens=feature_lens,
+            y=ragged_y,
+            prune_range=params.prune_range,
+            am_scale=params.am_scale,
+            lm_scale=params.lm_scale,
+        )
+        wer = 0.0  # Do not compute WER during training
+    
+    s = params.simple_loss_scale
+    simple_loss_scale = (
+        s
+        if "warm_step" not in params
+        else (
             s
-            if "warm_step" not in params
-            else (
-                s
-                if params.batch_idx_train > params.warm_step
-                else float(params.batch_idx_train) / params.warm_step * s
-            )
+            if params.batch_idx_train > params.warm_step
+            else float(params.batch_idx_train) / params.warm_step * s
         )
-        pruned_loss_scale = (
+    )
+    pruned_loss_scale = (
+        1.0
+        if "warm_step" not in params
+        else (
             1.0
-            if "warm_step" not in params
-            else (
-                1.0
-                if params.batch_idx_train > params.warm_step
-                else float(params.batch_idx_train) / params.warm_step
-            )
+            if params.batch_idx_train > params.warm_step
+            else float(params.batch_idx_train) / params.warm_step
         )
-        
-        loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
+    )
+    
+    loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
+    
+    assert loss.requires_grad == is_training
     
     info = MetricsTracker()
     with warnings.catch_warnings():
@@ -998,7 +959,17 @@ def decode_one_batch_hyps(
     sp: spm.SentencePieceProcessor,
     batch: dict,
 ) -> Tuple[List[str], List[str]]:
-    """Get hypotheses and predictions for one batch."""
+    """Get hypotheses and predictions for one batch.
+    
+    Args:
+        params: Model parameters
+        model: The model to use for decoding
+        sp: SentencePieceProcessor for converting ids to text
+        batch: A batch of data
+        
+    Returns:
+        (hyps, preds): Lists of ground truth and predicted texts
+    """
     device = next(model.parameters()).device
     feature = batch["inputs"].to(device)
     supervisions = batch["supervisions"]
@@ -1011,79 +982,25 @@ def decode_one_batch_hyps(
         feature_lens_pad = feature_lens + right_context
         feature_pad = torch.nn.functional.pad(
             feature,
-            pad=(0, right_context),  # Only pad the time dimension
+            pad=(0, 0, 0, right_context),
             value=LOG_EPS,
         )
         
-        # Create attention mask for proper padding
-        attention_mask = torch.ones(feature_pad.shape[:2], dtype=torch.long, device=device)  # [batch, time]
-        for i in range(attention_mask.shape[0]):  # Iterate over batch dimension
-            if i < feature_lens_pad.shape[0]:  # Check if index is valid
-                attention_mask[i, feature_lens_pad[i]:] = 0
-        
         # Get encoder output
-        if isinstance(model.encoder.model, Wav2Vec2ForCTC):
-            # For CTC pre-training, use the CTC model's forward pass
-            outputs = model.encoder.model(
-                feature_pad,
-                attention_mask=attention_mask,
-                output_hidden_states=True
-            )
-            encoder_out = outputs.hidden_states[-1]
-            encoder_out_lens = torch.div(feature_lens_pad, 320, rounding_mode='floor')  # XLSR downsample factor
-            encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
-            
-            # Project to vocab size
-            if isinstance(model, DDP):
-                logits = model.module.simple_am_proj(encoder_out)  # [B, T, V]
-            else:
-                logits = model.simple_am_proj(encoder_out)  # [B, T, V]
-            
-            # Get CTC predictions
-            log_probs = torch.log_softmax(logits, dim=-1)
-            
-            # Decode each sequence in batch
-            hyp_tokens = []
-            for b in range(log_probs.size(0)):
-                # Get sequence without padding
-                sequence_log_probs = log_probs[b, :encoder_out_lens[b]]  # [T, V]
-                
-                # Get best path
-                best_path = torch.argmax(sequence_log_probs, dim=-1)  # [T]
-                
-                # CTC decoding - collapse repeated tokens and remove blanks
-                decoded = []
-                prev = -1
-                for token in best_path:
-                    token = token.item()
-                    if token != params.blank_id and token != prev:
-                        decoded.append(token)
-                    prev = token
-                
-                hyp_tokens.append(decoded)
-                
-                # Debug logging
-                if b == 0:  # Log first sequence in batch
-                    logging.debug(f"Sequence {b} length: {encoder_out_lens[b]}")
-                    logging.debug(f"Raw best path: {best_path[:10].tolist()}")  # First 10 tokens
-                    logging.debug(f"Decoded tokens: {decoded[:10]}")  # First 10 decoded tokens
-                    
+        encoder_out, encoder_out_lens = model.encoder(feature_pad, feature_lens_pad)
+        
+        # Project encoder output
+        if isinstance(model, DDP):
+            encoder_out = model.module.encoder_proj(encoder_out)
         else:
-            # Regular encoder forward pass
-            encoder_out, encoder_out_lens = model.encoder(feature_pad, feature_lens_pad)
-            
-            # Project encoder output
-            if isinstance(model, DDP):
-                encoder_out = model.module.encoder_proj(encoder_out)
-            else:
-                encoder_out = model.encoder_proj(encoder_out)
-            
-            # Use transducer decoding
-            hyp_tokens = greedy_search_batch(
-                model=model,
-                encoder_out=encoder_out,
-                encoder_out_lens=encoder_out_lens,
-            )
+            encoder_out = model.encoder_proj(encoder_out)
+        
+        # Use greedy search batch for decoding
+        hyp_tokens = greedy_search_batch(
+            model=model,
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens,
+        )
     
     # Convert token IDs to text
     hyps = []
@@ -1103,32 +1020,13 @@ def decode_one_batch_hyps(
             pred_tokens = pred_tokens.tolist()
         elif not isinstance(pred_tokens, list):
             pred_tokens = list(pred_tokens)
-        
-        # Debug logging for first sequence
-        if i == 0:
-            logging.debug(f"Prediction tokens before filtering: {pred_tokens[:10]}")
             
         # Remove any padding or special tokens
-        filtered_tokens = []
-        for token in pred_tokens:
-            if token != params.blank_id:
-                filtered_tokens.append(token)
-        
-        # Debug logging for first sequence
-        if i == 0:
-            logging.debug(f"Prediction tokens after filtering: {filtered_tokens[:10]}")
+        while pred_tokens and pred_tokens[-1] == params.blank_id:
+            pred_tokens.pop()
             
         # Convert to text
-        try:
-            pred = sp.decode(filtered_tokens)
-        except Exception as e:
-            logging.warning(f"Failed to decode tokens {filtered_tokens}: {str(e)}")
-            pred = ""
-        
-        # Debug logging for first sequence
-        if i == 0:
-            logging.debug(f"Decoded prediction: {pred}")
-            
+        pred = sp.decode(pred_tokens)
         preds.append(pred)
     
     return hyps, preds
@@ -1199,6 +1097,22 @@ def train_one_epoch(
     """Train the model for one epoch."""
     model.train()
 
+    # Set learning rate based on training phase
+    if params.is_pre_training:
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = params.pre_train_lr
+        logging.info(f"Pre-training phase (Epoch {params.cur_epoch}), lr={params.pre_train_lr}")
+    
+    # Check if we should switch from pre-training to streaming
+    if params.cur_epoch >= params.streaming_start_epoch and params.is_pre_training:
+        params.is_pre_training = False
+        logging.info("Switching from pre-training to streaming phase")
+        # Reset best metrics for streaming phase
+        params.best_train_loss = float("inf")
+        params.best_valid_loss = float("inf")
+        params.best_train_epoch = -1
+        params.best_valid_epoch = -1
+
     tot_loss = MetricsTracker()
 
     for batch_idx, batch in enumerate(train_dl):
@@ -1219,7 +1133,10 @@ def train_one_epoch(
 
             scaler.scale(loss).backward()
             set_batch_count(model, params.batch_idx_train)
-            scheduler.step_batch(params.batch_idx_train)
+            
+            # Use different scheduler behavior during pre-training
+            if not params.is_pre_training:
+                scheduler.step_batch(params.batch_idx_train)
 
             scaler.step(optimizer)
             scaler.update()
@@ -1332,11 +1249,6 @@ def run(rank, world_size, args):
     """
     params = get_params()
     params.update(vars(args))
-    
-    # Initialize training parameters
-    params.cur_epoch = max(1, params.start_epoch)  # Start from epoch 1 or start_epoch
-    params.batch_idx_train = 0
-    
     if params.full_libri is False:
         params.valid_interval = 1600
 
@@ -1426,17 +1338,7 @@ def run(rank, world_size, args):
         from estonian_dataset import EstonianASRDataset, collate_fn
         logging.info("Using Estonian dataset")
         
-        # Get processor from params (set during encoder initialization)
-        processor = getattr(params, 'wav2vec2_processor', None)
-        if processor is None:
-            logging.warning("No XLSR processor found, will use basic audio normalization")
-        
-        train_dataset = EstonianASRDataset(
-            params.train_txt, 
-            base_path=params.audio_base_path, 
-            sp=sp,
-            processor=processor
-        )
+        train_dataset = EstonianASRDataset(params.train_txt, base_path=params.audio_base_path, sp=sp)
         train_dl = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=params.batch_size,
@@ -1445,12 +1347,7 @@ def run(rank, world_size, args):
             num_workers=2,
         )
         
-        valid_dataset = EstonianASRDataset(
-            params.val_txt, 
-            base_path=params.audio_base_path, 
-            sp=sp,
-            processor=processor
-        )
+        valid_dataset = EstonianASRDataset(params.val_txt, base_path=params.audio_base_path, sp=sp)
         valid_dl = torch.utils.data.DataLoader(
             valid_dataset,
             batch_size=params.batch_size,

@@ -51,7 +51,7 @@ import editdistance
 import math
 from pathlib import Path
 from shutil import copyfile
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union, List
 
 import k2
 import optim
@@ -750,6 +750,12 @@ def save_checkpoint(
     if rank != 0:
         return
     filename = params.exp_dir / f"epoch-{params.cur_epoch}.pt"
+    
+    # Handle sampler state dict
+    sampler_state = None
+    if sampler is not None and hasattr(sampler, 'state_dict'):
+        sampler_state = sampler.state_dict()
+    
     save_checkpoint_impl(
         filename=filename,
         model=model,
@@ -757,7 +763,7 @@ def save_checkpoint(
         params=params,
         optimizer=optimizer,
         scheduler=scheduler,
-        sampler=sampler,
+        sampler=sampler_state,  # Pass the state instead of the sampler
         scaler=scaler,
         rank=rank,
     )
@@ -921,6 +927,59 @@ def compute_loss(
     return loss, info
 
 
+def decode_one_batch_hyps(
+    params: AttributeDict,
+    model: Union[nn.Module, DDP],
+    sp: spm.SentencePieceProcessor,
+    batch: dict,
+) -> Tuple[List[str], List[str]]:
+    """Decode one batch and return hypotheses and predictions.
+    
+    Args:
+        params: Model params
+        model: The model to use for decoding
+        sp: Sentence piece model
+        batch: A batch of data
+    Returns:
+        (hyps, preds): Lists of hypothesis and prediction strings
+    """
+    device = model.device if isinstance(model, nn.Module) else model.module.device
+    feature = batch["inputs"].to(device)
+    supervisions = batch["supervisions"]
+    feature_lens = supervisions["num_frames"].to(device)
+    
+    # Get encoder outputs
+    with torch.no_grad():
+        encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
+        if hasattr(model, 'encoder_proj'):
+            encoder_out = model.encoder_proj(encoder_out)
+        
+        # Get predictions using greedy search
+        hyp_tokens = greedy_search_batch(
+            model=model,
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens,
+        )
+    
+    # Convert token IDs to text
+    hyps = []
+    preds = []
+    
+    # Get ground truth (hypothesis)
+    for i in range(feature.size(0)):
+        tokens = supervisions["tokens"][i]
+        tokens = tokens[:supervisions["token_lens"][i]]
+        hyp = sp.decode(tokens.tolist())
+        hyps.append(hyp)
+    
+    # Get predictions
+    for tokens in hyp_tokens:
+        pred = sp.decode(tokens.tolist())
+        preds.append(pred)
+    
+    return hyps, preds
+
+
 def compute_validation_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
@@ -944,13 +1003,27 @@ def compute_validation_loss(
         assert loss.requires_grad is False
         tot_loss = tot_loss + loss_info
 
+        if batch_idx % 100 == 0:
+            logging.info(f"batch {batch_idx}, validation loss: {loss_info}")
+            
+            # Decode a few examples for comparison
+            hyps, preds = decode_one_batch_hyps(params, model, sp, batch)
+            num_to_print = min(3, len(hyps))  # Print first 3 examples
+            
+            logging.info("\nExample comparisons:")
+            logging.info("-" * 80)
+            for i in range(num_to_print):
+                logging.info(f"HYP[{i}]: {hyps[i]}")
+                logging.info(f"PRD[{i}]: {preds[i]}")
+                logging.info("-" * 80)
+
     if world_size > 1:
         tot_loss.reduce(loss.device)
 
     loss_value = tot_loss["loss"] / tot_loss["frames"]
     if loss_value < params.best_valid_loss:
-        params.best_valid_epoch = params.cur_epoch
         params.best_valid_loss = loss_value
+        params.best_valid_epoch = params.cur_epoch
 
     return tot_loss
 
@@ -1027,7 +1100,7 @@ def train_one_epoch(
                 params=params,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                sampler=train_dl.sampler,
+                sampler=train_dl.sampler if params.dataset == "librispeech" else None,
                 scaler=scaler,
                 rank=rank,
             )
@@ -1049,52 +1122,24 @@ def train_one_epoch(
 
         if batch_idx % params.log_interval == 0:
             cur_lr = scheduler.get_last_lr()[0]
-            cur_grad_scale = scaler._scale.item() if params.use_fp16 else 1.0
-
-            # Calculate validation WER periodically
-            if batch_idx % (params.log_interval * 5) == 0:
-                with torch.no_grad():
-                    model.eval()
-                    valid_loss, valid_info = compute_loss(
-                        params=params,
-                        model=model,
-                        sp=sp,
-                        batch=next(iter(valid_dl)),
-                        is_training=False,
-                    )
-                    model.train()
-                    valid_wer = valid_info["wer"]
-            else:
-                valid_wer = None
-
             logging.info(
-                f"Epoch {params.cur_epoch}, "
-                f"batch {batch_idx}, loss[{loss_info}], "
+                f"Epoch {params.cur_epoch}, batch {batch_idx}, loss[{loss_info}], "
                 f"tot_loss[{tot_loss}], batch size: {batch_size}, "
                 f"lr: {cur_lr:.2e}, "
-                + (f"grad_scale: {scaler._scale.item()}, " if params.use_fp16 else "")
-                + (f"valid_wer: {valid_wer:.1f}%" if valid_wer is not None else "")
+                f"grad_scale: {scaler.get_scale():.1f}"
             )
 
             if tb_writer is not None:
                 tb_writer.add_scalar(
                     "train/learning_rate", cur_lr, params.batch_idx_train
                 )
-                if valid_wer is not None:
-                    tb_writer.add_scalar(
-                        "train/valid_wer", valid_wer, params.batch_idx_train
-                    )
 
-                loss_info.write_summary(
-                    tb_writer, "train/current_", params.batch_idx_train
-                )
-                tot_loss.write_summary(tb_writer, "train/tot_", params.batch_idx_train)
-                if params.use_fp16:
-                    tb_writer.add_scalar(
-                        "train/grad_scale",
-                        cur_grad_scale,
-                        params.batch_idx_train,
-                    )
+                loss_info = MetricsTracker()
+                loss_info["loss"] = loss.detach().item()
+                loss_info["simple_loss"] = simple_loss.detach().item()
+                loss_info["pruned_loss"] = pruned_loss.detach().item()
+                for k, v in loss_info.items():
+                    tb_writer.add_scalar(f"train/{k}", v, params.batch_idx_train)
 
         if batch_idx % params.valid_interval == 0 and not params.print_diagnostics:
             logging.info("Computing validation loss")

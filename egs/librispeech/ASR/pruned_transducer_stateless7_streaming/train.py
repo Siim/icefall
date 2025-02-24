@@ -933,20 +933,28 @@ def decode_one_batch_hyps(
     sp: spm.SentencePieceProcessor,
     batch: dict,
 ) -> Tuple[List[str], List[str]]:
-    """Decode one batch and return hypotheses and predictions."""
-    if isinstance(model, DDP):
-        device = model.module.encoder.model.device
-    else:
-        device = next(model.parameters()).device
+    """Get hypotheses and predictions for one batch.
     
+    Args:
+        params: Model parameters
+        model: The model to use for decoding
+        sp: SentencePieceProcessor for converting ids to text
+        batch: A batch of data
+        
+    Returns:
+        (hyps, preds): Lists of ground truth and predicted texts
+    """
+    device = next(model.parameters()).device
     feature = batch["inputs"].to(device)
     supervisions = batch["supervisions"]
     feature_lens = supervisions["num_frames"].to(device)
     
-    # Get encoder outputs
+    # Get encoder output
     with torch.no_grad():
         encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
-        if hasattr(model, 'encoder_proj'):
+        if isinstance(model, DDP):
+            encoder_out = model.module.encoder_proj(encoder_out)
+        else:
             encoder_out = model.encoder_proj(encoder_out)
         
         # Get predictions using greedy search
@@ -960,16 +968,21 @@ def decode_one_batch_hyps(
     hyps = []
     preds = []
     
-    # Get ground truth (hypothesis)
-    for i in range(feature.size(0)):
-        tokens = supervisions["tokens"][i]
-        tokens = tokens[:supervisions["token_lens"][i]]
-        hyp = sp.decode(tokens.tolist())
-        hyps.append(hyp)
+    # Get ground truth
+    texts = supervisions["text"]
     
-    # Get predictions
-    for tokens in hyp_tokens:
-        pred = sp.decode(tokens.tolist())
+    # Process each item in the batch
+    for i in range(len(texts)):
+        # Ground truth
+        hyps.append(texts[i])
+        
+        # Prediction - handle both tensor and list outputs
+        pred_tokens = hyp_tokens[i]
+        if isinstance(pred_tokens, torch.Tensor):
+            pred_tokens = pred_tokens.tolist()
+        elif not isinstance(pred_tokens, list):
+            pred_tokens = list(pred_tokens)
+        pred = sp.decode(pred_tokens)
         preds.append(pred)
     
     return hyps, preds

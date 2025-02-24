@@ -1011,14 +1011,15 @@ def decode_one_batch_hyps(
         feature_lens_pad = feature_lens + right_context
         feature_pad = torch.nn.functional.pad(
             feature,
-            pad=(0, 0, 0, right_context),
+            pad=(0, right_context),  # Only pad the time dimension
             value=LOG_EPS,
         )
         
         # Create attention mask for proper padding
-        attention_mask = torch.ones_like(feature_pad, dtype=torch.long)
-        for i in range(feature_pad.size(0)):  # Iterate over batch dimension
-            attention_mask[i, feature_lens_pad[i]:] = 0
+        attention_mask = torch.ones(feature_pad.shape[:2], dtype=torch.long, device=device)  # [batch, time]
+        for i in range(attention_mask.shape[0]):  # Iterate over batch dimension
+            if i < feature_lens_pad.shape[0]:  # Check if index is valid
+                attention_mask[i, feature_lens_pad[i]:] = 0
         
         # Get encoder output
         if isinstance(model.encoder.model, Wav2Vec2ForCTC):

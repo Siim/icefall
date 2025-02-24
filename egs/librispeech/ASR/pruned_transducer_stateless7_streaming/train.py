@@ -810,48 +810,49 @@ def compute_loss(
     tokens = supervisions["tokens"].to(device)
     token_lens = supervisions["token_lens"].to(device)
     
-    # Get encoder output
-    encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
-    
-    # Use CTC loss for pre-training if in early epochs
-    if params.cur_epoch <= params.ctc_epochs:
-        # Project encoder output to vocab size
-        if isinstance(model, DDP):
-            encoder_out = model.module.encoder_proj(encoder_out)
-        else:
-            encoder_out = model.encoder_proj(encoder_out)
-        logits = model.simple_am_proj(encoder_out)  # [B, T, V]
+    # Compute with appropriate gradient context
+    with torch.set_grad_enabled(is_training):
+        # Get encoder output
+        encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
         
-        # Ensure lengths are valid for CTC loss
-        encoder_out_lens = torch.clamp(encoder_out_lens, max=logits.size(1))
-        
-        # Compute CTC loss with proper log softmax
-        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-        
-        # Ensure proper tensor shapes for CTC loss
-        log_probs = log_probs.transpose(0, 1)  # (T, B, V)
-        targets = tokens
-        input_lengths = encoder_out_lens
-        target_lengths = token_lens
-        
-        # Compute CTC loss with proper blank handling
-        ctc_loss = torch.nn.functional.ctc_loss(
-            log_probs,
-            targets,
-            input_lengths,
-            target_lengths,
-            blank=params.blank_id,
-            reduction='sum',
-            zero_infinity=True
-        )
-        
-        # Use only CTC loss during pre-training
-        simple_loss = ctc_loss
-        pruned_loss = ctc_loss
-        
-        # Get CTC predictions for WER calculation
-        if not is_training:
-            with torch.no_grad():
+        # Use CTC loss for pre-training if in early epochs
+        if params.cur_epoch <= params.ctc_epochs:
+            # Project encoder output to vocab size
+            if isinstance(model, DDP):
+                encoder_out = model.module.encoder_proj(encoder_out)
+            else:
+                encoder_out = model.encoder_proj(encoder_out)
+            logits = model.simple_am_proj(encoder_out)  # [B, T, V]
+            
+            # Ensure lengths are valid for CTC loss
+            encoder_out_lens = torch.clamp(encoder_out_lens, max=logits.size(1))
+            
+            # Compute CTC loss with proper log softmax
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+            
+            # Ensure proper tensor shapes for CTC loss
+            log_probs = log_probs.transpose(0, 1)  # (T, B, V)
+            targets = tokens
+            input_lengths = encoder_out_lens
+            target_lengths = token_lens
+            
+            # Compute CTC loss with proper blank handling
+            ctc_loss = torch.nn.functional.ctc_loss(
+                log_probs,
+                targets,
+                input_lengths,
+                target_lengths,
+                blank=params.blank_id,
+                reduction='sum',
+                zero_infinity=True
+            )
+            
+            # Use only CTC loss during pre-training
+            simple_loss = ctc_loss
+            pruned_loss = ctc_loss
+            
+            # Get CTC predictions for WER calculation
+            if not is_training:
                 # Get best path
                 pred_tokens = log_probs.argmax(dim=-1)  # [T, B]
                 pred_tokens = pred_tokens.transpose(0, 1)  # [B, T]
@@ -879,49 +880,47 @@ def compute_loss(
                 total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
                                 for hyp, ref in zip(hyp_texts, texts))
                 wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
+            else:
+                wer = 0.0  # Don't compute WER during training
         else:
+            # Use transducer loss after pre-training
+            if isinstance(model, DDP):
+                encoder_out = model.module.encoder_proj(encoder_out)
+            else:
+                encoder_out = model.encoder_proj(encoder_out)
+                
+            simple_loss, pruned_loss = model(
+                x=feature,
+                x_lens=feature_lens,
+                y=k2.RaggedTensor(tokens),
+                prune_range=params.prune_range,
+                am_scale=params.am_scale,
+                lm_scale=params.lm_scale,
+            )
             wer = 0.0  # Don't compute WER during training
-    else:
-        # Use transducer loss after pre-training
-        if isinstance(model, DDP):
-            encoder_out = model.module.encoder_proj(encoder_out)
-        else:
-            encoder_out = model.encoder_proj(encoder_out)
-            
-        simple_loss, pruned_loss = model(
-            x=feature,
-            x_lens=feature_lens,
-            y=k2.RaggedTensor(tokens),
-            prune_range=params.prune_range,
-            am_scale=params.am_scale,
-            lm_scale=params.lm_scale,
-        )
-        wer = 0.0  # Don't compute WER during training
-    
-    # Scale losses
-    s = params.simple_loss_scale
-    simple_loss_scale = (
-        s
-        if "warm_step" not in params
-        else (
+        
+        # Scale losses
+        s = params.simple_loss_scale
+        simple_loss_scale = (
             s
-            if params.batch_idx_train > params.warm_step
-            else float(params.batch_idx_train) / params.warm_step * s
+            if "warm_step" not in params
+            else (
+                s
+                if params.batch_idx_train > params.warm_step
+                else float(params.batch_idx_train) / params.warm_step * s
+            )
         )
-    )
-    pruned_loss_scale = (
-        1.0
-        if "warm_step" not in params
-        else (
+        pruned_loss_scale = (
             1.0
-            if params.batch_idx_train > params.warm_step
-            else float(params.batch_idx_train) / params.warm_step
+            if "warm_step" not in params
+            else (
+                1.0
+                if params.batch_idx_train > params.warm_step
+                else float(params.batch_idx_train) / params.warm_step
+            )
         )
-    )
-    
-    loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
-    
-    assert loss.requires_grad == is_training
+        
+        loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
     
     info = MetricsTracker()
     with warnings.catch_warnings():

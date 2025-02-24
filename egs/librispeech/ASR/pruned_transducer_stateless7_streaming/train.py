@@ -841,6 +841,11 @@ def compute_loss(
     tokens = supervisions["tokens"].to(device)
     token_lens = supervisions["token_lens"].to(device)
     
+    # Calculate output lengths after XLSR's downsampling
+    xlsr_downsample = 320  # XLSR/wav2vec2 downsampling factor
+    output_lens = torch.div(feature_lens, xlsr_downsample, rounding_mode='floor')
+    output_lens = torch.maximum(output_lens, torch.ones_like(output_lens))  # Ensure at least 1 frame
+    
     # Compute with appropriate gradient context
     with torch.set_grad_enabled(is_training):
         # Use CTC loss for pre-training if in early epochs
@@ -868,10 +873,9 @@ def compute_loss(
                 else:
                     logits = model.simple_am_proj(outputs.hidden_states[-1])
                 
-                # Calculate output lengths after XLSR's downsampling
-                xlsr_downsample = 320  # XLSR/wav2vec2 downsampling factor
-                output_lens = torch.div(feature_lens, xlsr_downsample, rounding_mode='floor')
-                output_lens = torch.maximum(output_lens, torch.ones_like(output_lens))  # Ensure at least 1 frame
+                # Ensure output lengths don't exceed logits length
+                max_logit_len = logits.size(1)
+                output_lens = torch.minimum(output_lens, torch.tensor(max_logit_len, device=output_lens.device))
                 
                 if is_training:
                     # During training, compute CTC loss
@@ -879,7 +883,7 @@ def compute_loss(
                     ctc_loss = torch.nn.functional.ctc_loss(
                         log_probs.transpose(0, 1),  # (T, B, V)
                         tokens,
-                        output_lens,  # Use downsampled lengths
+                        output_lens,
                         token_lens,
                         blank=params.blank_id,
                         reduction='sum',
@@ -896,7 +900,7 @@ def compute_loss(
                         
                         # Convert predictions to text for WER calculation
                         hyp_texts = []
-                        for i, length in enumerate(output_lens):  # Use downsampled lengths
+                        for i, length in enumerate(output_lens):
                             # Get sequence without padding
                             pred = predictions[i, :length].tolist()
                             
@@ -923,7 +927,7 @@ def compute_loss(
                         ctc_loss = torch.nn.functional.ctc_loss(
                             log_probs.transpose(0, 1),  # (T, B, V)
                             tokens,
-                            output_lens,  # Use downsampled lengths
+                            output_lens,
                             token_lens,
                             blank=params.blank_id,
                             reduction='sum',

@@ -591,40 +591,45 @@ def get_params() -> AttributeDict:
             "reset_interval": 200,
             "valid_interval": 3000,
             
-            # Pre-training parameters
-            "is_pre_training": True,  # Will be set to False after pre-training phase
-            "pre_train_epochs": 5,
-            "pre_train_lr": 0.0001,
-            "streaming_start_epoch": 6,
+            # Paper's training configuration
+            "non_streaming_epochs": 10,  # Train full attention model first
             
-            # XLSR specific parameters
-            "use_xlsr": True,
-            "xlsr_model_name": "facebook/wav2vec2-xls-r-300m",
+            # Chunk configurations from paper
+            "chunk_sizes": {
+                "320ms": 5120,   # 16 frames (best performing)
+                "640ms": 10240,  # 32 frames
+                "1280ms": 20480, # 64 frames
+                "2560ms": 40960  # 128 frames
+            },
+            
+            # Frame parameters (from paper)
+            "frame_duration": 0.025,  # 25ms per frame
+            "frame_stride": 0.020,    # 20ms stride
+            "downsample_factor": 320, # For wav2vec2/XLSR models
+            
+            # Attention sink parameters (from paper)
             "attention_sink_size": 16,  # Paper's optimal setting
-            "decode_chunk_size": 5120,  # 320ms at 16kHz
             "left_context_chunks": 1,   # Paper's optimal setting
             
-            # Frame parameters from paper
-            "frame_duration": 0.025,  # 25ms per frame
-            "frame_stride": 0.020,   # 20ms stride
+            # Memory management
+            "batch_size": {
+                "non_streaming": 4,  # Larger as no chunking overhead
+                "streaming": 2       # Smaller due to chunk processing
+            },
+            "gradient_accumulation_steps": {
+                "non_streaming": 4,
+                "streaming": 8
+            },
+            "max_duration": {
+                "non_streaming": 10.0,  # seconds
+                "streaming": 8.0        # seconds
+            },
             
             # Original parameters
             "feature_dim": 80,
             "subsampling_factor": 4,  # not passed in, this is fixed.
             "warm_step": 2000,
             "env_info": get_env_info(),
-            
-            # Add new parameters for memory management
-            "gradient_accumulation_steps": 4,  # Accumulate gradients over multiple steps
-            "max_duration": 10.0,  # Maximum audio duration in seconds
-            "dynamic_batch_size": True,  # Enable dynamic batch sizing
-            "initial_batch_size": 1,  # Start with small batch size during pre-training
-            "max_batch_size": 32,  # Maximum batch size to try
-            "target_batch_size": 16,  # Target batch size to achieve
-            
-            # Pre-training specific parameters
-            "max_sequence_length": 16000 * 10,  # 10 seconds at 16kHz during pre-training
-            "pre_train_batch_size": 2,  # Smaller batch size during pre-training
         }
     )
 
@@ -837,16 +842,185 @@ def save_checkpoint(
         copyfile(src=filename, dst=best_valid_filename)
 
 
+def evaluate_streaming(
+    params: AttributeDict,
+    model: nn.Module,
+    valid_dl: torch.utils.data.DataLoader,
+    chunk_size: int,
+    sp: spm.SentencePieceProcessor,
+) -> Dict[str, float]:
+    """Evaluate model with streaming inference using specified chunk size.
+    
+    Args:
+        params: Training parameters
+        model: The model to evaluate
+        valid_dl: Validation dataloader
+        chunk_size: Chunk size in samples (e.g., 5120 for 320ms)
+        sp: SentencePieceProcessor for text processing
+    
+    Returns:
+        Dictionary containing metrics (WER, latency)
+    """
+    model.eval()
+    total_words = 0
+    total_errors = 0
+    total_latency = 0.0
+    
+    for batch_idx, batch in enumerate(valid_dl):
+        try:
+            with torch.no_grad():
+                # Get encoder output with streaming settings
+                feature = batch["inputs"].to(next(model.parameters()).device)
+                feature_lens = batch["supervisions"]["num_frames"].to(feature.device)
+                texts = batch["supervisions"]["text"]
+                
+                # Process in chunks
+                encoder_out = process_streaming_chunks(
+                    model=model,
+                    feature=feature,
+                    chunk_size=chunk_size,
+                    attention_sink_size=params.attention_sink_size,
+                    left_context_chunks=params.left_context_chunks
+                )
+                
+                # Decode with greedy search
+                hyp_tokens = greedy_search_batch(
+                    model=model,
+                    encoder_out=encoder_out,
+                    encoder_out_lens=feature_lens
+                )
+                
+                # Convert predictions to text
+                hyps = []
+                for tokens in hyp_tokens:
+                    if isinstance(tokens, torch.Tensor):
+                        tokens = tokens.tolist()
+                    hyps.append(sp.decode(tokens))
+                
+                # Calculate WER
+                for hyp, ref in zip(hyps, texts):
+                    hyp_words = hyp.split()
+                    ref_words = ref.split()
+                    total_words += len(ref_words)
+                    total_errors += editdistance.eval(hyp_words, ref_words)
+                
+                # Calculate latency
+                total_latency += feature.size(1) / 16000  # Convert samples to seconds
+                
+        except Exception as e:
+            logging.error(f"Error processing batch {batch_idx}: {str(e)}")
+            continue
+            
+        if batch_idx % 10 == 0:
+            wer = 100.0 * total_errors / max(1, total_words)
+            logging.info(f"Batch {batch_idx}, current WER: {wer:.2f}%")
+    
+    # Calculate final metrics
+    wer = 100.0 * total_errors / max(1, total_words)
+    avg_latency = total_latency / len(valid_dl)
+    
+    metrics = {
+        "wer": wer,
+        "latency": avg_latency,
+        "chunk_size_ms": chunk_size / 16,  # Convert samples to ms
+    }
+    
+    return metrics
+
+
+def process_streaming_chunks(
+    model: nn.Module,
+    feature: torch.Tensor,
+    chunk_size: int,
+    attention_sink_size: int,
+    left_context_chunks: int
+) -> torch.Tensor:
+    """Process input features in streaming mode with chunks.
+    
+    Args:
+        model: The model to use
+        feature: Input features (batch, time)
+        chunk_size: Size of each chunk in samples
+        attention_sink_size: Number of frames for attention sink
+        left_context_chunks: Number of left context chunks to use
+    
+    Returns:
+        Encoder output tensor
+    """
+    device = feature.device
+    batch_size = feature.size(0)
+    
+    # Initialize states
+    states = None
+    chunk_outputs = []
+    
+    # Calculate effective chunk size with overlap
+    chunk_overlap = chunk_size // 2
+    effective_chunk_size = chunk_size - chunk_overlap
+    
+    # Process each sequence in batch
+    for b in range(batch_size):
+        seq = feature[b:b+1]  # Keep batch dimension
+        pos = 0
+        seq_outputs = []
+        
+        while pos < seq.size(1):
+            # Get current chunk
+            end_pos = min(pos + chunk_size, seq.size(1))
+            chunk = seq[:, pos:end_pos]
+            
+            # Add attention sink if enabled
+            if states is not None and attention_sink_size > 0:
+                sink = states[1]  # Attention sink cache
+                if sink is not None:
+                    chunk = torch.cat([sink, chunk], dim=1)
+            
+            # Process chunk
+            chunk_out, _, states = model.encoder.streaming_forward(
+                chunk,
+                torch.tensor([chunk.size(1)], device=device),
+                states
+            )
+            
+            # Save output
+            if pos > 0:  # Remove overlap from previous chunk
+                chunk_out = chunk_out[:, chunk_overlap//model.encoder.downsample_factor:]
+            seq_outputs.append(chunk_out)
+            
+            # Update position
+            pos = end_pos - chunk_overlap
+        
+        # Concatenate all chunks for this sequence
+        seq_output = torch.cat(seq_outputs, dim=1)
+        chunk_outputs.append(seq_output)
+    
+    # Pad to max length and stack
+    max_len = max(output.size(1) for output in chunk_outputs)
+    padded_outputs = []
+    
+    for output in chunk_outputs:
+        if output.size(1) < max_len:
+            padding = torch.zeros(
+                1, max_len - output.size(1), output.size(2),
+                device=device, dtype=output.dtype
+            )
+            padded_outputs.append(torch.cat([output, padding], dim=1))
+        else:
+            padded_outputs.append(output)
+    
+    return torch.cat(padded_outputs, dim=0)
+
+
 def compute_loss(
     params: AttributeDict,
     model: nn.Module,
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
-    is_pre_training: bool = False,
-    is_progressive: bool = False,
+    is_non_streaming: bool = True,
+    chunk_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, MetricsTracker]:
-    """Compute loss for the given batch.
+    """Compute loss following paper's approach.
     
     Args:
         params: Model parameters
@@ -854,118 +1028,48 @@ def compute_loss(
         sp: Sentence piece processor
         batch: A batch of data
         is_training: Whether this is a training batch
-        is_pre_training: Whether we are in pre-training phase
-        is_progressive: Whether we are in progressive training phase
+        is_non_streaming: Whether to use non-streaming mode
+        chunk_size: Chunk size for streaming mode
     
     Returns:
-        (loss, MetricsTracker) where loss is the loss tensor and MetricsTracker
-        contains various statistics about the loss.
+        (loss, MetricsTracker) containing loss and statistics
     """
     device = next(model.parameters()).device
-    feature = batch["inputs"]
-    feature = feature.to(device)
+    feature = batch["inputs"].to(device)
     
     # Get supervisions
     supervisions = batch["supervisions"]
-    feature_lens = supervisions["num_frames"].to(device)
     texts = supervisions["text"]
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
     
-    if is_pre_training:
-        # During pre-training, process full sequences without chunking
-        encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
-        encoder_out = model.encoder_proj(encoder_out)
-        
-        loss = model(
-            x=encoder_out,
-            x_lens=encoder_out_lens,
-            y=y,
-            prune_range=params.prune_range,
-            am_scale=params.am_scale,
-            lm_scale=params.lm_scale,
-        )
+    if is_non_streaming:
+        # Non-streaming mode: process full sequence
+        encoder_out = model.encoder(feature)
     else:
-        # For progressive and streaming phases, use chunked processing
-        chunk_size = 32  # 320ms at 10ms frame shift
-        context = 32     # Left/right context size
-        
-        # Split feature into chunks
-        num_frames = feature.size(1)
-        chunk_starts = torch.arange(0, num_frames - chunk_size, chunk_size // 2)
-        
-        # Initialize streaming state
-        model.encoder.reset_streaming_state()
-        
-        # Process chunks
-        chunk_encoder_outs = []
-        for start in chunk_starts:
-            end = start + chunk_size
-            chunk = feature[:, start:end]
-            
-            # Add context if available
-            left_pad = min(context, start)
-            right_pad = min(context, num_frames - end)
-            padded_chunk = feature[:, start - left_pad:end + right_pad]
-            
-            # Get encoder output for chunk
-            chunk_len = torch.tensor([padded_chunk.shape[1]], device=device)
-            chunk_out, chunk_lens = model.encoder(padded_chunk, chunk_len)
-            chunk_out = model.encoder_proj(chunk_out)
-            
-            # Remove context frames
-            if left_pad > 0:
-                chunk_out = chunk_out[:, left_pad:]
-            if right_pad > 0:
-                chunk_out = chunk_out[:, :-right_pad]
-                
-            chunk_encoder_outs.append(chunk_out)
-        
-        # Concatenate chunk outputs
-        encoder_out = torch.cat(chunk_encoder_outs, dim=1)
-        encoder_out_lens = ((feature_lens.float() / model.encoder.downsample_factor).floor()).to(torch.int64)
-        
-        if is_progressive:
-            # During progressive training, compute both streaming and full-sequence outputs
-            with torch.no_grad():
-                full_encoder_out, full_lens = model.encoder(feature, feature_lens)
-                full_encoder_out = model.encoder_proj(full_encoder_out)
-            
-            # Compute streaming regularization loss
-            streaming_reg_loss = F.mse_loss(encoder_out, full_encoder_out.detach())
-            
-            # Compute main loss
-            main_loss = model(
-                x=encoder_out,
-                x_lens=encoder_out_lens,
-                y=y,
-                prune_range=params.prune_range,
-                am_scale=params.am_scale,
-                lm_scale=params.lm_scale,
-            )
-            
-            # Combine losses
-            reg_weight = min(1.0, params.cur_epoch / params.progressive_epochs)
-            loss = main_loss + reg_weight * streaming_reg_loss
-        else:
-            # Fully streaming phase
-            loss = model(
-                x=encoder_out,
-                x_lens=encoder_out_lens,
-                y=y,
-                prune_range=params.prune_range,
-                am_scale=params.am_scale,
-                lm_scale=params.lm_scale,
-            )
+        # Streaming mode: process in chunks
+        encoder_out = process_streaming_chunks(
+            model=model,
+            feature=feature,
+            chunk_size=chunk_size,
+            attention_sink_size=params.attention_sink_size,
+            left_context_chunks=params.left_context_chunks
+        )
+    
+    # Compute transducer loss
+    loss = model(
+        x=encoder_out,
+        y=y,
+        prune_range=params.prune_range,
+        am_scale=params.am_scale,
+        lm_scale=params.lm_scale,
+    )
     
     assert loss.requires_grad == is_training
     
     info = MetricsTracker()
     info["frames"] = feature.size(0)
     info["loss"] = loss.detach().cpu().item()
-    
-    if is_progressive:
-        info["streaming_reg_loss"] = streaming_reg_loss.detach().cpu().item()
     
     return loss, info
 
@@ -1109,50 +1213,61 @@ def train_one_epoch(
     world_size: int = 1,
     rank: int = 0,
 ) -> None:
-    """Train the model for one epoch.
-    The training phase is controlled by params.pretrain_epochs and params.progressive_epochs
-    to implement the three training phases:
-    1. Pre-training: Full sequence processing without chunking
-    2. Progressive: Gradual transition to streaming with regularization
-    3. Streaming: Only chunked processing
+    """Train the model for one epoch following paper's approach:
+    1. Non-streaming training first
+    2. Evaluate with different streaming configurations
     """
     model.train()
-    
     tot_loss = MetricsTracker()
-    curr_batch_size = params.initial_batch_size
+    
+    # Determine training phase
+    is_non_streaming = params.cur_epoch <= params.non_streaming_epochs
+    
+    # Set batch size and gradient accumulation based on phase
+    curr_batch_size = params.batch_size["non_streaming" if is_non_streaming else "streaming"]
+    grad_acc_steps = params.gradient_accumulation_steps["non_streaming" if is_non_streaming else "streaming"]
+    
+    logging.info(
+        f"Epoch {params.cur_epoch}: "
+        f"{'Non-streaming' if is_non_streaming else 'Streaming'} phase, "
+        f"batch_size={curr_batch_size}, grad_acc_steps={grad_acc_steps}"
+    )
     
     for batch_idx, batch in enumerate(train_dl):
         try:
             params.batch_idx_train += 1
-            batch_size = len(batch['supervisions']['text'])
-            
-            # Determine training phase
-            is_pre_training = params.cur_epoch < params.pretrain_epochs
-            is_progressive = (params.cur_epoch >= params.pretrain_epochs and 
-                            params.cur_epoch < params.pretrain_epochs + params.progressive_epochs)
-            
-            # Set appropriate batch size for pre-training
-            if is_pre_training:
-                curr_batch_size = min(params.pre_train_batch_size, curr_batch_size)
             
             # Zero gradients
             optimizer.zero_grad()
             
-            loss, loss_info = compute_loss(
-                params=params,
-                model=model,
-                sp=sp,
-                batch=batch,
-                is_training=True,
-                is_pre_training=is_pre_training,
-                is_progressive=is_progressive
-            )
+            if is_non_streaming:
+                # Non-streaming phase: full sequence processing
+                loss, loss_info = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    batch=batch,
+                    is_training=True,
+                    is_non_streaming=True
+                )
+            else:
+                # Streaming phase: evaluate with different chunk sizes
+                chunk_size = params.chunk_sizes["320ms"]  # Best performing from paper
+                loss, loss_info = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    batch=batch,
+                    is_training=True,
+                    is_non_streaming=False,
+                    chunk_size=chunk_size
+                )
             
             # Scale loss for gradient accumulation
-            loss = loss / params.gradient_accumulation_steps
+            loss = loss / grad_acc_steps
             loss.backward()
             
-            if (batch_idx + 1) % params.gradient_accumulation_steps == 0:
+            if (batch_idx + 1) % grad_acc_steps == 0:
                 clip_grad_norm_(model.parameters(), 5.0, 2.0)
                 optimizer.step()
                 scheduler.step()
@@ -1160,12 +1275,17 @@ def train_one_epoch(
             tot_loss = tot_loss + loss_info
             
             if batch_idx % params.log_interval == 0:
-                logging.info(f'Epoch {params.cur_epoch}, batch {batch_idx}, '
-                           f'batch size {batch_size}, loss {loss:.4f}')
+                logging.info(
+                    f'Epoch {params.cur_epoch}, batch {batch_idx}, '
+                    f'batch size {curr_batch_size}, loss {loss:.4f}, '
+                    f'memory used: {torch.cuda.max_memory_allocated() // 1024 // 1024}MB'
+                )
                 
                 if tb_writer is not None:
                     tb_writer.add_scalar('train/loss', loss, params.batch_idx_train)
-                    tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0],
+                    tb_writer.add_scalar('train/batch_size', curr_batch_size, params.batch_idx_train)
+                    tb_writer.add_scalar('train/memory_used', 
+                                       torch.cuda.max_memory_allocated() // 1024 // 1024,
                                        params.batch_idx_train)
                     
         except RuntimeError as e:
@@ -1173,17 +1293,38 @@ def train_one_epoch(
                 # Reduce batch size
                 if curr_batch_size > 1:
                     curr_batch_size = max(1, curr_batch_size // 2)
-                    logging.warning(f'OOM error - reducing batch size to {curr_batch_size}')
+                    logging.warning(
+                        f'OOM error - reducing batch size to {curr_batch_size}. '
+                        f'Memory usage: {torch.cuda.max_memory_allocated() // 1024 // 1024}MB'
+                    )
                     # Skip this batch and continue with reduced size
                     torch.cuda.empty_cache()
                     continue
                 else:
-                    logging.error('OOM error with batch size 1 - cannot reduce further')
+                    logging.error(
+                        'OOM error with batch size 1 - cannot reduce further. '
+                        f'Memory usage: {torch.cuda.max_memory_allocated() // 1024 // 1024}MB'
+                    )
                     raise e
             else:
                 raise e
     
     logging.info(f'Mean loss: {tot_loss["loss"] / tot_loss["frames"]:.4f}')
+    
+    # After non-streaming phase, evaluate with different chunk sizes
+    if params.cur_epoch == params.non_streaming_epochs:
+        logging.info("Non-streaming training complete. Evaluating streaming configurations...")
+        model.eval()
+        with torch.no_grad():
+            for name, size in params.chunk_sizes.items():
+                metrics = evaluate_streaming(
+                    params=params,
+                    model=model,
+                    valid_dl=valid_dl,
+                    chunk_size=size,
+                    sp=sp
+                )
+                logging.info(f"Chunk size {name}: WER = {metrics['wer']:.2f}%")
     
     save_checkpoint(
         params=params,

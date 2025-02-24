@@ -5,24 +5,25 @@ from torch.utils.data import Dataset
 import logging
 
 class EstonianASRDataset(Dataset):
-    def __init__(self, txt_path: str, base_path: str = None, transform=None, sp=None) -> None:
+    def __init__(self, txt_path: str, base_path: str = None, transform=None, sp=None, max_duration: float = 10.0) -> None:
         """
         Args:
             txt_path: Path to the text file containing wav paths and transcripts
             base_path: Base path to prepend to the audio file paths
             transform: Optional transform to apply to the audio
-            sp: SentencePiece processor for tokenization
+            sp: SentencePieceProcessor for tokenization
+            max_duration: Maximum audio duration in seconds
         """
         self.samples = []  # list of tuples (wav_path, transcript)
         self.transform = transform
-        self.sp = sp  # Store SentencePiece processor
+        self.sp = sp  # Store SentencePieceProcessor
         
         if self.sp is None:
-            raise ValueError("SentencePiece processor (sp) must be provided")
+            raise ValueError("SentencePieceProcessor (sp) must be provided")
         
         # Duration limits (in samples at 16kHz)
         self.min_samples = 16000  # 1 sec minimum
-        self.max_samples = 160000  # 10 sec maximum
+        self.max_samples = int(max_duration * 16000)  # Convert max_duration to samples
         
         # Add logging
         self.logger = logging.getLogger(__name__)
@@ -189,9 +190,8 @@ def collate_fn(batch: list, max_duration: float = 10.0) -> dict:
         item['supervisions']['num_frames'] = torch.tensor([max_samples])
         filtered_batch = [item]
     
-    # Get maximum lengths in batch
+    # Get maximum length in batch
     max_len = max(item['inputs'].size(1) for item in filtered_batch)
-    max_token_len = max(len(item['supervisions']['tokens']) for item in filtered_batch)
     
     padded_waveforms = []
     padded_tokens = []
@@ -212,7 +212,7 @@ def collate_fn(batch: list, max_duration: float = 10.0) -> dict:
         
         # Handle token padding
         tokens = item['supervisions']['tokens']
-        token_pad_len = max_token_len - len(tokens)
+        token_pad_len = max(len(t) for t in tokens) - len(tokens)
         if token_pad_len > 0:
             # Pad with zeros
             token_pad = torch.zeros(token_pad_len, dtype=tokens.dtype)

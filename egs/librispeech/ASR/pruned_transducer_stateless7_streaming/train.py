@@ -583,42 +583,46 @@ def get_params() -> AttributeDict:
 def get_encoder_model(params: AttributeDict) -> nn.Module:
     if getattr(params, 'use_xlsr', False):
         from xlsr_encoder import XLSREncoder
-        from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
-        
-        # Use TalTechNLP's Estonian XLSR model
-        model_name = "TalTechNLP/xls-r-300m-et"
-        logging.info(f"Loading XLSR encoder: {model_name}")
-        
-        # Initialize processor and store in params
+        from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+
+        # Initialize cur_epoch if not present
+        if not hasattr(params, 'cur_epoch'):
+            params.cur_epoch = 0
+
+        # Initialize ctc_epochs if not present
+        if not hasattr(params, 'ctc_epochs'):
+            params.ctc_epochs = 5  # Default to 5 epochs of CTC pre-training
+
+        # Load processor first
         try:
-            processor = Wav2Vec2Processor.from_pretrained(model_name)
+            processor = Wav2Vec2Processor.from_pretrained(params.xlsr_model_name)
+            logging.info(f"Successfully loaded XLSR processor")
             params.wav2vec2_processor = processor
-            logging.info("Successfully loaded XLSR processor")
         except Exception as e:
-            logging.warning(f"Failed to load XLSR processor: {str(e)}")
-            params.wav2vec2_processor = None
-        
-        # Create XLSR encoder with streaming capabilities built-in
-        # During pre-training epochs, use Wav2Vec2ForCTC
+            logging.warning(f"Could not load processor: {str(e)}")
+
+        # Load appropriate model based on training phase
         if params.cur_epoch <= params.ctc_epochs:
-            logging.info("Using Wav2Vec2ForCTC for pre-training")
-            wav2vec_model = Wav2Vec2ForCTC.from_pretrained(model_name)
+            # During CTC pre-training, use Wav2Vec2ForCTC
+            model = Wav2Vec2ForCTC.from_pretrained(params.xlsr_model_name)
+            logging.info(f"Using Wav2Vec2ForCTC for pre-training (epoch {params.cur_epoch}/{params.ctc_epochs})")
         else:
-            logging.info("Using Wav2Vec2Model for transducer training")
-            wav2vec_model = None  # Will be initialized in XLSREncoder
-            
+            # After pre-training, use base model
+            model = Wav2Vec2Model.from_pretrained(params.xlsr_model_name)
+            logging.info(f"Using base Wav2Vec2Model for transducer training")
+
+        # Create XLSR encoder with streaming capabilities
         encoder = XLSREncoder(
-            model_name=model_name,
-            model=wav2vec_model,  # Pass the pre-initialized model if in pre-training
-            decode_chunk_size=params.decode_chunk_len,  # Now using decode_chunk_size consistently
+            model=model,
+            decode_chunk_size=params.decode_chunk_len,
             chunk_overlap=params.decode_chunk_len // 2,
             use_attention_sink=True,
             attention_sink_size=16,  # Paper's optimal setting
-            frame_duration=0.025,  # 25ms per frame
-            frame_stride=0.020,  # 20ms stride
-            min_chunk_size=2560,  # 160ms at 16kHz
-            max_chunk_size=20480,  # 1280ms at 16kHz
-            left_context_chunks=1  # Paper's optimal setting
+            frame_duration=0.025,    # 25ms per frame
+            frame_stride=0.020,      # 20ms stride
+            min_chunk_size=2560,     # 160ms at 16kHz
+            max_chunk_size=20480,    # 1280ms at 16kHz
+            left_context_chunks=1     # Paper's optimal setting
         )
         return encoder
     else:
@@ -1253,6 +1257,11 @@ def run(rank, world_size, args):
     """
     params = get_params()
     params.update(vars(args))
+    
+    # Initialize training parameters
+    params.cur_epoch = max(1, params.start_epoch)  # Start from epoch 1 or start_epoch
+    params.batch_idx_train = 0
+    
     if params.full_libri is False:
         params.valid_interval = 1600
 

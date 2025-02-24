@@ -1015,8 +1015,25 @@ def decode_one_batch_hyps(
             value=LOG_EPS,
         )
         
+        # Create attention mask for proper padding
+        attention_mask = torch.ones_like(feature_pad, dtype=torch.long)
+        for i in range(feature_pad.size(0)):  # Iterate over batch dimension
+            attention_mask[i, feature_lens_pad[i]:] = 0
+        
         # Get encoder output
-        encoder_out, encoder_out_lens = model.encoder(feature_pad, feature_lens_pad)
+        if isinstance(model.encoder.model, Wav2Vec2ForCTC):
+            # For CTC pre-training, use the CTC model's forward pass
+            outputs = model.encoder.model(
+                feature_pad,
+                attention_mask=attention_mask,
+                output_hidden_states=True
+            )
+            encoder_out = outputs.hidden_states[-1]
+            encoder_out_lens = torch.div(feature_lens_pad, 320, rounding_mode='floor')  # XLSR downsample factor
+            encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
+        else:
+            # Regular encoder forward pass
+            encoder_out, encoder_out_lens = model.encoder(feature_pad, feature_lens_pad)
         
         # Project encoder output
         if isinstance(model, DDP):
@@ -1027,7 +1044,10 @@ def decode_one_batch_hyps(
         # Use CTC decoding during pre-training epochs
         if params.cur_epoch <= params.ctc_epochs:
             # Project encoder output to vocab size
-            logits = model.simple_am_proj(encoder_out)  # [B, T, V]
+            if isinstance(model, DDP):
+                logits = model.module.simple_am_proj(encoder_out)  # [B, T, V]
+            else:
+                logits = model.simple_am_proj(encoder_out)  # [B, T, V]
             
             # Get CTC predictions with temperature scaling for sharper distribution
             log_probs = torch.log_softmax(logits / 0.5, dim=-1)  # temperature = 0.5

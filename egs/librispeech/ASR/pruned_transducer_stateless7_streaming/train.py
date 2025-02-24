@@ -271,6 +271,34 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         help="Epoch to start using streaming (after pre-training)",
     )
 
+    parser.add_argument(
+        "--chunk-size-stage1",
+        type=int,
+        default=5120,  # 320ms at 16kHz (16 frames)
+        help="Chunk size for first streaming stage",
+    )
+
+    parser.add_argument(
+        "--chunk-size-stage2",
+        type=int,
+        default=10240,  # 640ms at 16kHz (32 frames)
+        help="Chunk size for second streaming stage",
+    )
+
+    parser.add_argument(
+        "--stage1-epochs",
+        type=int,
+        default=10,
+        help="Number of epochs for first chunk size stage",
+    )
+
+    parser.add_argument(
+        "--stage2-epochs",
+        type=int,
+        default=15,
+        help="Number of epochs for second chunk size stage",
+    )
+
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -592,6 +620,13 @@ def get_params() -> AttributeDict:
             "subsampling_factor": 4,  # not passed in, this is fixed.
             "warm_step": 2000,
             "env_info": get_env_info(),
+            
+            # Progressive training stages
+            "current_stage": 0,  # 0: pre-training, 1: first chunk size, 2: second chunk size
+            "chunk_size_stage1": 5120,  # 320ms (16 frames)
+            "chunk_size_stage2": 10240,  # 640ms (32 frames)
+            "stage1_epochs": 10,
+            "stage2_epochs": 15,
         }
     )
 
@@ -1097,21 +1132,43 @@ def train_one_epoch(
     """Train the model for one epoch."""
     model.train()
 
-    # Set learning rate based on training phase
-    if params.is_pre_training:
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = params.pre_train_lr
-        logging.info(f"Pre-training phase (Epoch {params.cur_epoch}), lr={params.pre_train_lr}")
-    
-    # Check if we should switch from pre-training to streaming
-    if params.cur_epoch >= params.streaming_start_epoch and params.is_pre_training:
+    # Check training stage transitions
+    if params.is_pre_training and params.cur_epoch >= params.streaming_start_epoch:
         params.is_pre_training = False
-        logging.info("Switching from pre-training to streaming phase")
-        # Reset best metrics for streaming phase
+        params.current_stage = 1
+        logging.info(f"Switching from pre-training to streaming stage 1 (chunk size: {params.chunk_size_stage1})")
+        # Update encoder chunk size
+        if isinstance(model, DDP):
+            model.module.encoder.decode_chunk_size = params.chunk_size_stage1
+        else:
+            model.encoder.decode_chunk_size = params.chunk_size_stage1
+        # Reset best metrics for new stage
         params.best_train_loss = float("inf")
         params.best_valid_loss = float("inf")
         params.best_train_epoch = -1
         params.best_valid_epoch = -1
+    elif not params.is_pre_training and params.current_stage == 1 and params.cur_epoch >= (params.streaming_start_epoch + params.stage1_epochs):
+        params.current_stage = 2
+        logging.info(f"Switching to streaming stage 2 (chunk size: {params.chunk_size_stage2})")
+        # Update encoder chunk size
+        if isinstance(model, DDP):
+            model.module.encoder.decode_chunk_size = params.chunk_size_stage2
+        else:
+            model.encoder.decode_chunk_size = params.chunk_size_stage2
+        # Reset best metrics for new stage
+        params.best_train_loss = float("inf")
+        params.best_valid_loss = float("inf")
+        params.best_train_epoch = -1
+        params.best_valid_epoch = -1
+
+    # Set learning rate based on training stage
+    if params.is_pre_training:
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = params.pre_train_lr
+        logging.info(f"Pre-training phase (Epoch {params.cur_epoch}), lr={params.pre_train_lr}")
+    else:
+        stage_name = f"stage{params.current_stage}"
+        logging.info(f"Training {stage_name} (Epoch {params.cur_epoch}, chunk size: {getattr(params, f'chunk_size_{stage_name}')})")
 
     tot_loss = MetricsTracker()
 

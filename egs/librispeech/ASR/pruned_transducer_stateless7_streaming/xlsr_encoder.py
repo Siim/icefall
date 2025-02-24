@@ -333,6 +333,24 @@ class XLSREncoder(EncoderInterface):
         
         return outputs, expected_frames, next_states
 
+    def update_chunk_size(self, new_chunk_size: int) -> None:
+        """Update chunk size during training stages
+        
+        Args:
+            new_chunk_size: New chunk size to use (must be one of paper's configurations)
+        """
+        assert new_chunk_size in self.chunk_sizes.values(), \
+            f"Chunk size {new_chunk_size} not in paper's configurations: {list(self.chunk_sizes.values())}"
+        
+        self.decode_chunk_size = new_chunk_size
+        self.chunk_overlap = new_chunk_size // 2
+        self.frames_per_chunk = int(new_chunk_size / self.downsample_factor)
+        
+        # Reset streaming state for new chunk size
+        self.reset_streaming_state()
+        
+        logging.info(f"Updated chunk size to {new_chunk_size} samples ({new_chunk_size/16000*1000:.1f}ms)")
+
     def forward(
         self,
         x: torch.Tensor,
@@ -349,30 +367,23 @@ class XLSREncoder(EncoderInterface):
         Returns:
             (encoder_out, encoder_out_lens)
         """
-        batch_size = x.size(0)
-        
         # Ensure input is float and in correct shape
         x = x.float()
-        if x.ndim == 3:  # (batch, time, channel)
+        if x.ndim == 3:
             x = x.squeeze(-1)
-        elif x.ndim == 1:  # (time,)
-            x = x.unsqueeze(0)  # Add batch dimension
-        
+        elif x.ndim == 1:
+            x = x.unsqueeze(0)
+            
         assert x.ndim == 2, f"Expected 2D input (batch, time), got shape {x.shape}"
         
         # Clamp values silently since inputs are already normalized
         x = torch.clamp(x, min=-1.0, max=1.0)
         
-        # Create attention mask
-        attention_mask = torch.ones_like(x, dtype=torch.long)
-        for i in range(batch_size):
-            attention_mask[i, x_lens[i]:] = 0
-        
         if is_pre_training:
-            # During pre-training, use full sequence without chunking
+            # During pre-training, process full sequences without chunking
             outputs = self.model(
                 x,
-                attention_mask=attention_mask,
+                attention_mask=torch.ones_like(x, dtype=torch.long),
                 output_hidden_states=False,
                 output_attentions=False,
                 return_dict=False
@@ -384,77 +395,79 @@ class XLSREncoder(EncoderInterface):
             
             return outputs, encoder_out_lens
         else:
-            # Use streaming mode with chunks
-            if self.training:
-                # During training with streaming, simulate chunked processing
-                outputs = []
-                current_lengths = []
+            # Use chunked processing during training
+            batch_size = x.size(0)
+            outputs = []
+            current_lengths = []
+            
+            for i in range(batch_size):
+                # Process each sequence in batch
+                seq_len = x_lens[i]
+                sequence = x[i, :seq_len]
                 
-                for i in range(batch_size):
-                    # Process each sequence in the batch
-                    seq_len = x_lens[i]
-                    sequence = x[i, :seq_len]
+                # Process in chunks
+                chunk_outputs = []
+                pos = 0
+                while pos < seq_len:
+                    # Get current chunk
+                    chunk_size = min(self.decode_chunk_size, seq_len - pos)
+                    chunk = sequence[pos:pos + chunk_size]
                     
-                    # Process in chunks
-                    chunk_outputs = []
-                    pos = 0
-                    while pos < seq_len:
-                        # Get current chunk
-                        chunk_size = min(self.decode_chunk_size, seq_len - pos)
-                        chunk = sequence[pos:pos + chunk_size]
-                        
-                        # Add left context if available
-                        if self.past_context is not None:
-                            chunk = torch.cat([self.past_context, chunk], dim=0)
-                        
-                        # Process chunk
-                        chunk_output = self.model(
-                            chunk.unsqueeze(0),
-                            attention_mask=torch.ones_like(chunk).unsqueeze(0),
-                            output_hidden_states=False,
-                            output_attentions=False,
-                            return_dict=False
-                        )[0]
-                        
-                        # Add attention sink if enabled
-                        if self.use_attention_sink:
-                            chunk_output = torch.cat([
-                                self.attention_sink.unsqueeze(0).expand(1, -1, -1),
-                                chunk_output
-                            ], dim=1)
-                        
-                        chunk_outputs.append(chunk_output)
-                        
-                        # Update position and save context
-                        pos += chunk_size - self.chunk_overlap
-                        if pos < seq_len:
-                            self.past_context = chunk[-self.chunk_overlap:]
+                    # Add left context if available
+                    chunk = self.prepare_left_context(chunk.unsqueeze(0))
                     
-                    # Concatenate chunks
-                    sequence_output = torch.cat(chunk_outputs, dim=1)
-                    outputs.append(sequence_output)
-                    current_lengths.append(sequence_output.size(1))
+                    # Add attention sink
+                    chunk, new_sink = self.prepare_attention_sink(
+                        chunk,
+                        self.attention_sink_cache
+                    )
+                    self.attention_sink_cache = new_sink
+                    
+                    # Process chunk
+                    chunk_output = self.model(
+                        chunk,
+                        attention_mask=torch.ones_like(chunk, dtype=torch.long),
+                        output_hidden_states=False,
+                        output_attentions=False,
+                        return_dict=False
+                    )[0]
+                    
+                    # Apply smooth transition if we have previous output
+                    if self.last_chunk_output is not None:
+                        chunk_output = self.smooth_transition(chunk_output, self.last_chunk_output)
+                    
+                    chunk_outputs.append(chunk_output)
+                    self.last_chunk_output = chunk_output.clone()
+                    
+                    # Update position and save context
+                    pos += chunk_size - self.chunk_overlap
+                    if pos < seq_len:
+                        self.left_context_buffer.append(chunk.clone())
+                        if len(self.left_context_buffer) > self.left_context_chunks:
+                            self.left_context_buffer.pop(0)
                 
-                # Pad to max length
-                max_len = max(current_lengths)
-                padded_outputs = []
-                for output, length in zip(outputs, current_lengths):
-                    if length < max_len:
-                        padding = torch.zeros(
-                            1,
-                            max_len - length,
-                            output.size(-1),
-                            device=output.device,
-                            dtype=output.dtype
-                        )
-                        padded_outputs.append(torch.cat([output, padding], dim=1))
-                    else:
-                        padded_outputs.append(output)
-                
-                encoder_out = torch.cat(padded_outputs, dim=0)
-                encoder_out_lens = torch.tensor(current_lengths, device=x.device)
-            else:
-                # During inference, use streaming_forward
-                encoder_out, encoder_out_lens, _ = self.streaming_forward(x, x_lens)
+                # Concatenate chunks
+                sequence_output = torch.cat(chunk_outputs, dim=1)
+                outputs.append(sequence_output)
+                current_lengths.append(sequence_output.size(1))
+            
+            # Pad to max length
+            max_len = max(current_lengths)
+            padded_outputs = []
+            for output, length in zip(outputs, current_lengths):
+                if length < max_len:
+                    padding = torch.zeros(
+                        1,
+                        max_len - length,
+                        output.size(-1),
+                        device=output.device,
+                        dtype=output.dtype
+                    )
+                    padded_outputs.append(torch.cat([output, padding], dim=1))
+                else:
+                    padded_outputs.append(output)
+            
+            encoder_out = torch.cat(padded_outputs, dim=0)
+            encoder_out_lens = torch.tensor(current_lengths, device=x.device)
             
             return encoder_out, encoder_out_lens 

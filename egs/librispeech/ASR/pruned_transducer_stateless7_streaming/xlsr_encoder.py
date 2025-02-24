@@ -57,7 +57,7 @@ class XLSREncoder(EncoderInterface):
         model_name: Optional[str] = None,
         model: Optional[nn.Module] = None,
         decode_chunk_size: int = 5120,  # 320ms at 16kHz
-        chunk_overlap: int = 2560,      # Half of chunk size
+        chunk_overlap: int = None,  # Will be set to chunk_size // 2
         use_attention_sink: bool = True,
         attention_sink_size: int = 16,   # Paper's optimal setting
         frame_duration: float = 0.025,   # 25ms per frame
@@ -70,6 +70,7 @@ class XLSREncoder(EncoderInterface):
         
         if model is not None:
             self.model = model
+            logging.info(f"Using pre-initialized model: {type(model).__name__}")
         elif model_name is not None:
             from transformers import Wav2Vec2Model
             try:
@@ -82,7 +83,7 @@ class XLSREncoder(EncoderInterface):
         
         # Store configuration
         self.decode_chunk_size = decode_chunk_size
-        self.chunk_overlap = chunk_overlap
+        self.chunk_overlap = chunk_overlap if chunk_overlap is not None else decode_chunk_size // 2
         self.use_attention_sink = use_attention_sink
         self.attention_sink_size = attention_sink_size
         self.frame_duration = frame_duration

@@ -583,7 +583,7 @@ def get_params() -> AttributeDict:
 def get_encoder_model(params: AttributeDict) -> nn.Module:
     if getattr(params, 'use_xlsr', False):
         from xlsr_encoder import XLSREncoder
-        from transformers import Wav2Vec2Processor
+        from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
         
         # Use TalTechNLP's Estonian XLSR model
         model_name = "TalTechNLP/xls-r-300m-et"
@@ -599,8 +599,17 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
             params.wav2vec2_processor = None
         
         # Create XLSR encoder with streaming capabilities built-in
+        # During pre-training epochs, use Wav2Vec2ForCTC
+        if params.cur_epoch <= params.ctc_epochs:
+            logging.info("Using Wav2Vec2ForCTC for pre-training")
+            wav2vec_model = Wav2Vec2ForCTC.from_pretrained(model_name)
+        else:
+            logging.info("Using Wav2Vec2Model for transducer training")
+            wav2vec_model = None  # Will be initialized in XLSREncoder
+            
         encoder = XLSREncoder(
             model_name=model_name,
+            model=wav2vec_model,  # Pass the pre-initialized model if in pre-training
             decode_chunk_size=params.decode_chunk_len,  # Now using decode_chunk_size consistently
             chunk_overlap=params.decode_chunk_len // 2,
             use_attention_sink=True,

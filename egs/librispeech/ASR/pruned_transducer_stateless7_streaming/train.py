@@ -1363,7 +1363,11 @@ def train_one_epoch(
     is_pre_training = params.cur_epoch <= params.pretrain_epochs
     
     # Set batch size based on phase
-    curr_batch_size = params.batch_size["non_streaming" if is_pre_training else "streaming"]
+    if isinstance(params.batch_size, dict):
+        curr_batch_size = params.batch_size["non_streaming" if is_pre_training else "streaming"]
+    else:
+        # If batch_size is an integer (from command line args), use it directly
+        curr_batch_size = params.batch_size
     
     phase = (
         "Pre-training" if is_pre_training
@@ -1670,7 +1674,7 @@ def run(rank, world_size, args):
             params=params,
         )
 
-    scaler = GradScaler(enabled=params.use_fp16, init_scale=1.0)
+    scaler = GradScaler('cuda', enabled=params.use_fp16, init_scale=1.0)
     if checkpoints and "grad_scaler" in checkpoints:
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])

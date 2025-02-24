@@ -189,8 +189,9 @@ def collate_fn(batch: list, max_duration: float = 10.0) -> dict:
         item['supervisions']['num_frames'] = torch.tensor([max_samples])
         filtered_batch = [item]
     
-    # Get maximum length in batch
+    # Get maximum lengths in batch
     max_len = max(item['inputs'].size(1) for item in filtered_batch)
+    max_token_len = max(len(item['supervisions']['tokens']) for item in filtered_batch)
     
     padded_waveforms = []
     padded_tokens = []
@@ -211,7 +212,7 @@ def collate_fn(batch: list, max_duration: float = 10.0) -> dict:
         
         # Handle token padding
         tokens = item['supervisions']['tokens']
-        token_pad_len = max(len(t) for t in tokens) - len(tokens)
+        token_pad_len = max_token_len - len(tokens)
         if token_pad_len > 0:
             # Pad with zeros
             token_pad = torch.zeros(token_pad_len, dtype=tokens.dtype)

@@ -510,7 +510,11 @@ def get_parser():
     )
 
     add_model_arguments(parser)
-
+    
+    # New arguments for progressive streaming adaptation
+    parser.add_argument("--progressive-streaming-epochs", type=int, default=3, help="Number of epochs for progressive streaming adaptation stage.")
+    parser.add_argument("--streaming-reg-weight", type=float, default=0.1, help="Weight for streaming regularization loss during progressive streaming stage.")
+    
     return parser
 
 
@@ -810,6 +814,7 @@ def compute_loss(
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
+    progressive_streaming_factor: float,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute transducer loss given the model and batch.
@@ -950,6 +955,32 @@ def compute_loss(
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
     info["wer"] = wer
     
+    if progressive_streaming_factor > 0:
+        # Add streaming regularization loss
+        # Assuming batch contains 'speech' and 'speech_lengths'
+        speech = batch["speech"]
+        speech_lengths = batch["speech_lengths"]
+
+        # Get full-sequence encoder outputs (pre-training mode)
+        full_encoder_out, _ = model.encoder(speech, speech_lengths, is_pre_training=True)
+        
+        # Get streaming encoder outputs
+        stream_encoder_out, _ = model.encoder(speech, speech_lengths, is_pre_training=False)
+        
+        # Compute L2 (MSE) loss between full and streaming outputs
+        reg_loss = torch.nn.functional.mse_loss(full_encoder_out, stream_encoder_out)
+        
+        # Scale the streaming regularization loss
+        scaled_reg_loss = reg_loss * params.streaming_reg_weight * progressive_streaming_factor
+        
+        # Add the streaming regularization loss to the original loss
+        loss = loss + scaled_reg_loss
+        
+        # Log the streaming regularization loss
+        info["streaming_reg_loss"] = scaled_reg_loss.item()
+    else:
+        info["streaming_reg_loss"] = 0.0
+
     return loss, info
 
 
@@ -1051,6 +1082,7 @@ def compute_validation_loss(
             sp=sp,
             batch=batch,
             is_training=False,
+            progressive_streaming_factor=1.0,
         )
         assert loss.requires_grad is False
         tot_loss = tot_loss + loss_info
@@ -1113,6 +1145,15 @@ def train_one_epoch(
         params.best_train_epoch = -1
         params.best_valid_epoch = -1
 
+    # Calculate progressive streaming factor based on epoch
+    pretrain_epochs = getattr(params, "pre_train_epochs", 5)
+    if params.cur_epoch < pretrain_epochs:
+        progressive_streaming_factor = 0.0
+    elif params.cur_epoch < pretrain_epochs + params.progressive_streaming_epochs:
+        progressive_streaming_factor = (params.cur_epoch - pretrain_epochs + 1) / params.progressive_streaming_epochs
+    else:
+        progressive_streaming_factor = 1.0
+
     tot_loss = MetricsTracker()
 
     for batch_idx, batch in enumerate(train_dl):
@@ -1127,6 +1168,7 @@ def train_one_epoch(
                     sp=sp,
                     batch=batch,
                     is_training=True,
+                    progressive_streaming_factor=progressive_streaming_factor,
                 )
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
@@ -1500,6 +1542,7 @@ def scan_pessimistic_batches_for_oom(
                     sp=sp,
                     batch=batch,
                     is_training=True,
+                    progressive_streaming_factor=1.0,
                 )
             loss.backward()
             optimizer.zero_grad()

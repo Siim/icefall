@@ -73,6 +73,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from zipformer import Zipformer
 from xlsr_encoder import XLSREncoder
+from transformers import Wav2Vec2ForCTC
 
 from icefall import diagnostics
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
@@ -809,185 +810,93 @@ def compute_loss(
     tokens = supervisions["tokens"].to(device)
     token_lens = supervisions["token_lens"].to(device)
     
-    # Calculate loss with proper gradient context
-    if not is_training:
-        with torch.no_grad():
-            # Get encoder output for decoding
-            encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
-            
-            # Use CTC loss for pre-training if in early epochs
-            if params.cur_epoch <= params.ctc_epochs:
-                # If using Wav2Vec2ForCTC, get logits directly
-                if isinstance(model.encoder.model, Wav2Vec2ForCTC):
-                    logits = model.encoder.model(
-                        feature,
-                        attention_mask=torch.ones_like(feature),
-                    ).logits
-                else:
-                    # Project encoder output to vocab size
-                    if isinstance(model, DDP):
-                        encoder_out = model.module.encoder_proj(encoder_out)
-                    else:
-                        encoder_out = model.encoder_proj(encoder_out)
-                    logits = model.simple_am_proj(encoder_out)  # [B, T, V]
+    # Get encoder output
+    encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
+    
+    # Use CTC loss for pre-training if in early epochs
+    if params.cur_epoch <= params.ctc_epochs:
+        # Project encoder output to vocab size
+        if isinstance(model, DDP):
+            encoder_out = model.module.encoder_proj(encoder_out)
+        else:
+            encoder_out = model.encoder_proj(encoder_out)
+        logits = model.simple_am_proj(encoder_out)  # [B, T, V]
+        
+        # Ensure lengths are valid for CTC loss
+        encoder_out_lens = torch.clamp(encoder_out_lens, max=logits.size(1))
+        
+        # Compute CTC loss with proper log softmax
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        
+        # Ensure proper tensor shapes for CTC loss
+        log_probs = log_probs.transpose(0, 1)  # (T, B, V)
+        targets = tokens
+        input_lengths = encoder_out_lens
+        target_lengths = token_lens
+        
+        # Compute CTC loss with proper blank handling
+        ctc_loss = torch.nn.functional.ctc_loss(
+            log_probs,
+            targets,
+            input_lengths,
+            target_lengths,
+            blank=params.blank_id,
+            reduction='sum',
+            zero_infinity=True
+        )
+        
+        # Use only CTC loss during pre-training
+        simple_loss = ctc_loss
+        pruned_loss = ctc_loss
+        
+        # Get CTC predictions for WER calculation
+        if not is_training:
+            with torch.no_grad():
+                # Get best path
+                pred_tokens = log_probs.argmax(dim=-1)  # [T, B]
+                pred_tokens = pred_tokens.transpose(0, 1)  # [B, T]
                 
-                # Ensure lengths are valid for CTC loss
-                encoder_out_lens = torch.clamp(encoder_out_lens, max=logits.size(1))
-                
-                # Compute CTC loss with proper log softmax
-                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-                
-                # Ensure proper tensor shapes for CTC loss
-                log_probs = log_probs.transpose(0, 1)  # (T, B, V)
-                targets = tokens
-                input_lengths = encoder_out_lens
-                target_lengths = token_lens
-                
-                # Compute CTC loss with proper blank handling
-                ctc_loss = torch.nn.functional.ctc_loss(
-                    log_probs,
-                    targets,
-                    input_lengths,
-                    target_lengths,
-                    blank=params.blank_id,
-                    reduction='sum',
-                    zero_infinity=True
-                )
-                
-                # Use only CTC loss during pre-training
-                simple_loss = ctc_loss
-                pruned_loss = ctc_loss
-                
-                # Get CTC predictions for WER calculation
-                with torch.no_grad():
-                    # Get best path
-                    pred_tokens = log_probs.argmax(dim=-1)  # [T, B]
-                    pred_tokens = pred_tokens.transpose(0, 1)  # [B, T]
-                    
-                    # Convert predictions to text, removing repeated tokens and blanks
-                    hyp_texts = []
-                    for i, length in enumerate(encoder_out_lens):
-                        # Get sequence without padding
-                        pred = pred_tokens[i, :length].tolist()
-                        
-                        # CTC decoding - remove repeated and blanks
-                        decoded = []
-                        prev = -1
-                        for token in pred:
-                            if token != params.blank_id and token != prev:
-                                decoded.append(token)
-                            prev = token
-                        
-                        # Convert to text
-                        text = sp.decode(decoded)
-                        hyp_texts.append(text)
-                    
-                    # Calculate WER
-                    total_words = sum(len(ref.split()) for ref in texts)
-                    total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
-                                    for hyp, ref in zip(hyp_texts, texts))
-                    wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
-            else:
-                # Use transducer loss after pre-training
-                if isinstance(model, DDP):
-                    encoder_out = model.module.encoder_proj(encoder_out)
-                else:
-                    encoder_out = model.encoder_proj(encoder_out)
-                    
-                simple_loss, pruned_loss = model(
-                    x=feature,
-                    x_lens=feature_lens,
-                    y=k2.RaggedTensor(tokens),
-                    prune_range=params.prune_range,
-                    am_scale=params.am_scale,
-                    lm_scale=params.lm_scale,
-                )
-                
-                # Use greedy search for decoding
-                hyp_tokens = greedy_search_batch(
-                    model=model,
-                    encoder_out=encoder_out,
-                    encoder_out_lens=encoder_out_lens,
-                )
-                
-                # Convert predictions to text
+                # Convert predictions to text, removing repeated tokens and blanks
                 hyp_texts = []
-                for tokens in hyp_tokens:
-                    if isinstance(tokens, torch.Tensor):
-                        tokens = tokens.tolist()
-                    elif not isinstance(tokens, list):
-                        tokens = list(tokens)
-                    text = sp.decode(tokens)
+                for i, length in enumerate(encoder_out_lens):
+                    # Get sequence without padding
+                    pred = pred_tokens[i, :length].tolist()
+                    
+                    # CTC decoding - remove repeated and blanks
+                    decoded = []
+                    prev = -1
+                    for token in pred:
+                        if token != params.blank_id and token != prev:
+                            decoded.append(token)
+                        prev = token
+                    
+                    # Convert to text
+                    text = sp.decode(decoded)
                     hyp_texts.append(text)
                 
-                # Compute WER
+                # Calculate WER
                 total_words = sum(len(ref.split()) for ref in texts)
                 total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
                                 for hyp, ref in zip(hyp_texts, texts))
                 wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
-    else:
-        # Training mode
-        encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
-        
-        # Use CTC loss for pre-training if in early epochs
-        if params.cur_epoch <= params.ctc_epochs:
-            # If using Wav2Vec2ForCTC, get logits directly
-            if isinstance(model.encoder.model, Wav2Vec2ForCTC):
-                logits = model.encoder.model(
-                    feature,
-                    attention_mask=torch.ones_like(feature),
-                ).logits
-            else:
-                # Project encoder output to vocab size
-                if isinstance(model, DDP):
-                    encoder_out = model.module.encoder_proj(encoder_out)
-                else:
-                    encoder_out = model.encoder_proj(encoder_out)
-                logits = model.simple_am_proj(encoder_out)  # [B, T, V]
-            
-            # Ensure lengths are valid for CTC loss
-            encoder_out_lens = torch.clamp(encoder_out_lens, max=logits.size(1))
-            
-            # Compute CTC loss with proper log softmax
-            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-            
-            # Ensure proper tensor shapes for CTC loss
-            log_probs = log_probs.transpose(0, 1)  # (T, B, V)
-            targets = tokens
-            input_lengths = encoder_out_lens
-            target_lengths = token_lens
-            
-            # Compute CTC loss with proper blank handling
-            ctc_loss = torch.nn.functional.ctc_loss(
-                log_probs,
-                targets,
-                input_lengths,
-                target_lengths,
-                blank=params.blank_id,
-                reduction='sum',
-                zero_infinity=True
-            )
-            
-            # Use only CTC loss during pre-training
-            simple_loss = ctc_loss
-            pruned_loss = ctc_loss
-            wer = 0.0  # Don't compute WER during training
         else:
-            # Use transducer loss after pre-training
-            if isinstance(model, DDP):
-                encoder_out = model.module.encoder_proj(encoder_out)
-            else:
-                encoder_out = model.encoder_proj(encoder_out)
-                
-            simple_loss, pruned_loss = model(
-                x=feature,
-                x_lens=feature_lens,
-                y=k2.RaggedTensor(tokens),
-                prune_range=params.prune_range,
-                am_scale=params.am_scale,
-                lm_scale=params.lm_scale,
-            )
             wer = 0.0  # Don't compute WER during training
+    else:
+        # Use transducer loss after pre-training
+        if isinstance(model, DDP):
+            encoder_out = model.module.encoder_proj(encoder_out)
+        else:
+            encoder_out = model.encoder_proj(encoder_out)
+            
+        simple_loss, pruned_loss = model(
+            x=feature,
+            x_lens=feature_lens,
+            y=k2.RaggedTensor(tokens),
+            prune_range=params.prune_range,
+            am_scale=params.am_scale,
+            lm_scale=params.lm_scale,
+        )
+        wer = 0.0  # Don't compute WER during training
     
     # Scale losses
     s = params.simple_loss_scale

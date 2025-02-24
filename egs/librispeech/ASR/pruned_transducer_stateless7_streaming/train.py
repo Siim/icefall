@@ -1023,7 +1023,7 @@ def compute_loss(
     is_pre_training: bool = True,
     chunk_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, MetricsTracker]:
-    """Compute loss following paper's approach.
+    """Compute loss following paper's approach with progressive chunk sizes.
     
     Args:
         params: Model parameters
@@ -1031,8 +1031,8 @@ def compute_loss(
         sp: Sentence piece processor
         batch: A batch of data
         is_training: Whether this is a training batch
-        is_pre_training: Whether this is a pre-training phase
-        chunk_size: Chunk size for streaming mode (in samples)
+        is_pre_training: Whether this is pre-training phase
+        chunk_size: Optional override for chunk size
     
     Returns:
         (loss, MetricsTracker) containing loss and statistics
@@ -1055,11 +1055,26 @@ def compute_loss(
             is_pre_training=True
         )
     else:
-        # Streaming phase: process in chunks with attention sink
+        # Determine chunk size based on training phase
+        if chunk_size is None:
+            if params.cur_epoch <= params.pretrain_epochs + 5:  # 5 epochs transition
+                # Progressive chunk size selection
+                progress = (params.cur_epoch - params.pretrain_epochs) / 5
+                curr_chunk_size = int(
+                    params.chunk_sizes["2560ms"] * (1 - progress) + 
+                    params.chunk_sizes["320ms"] * progress
+                )
+            else:
+                # Use optimal chunk size from paper
+                curr_chunk_size = params.chunk_sizes["320ms"]
+        else:
+            curr_chunk_size = chunk_size
+            
+        # Process in chunks with attention sink
         encoder_out = process_streaming_chunks(
             model=model,
             feature=feature,
-            chunk_size=chunk_size or params.chunk_sizes["320ms"],  # Default to best performing size
+            chunk_size=curr_chunk_size,
             attention_sink_size=params.attention_sink_size,
             left_context_chunks=params.left_context_chunks
         )
@@ -1097,6 +1112,8 @@ def compute_loss(
     if not is_pre_training:
         info["simple_loss"] = simple_loss.detach().cpu().item()
         info["pruned_loss"] = pruned_loss.detach().cpu().item()
+        if is_training and hasattr(params, "cur_epoch"):
+            info["chunk_size"] = curr_chunk_size if not is_pre_training else 0
     
     return loss, info
 
@@ -1186,11 +1203,15 @@ def compute_validation_loss(
     sp: spm.SentencePieceProcessor,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
+    tb_writer: Optional[SummaryWriter] = None,
 ) -> MetricsTracker:
-    """Run the validation process."""
+    """Run the validation process with both streaming and non-streaming evaluation."""
     model.eval()
 
     tot_loss = MetricsTracker()
+    tot_non_streaming_wer = 0
+    tot_streaming_wer = 0
+    num_sentences = 0
 
     for batch_idx, batch in enumerate(valid_dl):
         loss, loss_info = compute_loss(
@@ -1217,14 +1238,64 @@ def compute_validation_loss(
                 logging.info(f"HYP[{i}]: {hyps[i]}")
                 logging.info(f"PRD[{i}]: {preds[i]}")
                 logging.info("-" * 80)
+            
+            # Evaluate streaming performance
+            streaming_metrics = evaluate_streaming(
+                params=params,
+                model=model,
+                valid_dl=torch.utils.data.DataLoader([batch], batch_size=None),
+                chunk_size=params.chunk_sizes["320ms"],
+                sp=sp
+            )
+            
+            # Calculate WER for both modes
+            for hyp, ref in zip(hyps, preds):
+                hyp_words = hyp.split()
+                ref_words = ref.split()
+                tot_non_streaming_wer += editdistance.eval(hyp_words, ref_words)
+                num_sentences += 1
+            
+            tot_streaming_wer += streaming_metrics["wer"] * len(hyps)
+            
+            if tb_writer is not None:
+                tb_writer.add_scalar(
+                    'valid/streaming_wer',
+                    streaming_metrics["wer"],
+                    params.batch_idx_train
+                )
+                tb_writer.add_scalar(
+                    'valid/non_streaming_wer',
+                    tot_non_streaming_wer / max(1, num_sentences),
+                    params.batch_idx_train
+                )
 
     if world_size > 1:
         tot_loss.reduce(loss.device)
+        metrics = {
+            "tot_non_streaming_wer": tot_non_streaming_wer,
+            "tot_streaming_wer": tot_streaming_wer,
+            "num_sentences": num_sentences
+        }
+        metrics = reduce_metrics(metrics, loss.device)
+        tot_non_streaming_wer = metrics["tot_non_streaming_wer"]
+        tot_streaming_wer = metrics["tot_streaming_wer"]
+        num_sentences = metrics["num_sentences"]
 
     loss_value = tot_loss["loss"] / tot_loss["frames"]
     if loss_value < params.best_valid_loss:
         params.best_valid_loss = loss_value
         params.best_valid_epoch = params.cur_epoch
+
+    # Calculate final WERs
+    non_streaming_wer = tot_non_streaming_wer / max(1, num_sentences)
+    streaming_wer = tot_streaming_wer / max(1, num_sentences)
+    
+    logging.info(
+        f"Validation complete:\n"
+        f"Loss: {loss_value:.4f}\n"
+        f"Non-streaming WER: {non_streaming_wer:.2f}%\n"
+        f"Streaming WER: {streaming_wer:.2f}%"
+    )
 
     return tot_loss
 
@@ -1243,21 +1314,26 @@ def train_one_epoch(
 ) -> None:
     """Train the model for one epoch following paper's approach:
     1. Pre-training phase: Full sequence processing
-    2. Streaming phase: Chunk-based processing with attention sink
+    2. Progressive streaming phase: Gradually decrease chunk size
+    3. Final streaming phase: Fixed optimal chunk size
     """
     model.train()
     tot_loss = MetricsTracker()
     
-    # Determine training phase - simple binary choice
+    # Determine training phase
     is_pre_training = params.cur_epoch <= params.pretrain_epochs
     
     # Set batch size based on phase
     curr_batch_size = params.batch_size["non_streaming" if is_pre_training else "streaming"]
     
+    phase = (
+        "Pre-training" if is_pre_training
+        else "Progressive streaming" if params.cur_epoch <= params.pretrain_epochs + 5
+        else "Final streaming"
+    )
+    
     logging.info(
-        f"Epoch {params.cur_epoch}: "
-        f"{'Pre-training' if is_pre_training else 'Streaming'} phase, "
-        f"batch_size={curr_batch_size}"
+        f"Epoch {params.cur_epoch}: {phase} phase, batch_size={curr_batch_size}"
     )
     
     for batch_idx, batch in enumerate(train_dl):
@@ -1265,28 +1341,14 @@ def train_one_epoch(
             params.batch_idx_train += 1
             optimizer.zero_grad()
             
-            # Simple phase selection
-            if is_pre_training:
-                # Pre-training: full sequence processing
-                loss, loss_info = compute_loss(
-                    params=params,
-                    model=model,
-                    sp=sp,
-                    batch=batch,
-                    is_training=True,
-                    is_pre_training=True
-                )
-            else:
-                # Streaming: use optimal chunk size from paper (320ms)
-                loss, loss_info = compute_loss(
-                    params=params,
-                    model=model,
-                    sp=sp,
-                    batch=batch,
-                    is_training=True,
-                    is_pre_training=False,
-                    chunk_size=params.chunk_sizes["320ms"]  # Paper's best performing size
-                )
+            loss, loss_info = compute_loss(
+                params=params,
+                model=model,
+                sp=sp,
+                batch=batch,
+                is_training=True,
+                is_pre_training=is_pre_training
+            )
             
             loss.backward()
             clip_grad_norm_(model.parameters(), 5.0, 2.0)
@@ -1296,18 +1358,58 @@ def train_one_epoch(
             tot_loss = tot_loss + loss_info
             
             if batch_idx % params.log_interval == 0:
+                current_lr = list(optimizer.param_groups)[0]['lr']
                 logging.info(
                     f'Epoch {params.cur_epoch}, batch {batch_idx}, '
                     f'batch size {curr_batch_size}, loss {loss:.4f}, '
+                    f'current lr {current_lr:.2e}, '
                     f'memory used: {torch.cuda.max_memory_allocated() // 1024 // 1024}MB'
                 )
                 
                 if tb_writer is not None:
                     tb_writer.add_scalar('train/loss', loss, params.batch_idx_train)
+                    tb_writer.add_scalar('train/lr', current_lr, params.batch_idx_train)
                     tb_writer.add_scalar('train/batch_size', curr_batch_size, params.batch_idx_train)
-                    tb_writer.add_scalar('train/memory_used', 
-                                       torch.cuda.max_memory_allocated() // 1024 // 1024,
-                                       params.batch_idx_train)
+                    
+                    # Add streaming specific metrics
+                    if not is_pre_training:
+                        tb_writer.add_scalar(
+                            'train/chunk_size',
+                            loss_info["chunk_size"],
+                            params.batch_idx_train
+                        )
+                        
+                        # Compare streaming vs non-streaming every 10 log intervals
+                        if batch_idx % (params.log_interval * 10) == 0:
+                            with torch.no_grad():
+                                # Get non-streaming output for comparison
+                                non_streaming_out, _ = model.encoder(
+                                    x=batch["inputs"].to(device),
+                                    x_lens=batch["supervisions"]["num_frames"].to(device),
+                                    is_pre_training=True
+                                )
+                                
+                                # Get streaming output
+                                streaming_out = process_streaming_chunks(
+                                    model=model,
+                                    feature=batch["inputs"].to(device),
+                                    chunk_size=params.chunk_sizes["320ms"],
+                                    attention_sink_size=params.attention_sink_size,
+                                    left_context_chunks=params.left_context_chunks
+                                )
+                                
+                                # Compare outputs
+                                output_diff = (streaming_out - non_streaming_out).abs()
+                                tb_writer.add_scalar(
+                                    'train/streaming_max_diff',
+                                    output_diff.max().item(),
+                                    params.batch_idx_train
+                                )
+                                tb_writer.add_scalar(
+                                    'train/streaming_mean_diff',
+                                    output_diff.mean().item(),
+                                    params.batch_idx_train
+                                )
                     
         except RuntimeError as e:
             if "out of memory" in str(e):
@@ -1345,6 +1447,12 @@ def train_one_epoch(
                     sp=sp
                 )
                 logging.info(f"Chunk size {name}: WER = {metrics['wer']:.2f}%")
+                if tb_writer is not None:
+                    tb_writer.add_scalar(
+                        f'eval/wer_{name}',
+                        metrics['wer'],
+                        params.batch_idx_train
+                    )
     
     save_checkpoint(
         params=params,

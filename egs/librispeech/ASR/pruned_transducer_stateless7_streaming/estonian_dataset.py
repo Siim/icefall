@@ -121,19 +121,18 @@ class EstonianASRDataset(Dataset):
             if waveform.size(0) > 1:
                 waveform = torch.mean(waveform, dim=0, keepdim=True)
             
-            # Process using HuggingFace processor (same as xl_exp.py)
-            input_values = self.processor(
-                waveform.squeeze().numpy(),
-                sampling_rate=16000,
-                return_tensors="pt"
-            ).input_values
+            # Instead of using the full processor which extracts features,
+            # we'll just normalize the raw waveform to the range [-1, 1]
+            # which is what the XLSR encoder expects
+            waveform = waveform.squeeze()  # Remove channel dimension if present
             
-            # Ensure we have a 2D tensor with shape (1, time) as expected by the encoder
-            if input_values.dim() == 3:  # If processor returns (batch, time, feature)
-                input_values = input_values.squeeze(-1)  # Remove feature dimension
-            if input_values.dim() == 1:  # If processor returns (time,)
-                input_values = input_values.unsqueeze(0)  # Add batch dimension
+            # Normalize audio to the range [-1, 1]
+            if waveform.abs().max() > 0:
+                waveform = waveform / waveform.abs().max()
                 
+            # Add batch dimension
+            input_values = waveform.unsqueeze(0)  # Shape: (1, time)
+            
             # Double check shape - should be (1, time)
             assert input_values.dim() == 2, f"Expected 2D tensor, got {input_values.shape}"
             
@@ -227,8 +226,8 @@ def collate_fn(batch: list, max_duration: float = 10.0) -> dict:
         waveform = item['inputs']  # shape: (1, time)
         pad_len = max_len - waveform.size(1)
         if pad_len > 0:
-            # Pad with zeros while keeping the channel dimension
-            pad = torch.zeros(1, pad_len, dtype=waveform.dtype)
+            # Pad with zeros while keeping the batch dimension
+            pad = torch.zeros(1, pad_len, dtype=waveform.dtype, device=waveform.device)
             waveform = torch.cat([waveform, pad], dim=1)
         padded_waveforms.append(waveform)
         

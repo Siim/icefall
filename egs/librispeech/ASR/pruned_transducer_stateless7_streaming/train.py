@@ -60,6 +60,7 @@ import sentencepiece as spm
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
+from torch.nn.utils import clip_grad_norm_
 from asr_datamodule import LibriSpeechAsrDataModule
 from decoder import Decoder
 from joiner import Joiner
@@ -1592,7 +1593,7 @@ def run(rank, world_size, args):
         optimizer,
         lr_batches=params.lr_batches,
         lr_epochs=params.lr_epochs,
-        custom_lr_func=lr_scheduler,
+        warmup_batches=params.warmup_steps,
     )
 
     if checkpoints and "optimizer" in checkpoints:

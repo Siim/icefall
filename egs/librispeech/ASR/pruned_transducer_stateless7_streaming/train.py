@@ -73,7 +73,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from zipformer import Zipformer
 from xlsr_encoder import XLSREncoder
-from transformers import Wav2Vec2ForCTC
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
 from icefall import diagnostics
 from icefall.checkpoint import load_checkpoint, remove_checkpoints
@@ -583,9 +583,20 @@ def get_params() -> AttributeDict:
 def get_encoder_model(params: AttributeDict) -> nn.Module:
     if getattr(params, 'use_xlsr', False):
         from xlsr_encoder import XLSREncoder
+        from transformers import Wav2Vec2Processor
+        
         # Use TalTechNLP's Estonian XLSR model
         model_name = "TalTechNLP/xls-r-300m-et"
         logging.info(f"Loading XLSR encoder: {model_name}")
+        
+        # Initialize processor and store in params
+        try:
+            processor = Wav2Vec2Processor.from_pretrained(model_name)
+            params.wav2vec2_processor = processor
+            logging.info("Successfully loaded XLSR processor")
+        except Exception as e:
+            logging.warning(f"Failed to load XLSR processor: {str(e)}")
+            params.wav2vec2_processor = None
         
         # Create XLSR encoder with streaming capabilities built-in
         encoder = XLSREncoder(
@@ -812,78 +823,78 @@ def compute_loss(
     
     # Compute with appropriate gradient context
     with torch.set_grad_enabled(is_training):
-        # Get encoder output
-        encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
-        
         # Use CTC loss for pre-training if in early epochs
         if params.cur_epoch <= params.ctc_epochs:
-            # Project encoder output to vocab size
-            if isinstance(model, DDP):
-                encoder_out = model.module.encoder_proj(encoder_out)
-            else:
-                encoder_out = model.encoder_proj(encoder_out)
-            logits = model.simple_am_proj(encoder_out)  # [B, T, V]
-            
-            # Ensure lengths are valid for CTC loss
-            encoder_out_lens = torch.clamp(encoder_out_lens, max=logits.size(1))
-            
-            # Compute CTC loss with proper log softmax
-            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-            
-            # Ensure proper tensor shapes for CTC loss
-            log_probs = log_probs.transpose(0, 1)  # (T, B, V)
-            targets = tokens
-            input_lengths = encoder_out_lens
-            target_lengths = token_lens
-            
-            # Compute CTC loss with proper blank handling
-            ctc_loss = torch.nn.functional.ctc_loss(
-                log_probs,
-                targets,
-                input_lengths,
-                target_lengths,
-                blank=params.blank_id,
-                reduction='sum',
-                zero_infinity=True
-            )
-            
-            # Use only CTC loss during pre-training
-            simple_loss = ctc_loss
-            pruned_loss = ctc_loss
-            
-            # Get CTC predictions for WER calculation
-            if not is_training:
-                # Get best path
-                pred_tokens = log_probs.argmax(dim=-1)  # [T, B]
-                pred_tokens = pred_tokens.transpose(0, 1)  # [B, T]
+            # Get CTC outputs directly from Wav2Vec2ForCTC
+            if isinstance(model.encoder.model, Wav2Vec2ForCTC):
+                # Create attention mask for proper padding
+                attention_mask = torch.ones_like(feature, dtype=torch.long)
+                for i in range(attention_mask.size(0)):
+                    attention_mask[i, feature_lens[i]:] = 0
                 
-                # Convert predictions to text, removing repeated tokens and blanks
-                hyp_texts = []
-                for i, length in enumerate(encoder_out_lens):
-                    # Get sequence without padding
-                    pred = pred_tokens[i, :length].tolist()
-                    
-                    # CTC decoding - remove repeated and blanks
-                    decoded = []
-                    prev = -1
-                    for token in pred:
-                        if token != params.blank_id and token != prev:
-                            decoded.append(token)
-                        prev = token
-                    
-                    # Convert to text
-                    text = sp.decode(decoded)
-                    hyp_texts.append(text)
+                # Forward through CTC model
+                outputs = model.encoder.model(
+                    feature,
+                    attention_mask=attention_mask,
+                    labels=tokens if is_training else None,  # Only provide labels during training
+                )
                 
-                # Calculate WER
-                total_words = sum(len(ref.split()) for ref in texts)
-                total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
-                                for hyp, ref in zip(hyp_texts, texts))
-                wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
+                if is_training:
+                    # During training, use the CTC loss computed by the model
+                    ctc_loss = outputs.loss
+                    simple_loss = ctc_loss
+                    pruned_loss = ctc_loss
+                    wer = 0.0  # Don't compute WER during training
+                else:
+                    # During validation, compute WER from logits
+                    logits = outputs.logits
+                    
+                    # Get predictions (batch_size, sequence_length)
+                    predictions = torch.argmax(logits, dim=-1)
+                    
+                    # Convert predictions to text for WER calculation
+                    hyp_texts = []
+                    for i, length in enumerate(feature_lens):
+                        # Get sequence without padding
+                        pred = predictions[i, :length].tolist()
+                        
+                        # CTC decoding - remove repeated and blanks
+                        decoded = []
+                        prev = -1
+                        for token in pred:
+                            if token != params.blank_id and token != prev:
+                                decoded.append(token)
+                            prev = token
+                        
+                        # Convert to text
+                        text = sp.decode(decoded)
+                        hyp_texts.append(text)
+                    
+                    # Calculate WER
+                    total_words = sum(len(ref.split()) for ref in texts)
+                    total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
+                                    for hyp, ref in zip(hyp_texts, texts))
+                    wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
+                    
+                    # Compute loss for validation metrics
+                    log_probs = torch.log_softmax(logits, dim=-1)
+                    ctc_loss = torch.nn.functional.ctc_loss(
+                        log_probs.transpose(0, 1),  # (T, B, V)
+                        tokens,
+                        feature_lens,
+                        token_lens,
+                        blank=params.blank_id,
+                        reduction='sum',
+                        zero_infinity=True
+                    )
+                    simple_loss = ctc_loss
+                    pruned_loss = ctc_loss
             else:
-                wer = 0.0  # Don't compute WER during training
+                raise ValueError("Encoder model must be Wav2Vec2ForCTC during pre-training epochs")
         else:
             # Use transducer loss after pre-training
+            encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
+            
             if isinstance(model, DDP):
                 encoder_out = model.module.encoder_proj(encoder_out)
             else:
@@ -941,17 +952,7 @@ def decode_one_batch_hyps(
     sp: spm.SentencePieceProcessor,
     batch: dict,
 ) -> Tuple[List[str], List[str]]:
-    """Get hypotheses and predictions for one batch.
-    
-    Args:
-        params: Model parameters
-        model: The model to use for decoding
-        sp: SentencePieceProcessor for converting ids to text
-        batch: A batch of data
-        
-    Returns:
-        (hyps, preds): Lists of ground truth and predicted texts
-    """
+    """Get hypotheses and predictions for one batch."""
     device = next(model.parameters()).device
     feature = batch["inputs"].to(device)
     supervisions = batch["supervisions"]
@@ -982,24 +983,30 @@ def decode_one_batch_hyps(
             # Project encoder output to vocab size
             logits = model.simple_am_proj(encoder_out)  # [B, T, V]
             
-            # Get CTC predictions
-            log_probs = torch.log_softmax(logits, dim=-1)
-            pred_tokens = log_probs.argmax(dim=-1)  # [B, T]
+            # Get CTC predictions with temperature scaling for sharper distribution
+            log_probs = torch.log_softmax(logits / 0.5, dim=-1)  # temperature = 0.5
+            
+            # Get top-k predictions for better decoding
+            topk_prob, topk_idx = torch.topk(log_probs, k=5, dim=-1)  # Get top 5 predictions
             
             # Convert predictions to text, removing repeated tokens and blanks
             hyp_tokens = []
-            for seq in pred_tokens:
-                # Remove padding
-                seq = seq[:encoder_out_lens[0]]
+            for b in range(log_probs.size(0)):
+                # Get sequence without padding
+                probs = topk_prob[b, :encoder_out_lens[b]]  # [T, K]
+                indices = topk_idx[b, :encoder_out_lens[b]]  # [T, K]
                 
-                # CTC decoding - remove repeated and blanks
+                # CTC decoding with confidence threshold
                 decoded = []
                 prev = -1
-                for t in seq:
-                    t = t.item()
-                    if t != params.blank_id and t != prev:
-                        decoded.append(t)
-                    prev = t
+                for t in range(probs.size(0)):
+                    # Only keep predictions with high confidence
+                    if probs[t, 0] > -1.0:  # log prob threshold
+                        token = indices[t, 0].item()
+                        if token != params.blank_id and token != prev:
+                            decoded.append(token)
+                            prev = token
+                
                 hyp_tokens.append(decoded)
         else:
             # Use transducer decoding after pre-training

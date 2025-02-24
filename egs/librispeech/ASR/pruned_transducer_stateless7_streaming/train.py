@@ -1348,6 +1348,7 @@ def train_one_epoch(
     train_dl: torch.utils.data.DataLoader,
     valid_dl: torch.utils.data.DataLoader,
     sp: spm.SentencePieceProcessor,
+    scaler: Optional[torch.amp.GradScaler],
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
     rank: int = 0,
@@ -1514,6 +1515,7 @@ def train_one_epoch(
         optimizer=optimizer,
         scheduler=scheduler,
         sampler=train_dl.sampler,
+        scaler=scaler,
         rank=rank,
     )
 
@@ -1710,6 +1712,7 @@ def run(rank, world_size, args):
             train_dl=train_dl,
             valid_dl=valid_dl,
             sp=sp,
+            scaler=scaler,
             tb_writer=tb_writer,
             world_size=world_size,
             rank=rank,

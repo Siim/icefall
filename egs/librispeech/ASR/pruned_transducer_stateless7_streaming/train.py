@@ -509,12 +509,29 @@ def get_parser():
         help="Weight for streaming regularization loss",
     )
 
+    parser.add_argument(
+        "--pretrain-epochs",
+        type=int,
+        default=5,
+        help="Number of epochs for pre-training phase with full-sequence processing."
+    )
+
+    parser.add_argument(
+        "--progressive-epochs",
+        type=int,
+        default=10,
+        help="Number of epochs for progressive training stage transitioning to streaming."
+    )
+
+    parser.add_argument(
+        "--streaming-epochs",
+        type=int,
+        default=15,
+        help="Number of epochs for fully streaming training phase."
+    )
+
     add_model_arguments(parser)
-    
-    # New arguments for progressive streaming adaptation
-    parser.add_argument("--progressive-streaming-epochs", type=int, default=3, help="Number of epochs for progressive streaming adaptation stage.")
-    parser.add_argument("--streaming-reg-weight", type=float, default=0.1, help="Weight for streaming regularization loss during progressive streaming stage.")
-    
+
     return parser
 
 
@@ -814,10 +831,13 @@ def compute_loss(
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
-    progressive_streaming_factor: float,
 ) -> Tuple[Tensor, MetricsTracker]:
     """
     Compute transducer loss given the model and batch.
+    Handles different training phases:
+    1. Pre-training: Full sequence processing
+    2. Progressive: Gradual transition to streaming with regularization
+    3. Streaming: Fully streaming inference
     """
     device = model.device if isinstance(model, DDP) else next(model.parameters()).device
     feature = batch["inputs"]
@@ -825,8 +845,6 @@ def compute_loss(
     
     # Get supervisions
     supervisions = batch["supervisions"]
-    
-    # Get feature lengths from supervisions
     feature_lens = supervisions["num_frames"].to(device)
     
     # Get supervision segments
@@ -844,83 +862,90 @@ def compute_loss(
         cached_tot_size=row_splits[-1].item()
     )
     
-    # Get total number of elements (using axis=1 for flattened size)
-    total_elements = shape.tot_size(1)  # Get total size along token dimension
+    # Get total number of elements
+    total_elements = shape.tot_size(1)
     
     # Ensure values tensor matches shape's elements
     values = tokens.flatten()[:total_elements].to(dtype=torch.int32)
     
     # Create RaggedTensor with proper shape and values
     ragged_y = k2.RaggedTensor(shape=shape, value=values)
-    
-    # Calculate loss with proper gradient context
-    if not is_training:
+
+    # Different processing based on training phase
+    if params.is_pre_training:
+        # Pre-training phase: Full sequence processing
+        encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
+        encoder_out = model.encoder_proj(encoder_out)
+        
+    elif params.is_progressive_training:
+        # Progressive training phase: Both full sequence and streaming with regularization
+        # Get full sequence output
         with torch.no_grad():
-            # Get encoder output for decoding
-            if isinstance(model, DDP):
-                encoder_out, encoder_out_lens = model.module.encoder(
-                    feature, 
-                    feature_lens,
-                    is_pre_training=params.is_pre_training
-                )
-                encoder_out = model.module.encoder_proj(encoder_out)
-            else:
-                encoder_out, encoder_out_lens = model.encoder(
-                    feature, 
-                    feature_lens,
-                    is_pre_training=params.is_pre_training
-                )
-                encoder_out = model.encoder_proj(encoder_out)
+            full_out, _ = model.encoder(feature, feature_lens)
+            full_out = model.encoder_proj(full_out)
+        
+        # Get streaming output
+        chunk_size = params.decode_chunk_size
+        overlap = chunk_size // 2
+        streaming_out = []
+        states = None
+        
+        for start in range(0, feature.size(1), chunk_size - overlap):
+            end = min(start + chunk_size, feature.size(1))
+            chunk = feature[:, start:end]
+            chunk_lens = torch.tensor([chunk.size(1)], device=device)
             
-            # Use greedy search batch for decoding
-            hyp_tokens = greedy_search_batch(
-                model=model,
-                encoder_out=encoder_out,
-                encoder_out_lens=encoder_out_lens,
+            # Process chunk
+            chunk_out, _, states = model.encoder.streaming_forward(chunk, chunk_lens, states)
+            chunk_out = model.encoder_proj(chunk_out)
+            streaming_out.append(chunk_out)
+        
+        # Concatenate streaming outputs
+        encoder_out = torch.cat(streaming_out, dim=1)
+        encoder_out_lens = feature_lens
+        
+        # Compute streaming regularization loss
+        if is_training:
+            # Only compute regularization during training
+            min_len = min(encoder_out.size(1), full_out.size(1))
+            streaming_reg_loss = torch.nn.functional.mse_loss(
+                encoder_out[:, :min_len],
+                full_out[:, :min_len]
             )
             
-            # Convert predictions to text
-            hyp_texts = []
-            for tokens in hyp_tokens:
-                if isinstance(tokens, torch.Tensor):
-                    tokens = tokens.tolist()
-                elif not isinstance(tokens, list):
-                    tokens = list(tokens)
-                text = sp.decode(tokens)
-                hyp_texts.append(text)
-            
-            # Compute WER
-            total_words = sum(len(ref.split()) for ref in texts)
-            total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
-                             for hyp, ref in zip(hyp_texts, texts))
-            wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
-            
-            # Compute loss
-            simple_loss, pruned_loss = model(
-                x=feature,
-                x_lens=feature_lens,
-                y=ragged_y,
-                prune_range=params.prune_range,
-                am_scale=params.am_scale,
-                lm_scale=params.lm_scale,
-            )
     else:
-        # During training, pass pre-training flag to model
-        if isinstance(model, DDP):
-            model.module.encoder.is_pre_training = params.is_pre_training
-        else:
-            model.encoder.is_pre_training = params.is_pre_training
+        # Fully streaming phase
+        chunk_size = params.decode_chunk_size
+        overlap = chunk_size // 2
+        streaming_out = []
+        states = None
+        
+        for start in range(0, feature.size(1), chunk_size - overlap):
+            end = min(start + chunk_size, feature.size(1))
+            chunk = feature[:, start:end]
+            chunk_lens = torch.tensor([chunk.size(1)], device=device)
             
-        simple_loss, pruned_loss = model(
-            x=feature,
-            x_lens=feature_lens,
-            y=ragged_y,
-            prune_range=params.prune_range,
-            am_scale=params.am_scale,
-            lm_scale=params.lm_scale,
-        )
-        wer = 0.0  # Do not compute WER during training
-    
+            # Process chunk
+            chunk_out, _, states = model.encoder.streaming_forward(chunk, chunk_lens, states)
+            chunk_out = model.encoder_proj(chunk_out)
+            streaming_out.append(chunk_out)
+        
+        encoder_out = torch.cat(streaming_out, dim=1)
+        encoder_out_lens = feature_lens
+
+    # Compute transducer loss
+    simple_loss, pruned_loss = model(
+        x=feature,
+        x_lens=feature_lens,
+        y=ragged_y,
+        prune_range=params.prune_range,
+        am_scale=params.am_scale,
+        lm_scale=params.lm_scale,
+        encoder_out=encoder_out,  # Pass pre-computed encoder output
+        encoder_out_lens=encoder_out_lens,
+    )
+
+    # Apply loss scaling
     s = params.simple_loss_scale
     simple_loss_scale = (
         s
@@ -943,6 +968,11 @@ def compute_loss(
     
     loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
     
+    # Add streaming regularization loss during progressive training
+    if params.is_progressive_training and is_training:
+        reg_weight = params.streaming_regularization
+        loss = loss + reg_weight * streaming_reg_loss
+    
     assert loss.requires_grad == is_training
     
     info = MetricsTracker()
@@ -953,34 +983,36 @@ def compute_loss(
     info["loss"] = loss.detach().cpu().item()
     info["simple_loss"] = simple_loss.detach().cpu().item()
     info["pruned_loss"] = pruned_loss.detach().cpu().item()
-    info["wer"] = wer
     
-    if progressive_streaming_factor > 0:
-        # Add streaming regularization loss
-        # Assuming batch contains 'speech' and 'speech_lengths'
-        speech = batch["speech"]
-        speech_lengths = batch["speech_lengths"]
-
-        # Get full-sequence encoder outputs (pre-training mode)
-        full_encoder_out, _ = model.encoder(speech, speech_lengths, is_pre_training=True)
+    if params.is_progressive_training and is_training:
+        info["streaming_reg_loss"] = streaming_reg_loss.detach().cpu().item()
+    
+    # Compute WER during validation
+    if not is_training:
+        # Use greedy search batch for decoding
+        hyp_tokens = greedy_search_batch(
+            model=model,
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens,
+        )
         
-        # Get streaming encoder outputs
-        stream_encoder_out, _ = model.encoder(speech, speech_lengths, is_pre_training=False)
+        # Convert predictions to text
+        hyp_texts = []
+        for tokens in hyp_tokens:
+            if isinstance(tokens, torch.Tensor):
+                tokens = tokens.tolist()
+            elif not isinstance(tokens, list):
+                tokens = list(tokens)
+            text = sp.decode(tokens)
+            hyp_texts.append(text)
         
-        # Compute L2 (MSE) loss between full and streaming outputs
-        reg_loss = torch.nn.functional.mse_loss(full_encoder_out, stream_encoder_out)
-        
-        # Scale the streaming regularization loss
-        scaled_reg_loss = reg_loss * params.streaming_reg_weight * progressive_streaming_factor
-        
-        # Add the streaming regularization loss to the original loss
-        loss = loss + scaled_reg_loss
-        
-        # Log the streaming regularization loss
-        info["streaming_reg_loss"] = scaled_reg_loss.item()
-    else:
-        info["streaming_reg_loss"] = 0.0
-
+        # Compute WER
+        total_words = sum(len(ref.split()) for ref in texts)
+        total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
+                          for hyp, ref in zip(hyp_texts, texts))
+        wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
+        info["wer"] = wer
+    
     return loss, info
 
 
@@ -1082,7 +1114,6 @@ def compute_validation_loss(
             sp=sp,
             batch=batch,
             is_training=False,
-            progressive_streaming_factor=1.0,
         )
         assert loss.requires_grad is False
         tot_loss = tot_loss + loss_info
@@ -1129,30 +1160,29 @@ def train_one_epoch(
     """Train the model for one epoch."""
     model.train()
 
-    # Set learning rate based on training phase
-    if params.is_pre_training:
+    # Adjust learning rate and training phase based on current epoch
+    if params.cur_epoch <= params.pretrain_epochs:
+        params.is_pre_training = True
         for param_group in optimizer.param_groups:
             param_group['lr'] = params.pre_train_lr
         logging.info(f"Pre-training phase (Epoch {params.cur_epoch}), lr={params.pre_train_lr}")
-    
-    # Check if we should switch from pre-training to streaming
-    if params.cur_epoch >= params.streaming_start_epoch and params.is_pre_training:
+
+    elif params.pretrain_epochs < params.cur_epoch <= params.pretrain_epochs + params.progressive_epochs:
         params.is_pre_training = False
-        logging.info("Switching from pre-training to streaming phase")
-        # Reset best metrics for streaming phase
+        params.is_progressive_training = True
+        logging.info(f"Progressive training phase (Epoch {params.cur_epoch})")
+
+    else:
+        params.is_pre_training = False
+        params.is_progressive_training = False
+        logging.info(f"Fully streaming training phase (Epoch {params.cur_epoch})")
+
+    # Reset best metrics when transitioning to a new phase
+    if params.cur_epoch == params.pretrain_epochs + 1 or params.cur_epoch == params.pretrain_epochs + params.progressive_epochs + 1:
         params.best_train_loss = float("inf")
         params.best_valid_loss = float("inf")
         params.best_train_epoch = -1
         params.best_valid_epoch = -1
-
-    # Calculate progressive streaming factor based on epoch
-    pretrain_epochs = getattr(params, "pre_train_epochs", 5)
-    if params.cur_epoch < pretrain_epochs:
-        progressive_streaming_factor = 0.0
-    elif params.cur_epoch < pretrain_epochs + params.progressive_streaming_epochs:
-        progressive_streaming_factor = (params.cur_epoch - pretrain_epochs + 1) / params.progressive_streaming_epochs
-    else:
-        progressive_streaming_factor = 1.0
 
     tot_loss = MetricsTracker()
 
@@ -1168,7 +1198,6 @@ def train_one_epoch(
                     sp=sp,
                     batch=batch,
                     is_training=True,
-                    progressive_streaming_factor=progressive_streaming_factor,
                 )
             # summary stats
             tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
@@ -1275,6 +1304,13 @@ def train_one_epoch(
     if params.train_loss < params.best_train_loss:
         params.best_train_epoch = params.cur_epoch
         params.best_train_loss = params.train_loss
+
+    # Implement progressive training logic
+    if params.is_progressive_training:
+        # Example: Adjust loss computation or add regularization
+        # This is a placeholder for any specific logic needed during progressive training
+        logging.info("Applying progressive training adjustments")
+        # Add any specific logic for progressive training here
 
 
 def run(rank, world_size, args):
@@ -1542,7 +1578,6 @@ def scan_pessimistic_batches_for_oom(
                     sp=sp,
                     batch=batch,
                     is_training=True,
-                    progressive_streaming_factor=1.0,
                 )
             loss.backward()
             optimizer.zero_grad()

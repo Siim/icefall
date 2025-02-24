@@ -49,6 +49,7 @@ import logging
 import warnings
 import editdistance
 import math
+import time
 from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, Optional, Tuple, Union, List
@@ -1118,6 +1119,43 @@ def compute_loss(
     return loss, info
 
 
+def compute_loss_with_amp(
+    params: AttributeDict,
+    model: nn.Module,
+    sp: spm.SentencePieceProcessor,
+    batch: dict,
+    is_training: bool,
+    scaler: GradScaler,
+    is_pre_training: bool = True,
+    chunk_size: Optional[int] = None,
+) -> Tuple[torch.Tensor, MetricsTracker]:
+    """Compute loss with automatic mixed precision.
+    
+    Args:
+        Same as compute_loss with additional scaler
+        
+    Returns:
+        Same as compute_loss
+    """
+    with torch.cuda.amp.autocast(enabled=params.use_fp16):
+        loss, info = compute_loss(
+            params=params,
+            model=model,
+            sp=sp,
+            batch=batch,
+            is_training=is_training,
+            is_pre_training=is_pre_training,
+            chunk_size=chunk_size
+        )
+    
+    # Scale loss for mixed precision training
+    if is_training and params.use_fp16:
+        scaled_loss = scaler.scale(loss)
+        return scaled_loss, info
+    
+    return loss, info
+
+
 def decode_one_batch_hyps(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
@@ -1381,6 +1419,7 @@ def train_one_epoch(
                         
                         # Compare streaming vs non-streaming every 10 log intervals
                         if batch_idx % (params.log_interval * 10) == 0:
+                            device = next(model.parameters()).device
                             with torch.no_grad():
                                 # Get non-streaming output for comparison
                                 non_streaming_out, _ = model.encoder(
@@ -1756,6 +1795,78 @@ def scan_pessimistic_batches_for_oom(
         logging.info(
             f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
         )
+
+
+def reduce_metrics(metrics: Dict[str, float], device: torch.device) -> Dict[str, float]:
+    """Reduce metrics across distributed processes.
+    
+    Args:
+        metrics: Dictionary of metrics to reduce
+        device: Device to perform reduction on
+        
+    Returns:
+        Reduced metrics dictionary
+    """
+    if torch.distributed.is_initialized():
+        reduced_metrics = {}
+        for k, v in metrics.items():
+            tensor = torch.tensor([v], device=device)
+            torch.distributed.all_reduce(tensor)
+            reduced_metrics[k] = tensor.item() / torch.distributed.get_world_size()
+        return reduced_metrics
+    return metrics
+
+
+def find_optimal_chunk_size(
+    params: AttributeDict,
+    model: nn.Module,
+    valid_dl: torch.utils.data.DataLoader,
+    sp: spm.SentencePieceProcessor,
+) -> int:
+    """Benchmarks different chunk sizes and returns optimal one.
+    
+    Args:
+        params: Model parameters
+        model: The model to test
+        valid_dl: Validation dataloader
+        sp: Sentence piece processor
+        
+    Returns:
+        Optimal chunk size in samples
+    """
+    logging.info("Benchmarking chunk sizes to find optimal configuration...")
+    results = {}
+    
+    # Test a range of chunk sizes
+    for name, size in params.chunk_sizes.items():
+        start_time = time.time()
+        metrics = evaluate_streaming(
+            params=params,
+            model=model,
+            valid_dl=valid_dl,
+            chunk_size=size,
+            sp=sp
+        )
+        elapsed = time.time() - start_time
+        
+        # Calculate efficiency score (lower WER and latency is better)
+        efficiency = metrics["wer"] * (metrics["latency"] ** 0.5)
+        results[name] = {
+            "wer": metrics["wer"],
+            "latency": metrics["latency"],
+            "efficiency": efficiency,
+            "size": size
+        }
+        
+        logging.info(f"Chunk size {name}: WER={metrics['wer']:.2f}%, "
+                     f"Latency={metrics['latency']:.3f}s, "
+                     f"Efficiency={efficiency:.3f}")
+    
+    # Find most efficient configuration
+    optimal = min(results.items(), key=lambda x: x[1]["efficiency"])
+    logging.info(f"Optimal chunk size: {optimal[0]} with efficiency {optimal[1]['efficiency']:.3f}")
+    
+    return optimal[1]["size"]
 
 
 def main():

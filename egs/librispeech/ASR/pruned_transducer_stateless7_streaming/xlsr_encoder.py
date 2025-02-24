@@ -71,7 +71,11 @@ class XLSREncoder(EncoderInterface):
             self.model = model
         elif model_name is not None:
             from transformers import Wav2Vec2Model
-            self.model = Wav2Vec2Model.from_pretrained(model_name)
+            try:
+                self.model = Wav2Vec2Model.from_pretrained(model_name)
+                logging.info(f"Successfully loaded XLSR model from {model_name}")
+            except Exception as e:
+                raise ValueError(f"Failed to load XLSR model from {model_name}: {str(e)}")
         else:
             raise ValueError("Either model_name or model must be provided")
         

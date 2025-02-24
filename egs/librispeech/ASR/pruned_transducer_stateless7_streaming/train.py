@@ -581,61 +581,24 @@ def get_params() -> AttributeDict:
 
 def get_encoder_model(params: AttributeDict) -> nn.Module:
     if getattr(params, 'use_xlsr', False):
-        from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
-        # First try to load Estonian-specific model and processor
-        model_names = [
-            "TalTechNLP/xls-r-300m-et",  # TalTechNLP Estonian XLSR
-            "tartuNLP/wav2vec2-large-xls-r-300m-et",  # Estonian from TartuNLP
-            "tartuNLP/wav2vec2-large-xls-r-300m-v2-et",  # Another Estonian variant
-            "facebook/wav2vec2-xls-r-300m",  # Base multilingual
-        ]
+        from xlsr_encoder import XLSREncoder
+        # Use TalTechNLP's Estonian XLSR model
+        model_name = "TalTechNLP/xls-r-300m-et"
+        logging.info(f"Loading XLSR encoder: {model_name}")
         
-        for model_name in model_names:
-            try:
-                # Create processor and store it in params for later use
-                params.wav2vec2_processor = Wav2Vec2Processor.from_pretrained(model_name)
-                logging.info(f"Successfully loaded processor from {model_name}")
-                
-                # Create XLSR encoder with CTC head for pre-training
-                if params.cur_epoch <= params.ctc_epochs:
-                    # During CTC pre-training, use Wav2Vec2ForCTC
-                    base_model = Wav2Vec2ForCTC.from_pretrained(model_name)
-                    encoder = XLSREncoder(
-                        model=base_model,
-                        decode_chunk_size=params.decode_chunk_size,
-                        chunk_overlap=params.decode_chunk_size // 2,
-                        use_attention_sink=True,
-                        attention_sink_size=params.attention_sink_size,
-                        frame_duration=params.frame_duration,
-                        frame_stride=params.frame_stride,
-                        min_chunk_size=2560,   # 160ms at 16kHz
-                        max_chunk_size=20480,  # 1280ms at 16kHz
-                        left_context_chunks=params.left_context_chunks
-                    )
-                else:
-                    # After CTC pre-training, use base model without CTC head
-                    encoder = XLSREncoder(
-                        model_name=model_name,
-                        decode_chunk_size=params.decode_chunk_size,
-                        chunk_overlap=params.decode_chunk_size // 2,
-                        use_attention_sink=True,
-                        attention_sink_size=params.attention_sink_size,
-                        frame_duration=params.frame_duration,
-                        frame_stride=params.frame_stride,
-                        min_chunk_size=2560,
-                        max_chunk_size=20480,
-                        left_context_chunks=params.left_context_chunks
-                    )
-                logging.info(f"Successfully loaded XLSR encoder from {model_name}")
-                break
-            except Exception as e:
-                logging.warning(f"Could not load {model_name}: {str(e)}")
-                continue
-        else:
-            raise ValueError("Could not load any pre-trained XLSR model")
-            
-        # Verify the encoder is properly initialized
-        assert isinstance(encoder, XLSREncoder), f"Expected XLSREncoder, got {type(encoder)}"
+        # Create XLSR encoder with streaming capabilities built-in
+        encoder = XLSREncoder(
+            model_name=model_name,
+            decode_chunk_size=params.decode_chunk_len,  # Now using decode_chunk_size consistently
+            chunk_overlap=params.decode_chunk_len // 2,
+            use_attention_sink=True,
+            attention_sink_size=16,  # Paper's optimal setting
+            frame_duration=0.025,  # 25ms per frame
+            frame_stride=0.020,  # 20ms stride
+            min_chunk_size=2560,  # 160ms at 16kHz
+            max_chunk_size=20480,  # 1280ms at 16kHz
+            left_context_chunks=1  # Paper's optimal setting
+        )
         return encoder
     else:
         # Original Zipformer code...

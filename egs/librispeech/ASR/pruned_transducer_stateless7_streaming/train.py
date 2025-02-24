@@ -1128,7 +1128,7 @@ def compute_loss_with_amp(
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
-    scaler: GradScaler,
+    scaler: Optional[torch.amp.GradScaler],
     is_pre_training: bool = True,
     chunk_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, MetricsTracker]:
@@ -1152,9 +1152,8 @@ def compute_loss_with_amp(
         )
     
     # Scale loss for mixed precision training
-    if is_training and params.use_fp16:
-        scaled_loss = scaler.scale(loss)
-        return scaled_loss, info
+    if is_training and params.use_fp16 and scaler is not None:
+        return loss, info  # Return unscaled loss - scaler.scale will be applied in training loop
     
     return loss, info
 
@@ -1386,19 +1385,28 @@ def train_one_epoch(
             params.batch_idx_train += 1
             optimizer.zero_grad()
             
-            loss, loss_info = compute_loss(
+            # Use compute_loss_with_amp for proper fp16 handling
+            loss, loss_info = compute_loss_with_amp(
                 params=params,
                 model=model,
                 sp=sp,
                 batch=batch,
                 is_training=True,
-                is_pre_training=is_pre_training
+                is_pre_training=is_pre_training,
+                scaler=scaler
             )
             
-            loss.backward()
-            clip_grad_norm_(model.parameters(), 5.0, 2.0)
-            optimizer.step()
-            scheduler.step()
+            # Handle FP16 training with scaler
+            if params.use_fp16 and scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                clip_grad_norm_(model.parameters(), 5.0, 2.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                clip_grad_norm_(model.parameters(), 5.0, 2.0)
+                optimizer.step()
             
             tot_loss = tot_loss + loss_info
             
@@ -1676,7 +1684,8 @@ def run(rank, world_size, args):
             params=params,
         )
 
-    scaler = GradScaler(enabled=params.use_fp16, init_scale=1.0)
+    # Update to use new GradScaler API
+    scaler = torch.amp.GradScaler('cuda', enabled=params.use_fp16, init_scale=1.0) if params.use_fp16 else None
     if checkpoints and "grad_scaler" in checkpoints:
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])

@@ -9,6 +9,7 @@ import numpy as np
 from typing import Optional, List, Tuple
 from icefall.utils import make_pad_mask
 import math
+from transformers import Wav2Vec2Model, Wav2Vec2ForCTC
 
 class EncoderInterface(nn.Module):
     """Interface for encoders used in transducer models"""
@@ -429,17 +430,30 @@ class XLSREncoder(EncoderInterface):
             
         else:
             # Non-streaming forward pass
+            # Ensure input is float and in correct shape
+            x = x.float()
+            if x.ndim == 3:  # (batch, time, channel)
+                x = x.squeeze(-1)
+            
+            # Create attention mask
+            attention_mask = torch.ones_like(x, dtype=torch.long)
+            for i in range(batch_size):
+                attention_mask[i, x_lens[i]:] = 0
+            
+            # Forward through XLSR model
             if isinstance(self.model, Wav2Vec2ForCTC):
-                encoder_out = self.model(
+                outputs = self.model(
                     x,
-                    attention_mask=torch.ones_like(x),
+                    attention_mask=attention_mask,
                     output_hidden_states=True
-                ).hidden_states[-1]
+                )
+                encoder_out = outputs.hidden_states[-1]
             else:
-                encoder_out = self.model(
+                outputs = self.model(
                     x,
-                    attention_mask=torch.ones_like(x)
-                ).last_hidden_state
+                    attention_mask=attention_mask
+                )
+                encoder_out = outputs.last_hidden_state
             
             # Add attention sink if enabled
             if self.use_attention_sink:

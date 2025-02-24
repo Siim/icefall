@@ -868,13 +868,18 @@ def compute_loss(
                 else:
                     logits = model.simple_am_proj(outputs.hidden_states[-1])
                 
+                # Calculate output lengths after XLSR's downsampling
+                xlsr_downsample = 320  # XLSR/wav2vec2 downsampling factor
+                output_lens = torch.div(feature_lens, xlsr_downsample, rounding_mode='floor')
+                output_lens = torch.maximum(output_lens, torch.ones_like(output_lens))  # Ensure at least 1 frame
+                
                 if is_training:
                     # During training, compute CTC loss
                     log_probs = torch.log_softmax(logits, dim=-1)
                     ctc_loss = torch.nn.functional.ctc_loss(
                         log_probs.transpose(0, 1),  # (T, B, V)
                         tokens,
-                        feature_lens,
+                        output_lens,  # Use downsampled lengths
                         token_lens,
                         blank=params.blank_id,
                         reduction='sum',
@@ -891,7 +896,7 @@ def compute_loss(
                         
                         # Convert predictions to text for WER calculation
                         hyp_texts = []
-                        for i, length in enumerate(feature_lens):
+                        for i, length in enumerate(output_lens):  # Use downsampled lengths
                             # Get sequence without padding
                             pred = predictions[i, :length].tolist()
                             
@@ -918,7 +923,7 @@ def compute_loss(
                         ctc_loss = torch.nn.functional.ctc_loss(
                             log_probs.transpose(0, 1),  # (T, B, V)
                             tokens,
-                            feature_lens,
+                            output_lens,  # Use downsampled lengths
                             token_lens,
                             blank=params.blank_id,
                             reduction='sum',

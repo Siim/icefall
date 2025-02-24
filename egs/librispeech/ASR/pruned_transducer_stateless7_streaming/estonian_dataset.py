@@ -22,7 +22,7 @@ class EstonianASRDataset(Dataset):
         
         # Duration limits (in samples at 16kHz)
         self.min_samples = 16000  # 1 sec minimum
-        self.max_samples = 320000  # 20 sec maximum
+        self.max_samples = 160000  # 10 sec maximum
         
         # Add logging
         self.logger = logging.getLogger(__name__)

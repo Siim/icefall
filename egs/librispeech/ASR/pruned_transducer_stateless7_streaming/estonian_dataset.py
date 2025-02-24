@@ -126,18 +126,27 @@ class EstonianASRDataset(Dataset):
                 waveform.squeeze().numpy(),
                 sampling_rate=16000,
                 return_tensors="pt"
-            ).input_values.squeeze(0)  # Remove batch dimension from processor
+            ).input_values
+            
+            # Ensure we have a 2D tensor with shape (1, time) as expected by the encoder
+            if input_values.dim() == 3:  # If processor returns (batch, time, feature)
+                input_values = input_values.squeeze(-1)  # Remove feature dimension
+            if input_values.dim() == 1:  # If processor returns (time,)
+                input_values = input_values.unsqueeze(0)  # Add batch dimension
+                
+            # Double check shape - should be (1, time)
+            assert input_values.dim() == 2, f"Expected 2D tensor, got {input_values.shape}"
             
             # Double check length constraints with some margin for resampling
             margin = 100  # Small safety margin
-            if input_values.size(0) < self.min_samples - margin:
-                raise ValueError(f"Audio too short after processing: {input_values.size(0)} samples")
-            if input_values.size(0) > self.max_samples + margin:
-                raise ValueError(f"Audio too long after processing: {input_values.size(0)} samples")
+            if input_values.size(1) < self.min_samples - margin:
+                raise ValueError(f"Audio too short after processing: {input_values.size(1)} samples")
+            if input_values.size(1) > self.max_samples + margin:
+                raise ValueError(f"Audio too long after processing: {input_values.size(1)} samples")
             
             # Validate audio duration vs text length
             min_chars_per_second = 3  # Estonian ~4.5 chars/sec avg
-            audio_duration = input_values.size(0) / 16000
+            audio_duration = input_values.size(1) / 16000
             if len(transcript) / audio_duration < min_chars_per_second:
                 self.logger.warning(f"Suspicious sample {wav_path} - {len(transcript)} chars in {audio_duration:.1f}s")
             
@@ -146,9 +155,9 @@ class EstonianASRDataset(Dataset):
             
             # Return a dictionary with processed input values
             return {
-                'inputs': input_values.unsqueeze(0),  # Add channel dimension to make (1, time)
+                'inputs': input_values,  # Already has shape (1, time)
                 'supervisions': {
-                    'num_frames': input_values.size(0),
+                    'num_frames': input_values.size(1),
                     'text': transcript,
                     'audio_paths': wav_path,
                     'tokens': tokens_tensor,
@@ -253,7 +262,6 @@ def collate_fn(batch: list, max_duration: float = 10.0) -> dict:
     
     # Stack to get tensors
     inputs = torch.cat(padded_waveforms, dim=0)  # (batch, time)
-    inputs = inputs.unsqueeze(-1)  # Add channel dimension at the end
     tokens = torch.stack(padded_tokens)  # (batch, max_token_len)
     token_lens = torch.cat(token_lens)  # (batch,)
     

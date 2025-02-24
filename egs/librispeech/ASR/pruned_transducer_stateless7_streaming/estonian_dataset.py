@@ -28,10 +28,6 @@ class EstonianASRDataset(Dataset):
         # Add logging
         self.logger = logging.getLogger(__name__)
         
-        # Initialize processor
-        from transformers import Wav2Vec2Processor
-        self.processor = Wav2Vec2Processor.from_pretrained("TalTechNLP/xls-r-300m-et")
-        
         # Ensure base_path ends with a slash if provided
         if base_path:
             base_path = os.path.join(base_path, '')
@@ -121,17 +117,13 @@ class EstonianASRDataset(Dataset):
             if waveform.size(0) > 1:
                 waveform = torch.mean(waveform, dim=0, keepdim=True)
             
-            # Instead of using the full processor which extracts features,
-            # we'll just normalize the raw waveform to the range [-1, 1]
-            # which is what the XLSR encoder expects
-            waveform = waveform.squeeze()  # Remove channel dimension if present
-            
-            # Normalize audio to the range [-1, 1]
+            # Paper's approach: normalize raw waveform to [-1, 1]
+            waveform = waveform.squeeze()  # Remove channel dimension
             if waveform.abs().max() > 0:
                 waveform = waveform / waveform.abs().max()
-                
-            # Add batch dimension
-            input_values = waveform.unsqueeze(0)  # Shape: (1, time)
+            
+            # Add batch dimension to get shape (1, time)
+            input_values = waveform.unsqueeze(0)
             
             # Double check shape - should be (1, time)
             assert input_values.dim() == 2, f"Expected 2D tensor, got {input_values.shape}"
@@ -154,9 +146,9 @@ class EstonianASRDataset(Dataset):
             
             # Return a dictionary with processed input values
             return {
-                'inputs': input_values,  # Already has shape (1, time)
+                'inputs': input_values,  # Shape: (1, time)
                 'supervisions': {
-                    'num_frames': input_values.size(1),
+                    'num_frames': input_values.size(1),  # Use raw audio length
                     'text': transcript,
                     'audio_paths': wav_path,
                     'tokens': tokens_tensor,
@@ -222,7 +214,7 @@ def collate_fn(batch: list, max_duration: float = 10.0) -> dict:
     audio_paths = []
     
     for item in filtered_batch:
-        # Handle waveform padding
+        # Handle waveform padding - raw audio should be shape (1, time)
         waveform = item['inputs']  # shape: (1, time)
         pad_len = max_len - waveform.size(1)
         if pad_len > 0:
@@ -233,23 +225,22 @@ def collate_fn(batch: list, max_duration: float = 10.0) -> dict:
         
         # Handle token padding
         tokens = item['supervisions']['tokens']
-        # Fix: Handle tensors properly without using len() on potential scalar tensors
         if isinstance(tokens, torch.Tensor):
             if tokens.dim() == 0:  # Scalar tensor
-                # Convert scalar to a 1D tensor with a single element
                 tokens = tokens.unsqueeze(0)
                 token_len = 1
             else:
                 token_len = tokens.size(0)
         else:
             token_len = len(tokens)
+            tokens = torch.tensor(tokens)
         
         # Calculate how much padding we need to add
         token_pad_len = max_token_len - token_len
         
         if token_pad_len > 0:
             # Pad with zeros
-            token_pad = torch.zeros(token_pad_len, dtype=tokens.dtype)
+            token_pad = torch.zeros(token_pad_len, dtype=tokens.dtype, device=tokens.device)
             tokens = torch.cat([tokens, token_pad])
         padded_tokens.append(tokens)
         
@@ -259,7 +250,7 @@ def collate_fn(batch: list, max_duration: float = 10.0) -> dict:
         texts.append(item['supervisions']['text'])
         audio_paths.append(item['supervisions']['audio_paths'])
     
-    # Stack to get tensors
+    # Stack to get tensors - for raw audio, shape should be (batch, time)
     inputs = torch.cat(padded_waveforms, dim=0)  # (batch, time)
     tokens = torch.stack(padded_tokens)  # (batch, max_token_len)
     token_lens = torch.cat(token_lens)  # (batch,)

@@ -933,17 +933,12 @@ def decode_one_batch_hyps(
     sp: spm.SentencePieceProcessor,
     batch: dict,
 ) -> Tuple[List[str], List[str]]:
-    """Decode one batch and return hypotheses and predictions.
+    """Decode one batch and return hypotheses and predictions."""
+    if isinstance(model, DDP):
+        device = model.module.encoder.model.device
+    else:
+        device = next(model.parameters()).device
     
-    Args:
-        params: Model params
-        model: The model to use for decoding
-        sp: Sentence piece model
-        batch: A batch of data
-    Returns:
-        (hyps, preds): Lists of hypothesis and prediction strings
-    """
-    device = model.device if isinstance(model, nn.Module) else model.module.device
     feature = batch["inputs"].to(device)
     supervisions = batch["supervisions"]
     feature_lens = supervisions["num_frames"].to(device)

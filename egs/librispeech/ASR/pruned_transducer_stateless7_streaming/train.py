@@ -1134,10 +1134,7 @@ def train_one_epoch(
                     "train/learning_rate", cur_lr, params.batch_idx_train
                 )
 
-                loss_info = MetricsTracker()
-                loss_info["loss"] = loss.detach().item()
-                loss_info["simple_loss"] = simple_loss.detach().item()
-                loss_info["pruned_loss"] = pruned_loss.detach().item()
+                # Write all loss components to tensorboard
                 for k, v in loss_info.items():
                     tb_writer.add_scalar(f"train/{k}", v, params.batch_idx_train)
 
@@ -1314,7 +1311,7 @@ def run(rank, world_size, args):
             valid_cuts += librispeech.dev_other_cuts()
         valid_dl = librispeech.valid_dataloaders(valid_cuts)
 
-    scaler = GradScaler(enabled=params.use_fp16, init_scale=1.0)
+    scaler = torch.amp.GradScaler(device_type='cuda', enabled=params.use_fp16, init_scale=1.0)
     if checkpoints and "grad_scaler" in checkpoints:
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])

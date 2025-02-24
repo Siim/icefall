@@ -858,6 +858,17 @@ def compute_loss(
                 # Project encoder output to vocab size
                 logits = model.simple_am_proj(encoder_out)  # [B, T, V]
                 
+                # Ensure lengths are valid for CTC loss
+                max_out_len = encoder_out_lens.max().item()
+                max_target_len = token_lens.max().item()
+                
+                # CTC requirement: T ≥ U (output length must be greater than target length)
+                if max_out_len < max_target_len:
+                    # Pad encoder output if needed
+                    pad_amount = max_target_len - max_out_len + 1
+                    logits = torch.nn.functional.pad(logits, (0, 0, 0, pad_amount), mode='replicate')
+                    encoder_out_lens = encoder_out_lens + pad_amount
+                
                 # Compute CTC loss
                 log_probs = torch.log_softmax(logits, dim=-1)
                 ctc_loss = torch.nn.functional.ctc_loss(
@@ -918,6 +929,17 @@ def compute_loss(
         if params.cur_epoch <= params.ctc_epochs:
             # Project encoder output to vocab size
             logits = model.simple_am_proj(encoder_out)  # [B, T, V]
+            
+            # Ensure lengths are valid for CTC loss
+            max_out_len = encoder_out_lens.max().item()
+            max_target_len = token_lens.max().item()
+            
+            # CTC requirement: T ≥ U (output length must be greater than target length)
+            if max_out_len < max_target_len:
+                # Pad encoder output if needed
+                pad_amount = max_target_len - max_out_len + 1
+                logits = torch.nn.functional.pad(logits, (0, 0, 0, pad_amount), mode='replicate')
+                encoder_out_lens = encoder_out_lens + pad_amount
             
             # Compute CTC loss
             log_probs = torch.log_softmax(logits, dim=-1)

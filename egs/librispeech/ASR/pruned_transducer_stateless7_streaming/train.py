@@ -1032,51 +1032,53 @@ def decode_one_batch_hyps(
             encoder_out = outputs.hidden_states[-1]
             encoder_out_lens = torch.div(feature_lens_pad, 320, rounding_mode='floor')  # XLSR downsample factor
             encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
-        else:
-            # Regular encoder forward pass
-            encoder_out, encoder_out_lens = model.encoder(feature_pad, feature_lens_pad)
-        
-        # Project encoder output
-        if isinstance(model, DDP):
-            encoder_out = model.module.encoder_proj(encoder_out)
-        else:
-            encoder_out = model.encoder_proj(encoder_out)
             
-        # Use CTC decoding during pre-training epochs
-        if params.cur_epoch <= params.ctc_epochs:
-            # Project encoder output to vocab size
+            # Project to vocab size
             if isinstance(model, DDP):
                 logits = model.module.simple_am_proj(encoder_out)  # [B, T, V]
             else:
                 logits = model.simple_am_proj(encoder_out)  # [B, T, V]
             
-            # Get CTC predictions with temperature scaling for sharper distribution
-            log_probs = torch.log_softmax(logits / 0.5, dim=-1)  # temperature = 0.5
+            # Get CTC predictions
+            log_probs = torch.log_softmax(logits, dim=-1)
             
-            # Get top-k predictions for better decoding
-            topk_prob, topk_idx = torch.topk(log_probs, k=5, dim=-1)  # Get top 5 predictions
-            
-            # Convert predictions to text, removing repeated tokens and blanks
+            # Decode each sequence in batch
             hyp_tokens = []
             for b in range(log_probs.size(0)):
                 # Get sequence without padding
-                probs = topk_prob[b, :encoder_out_lens[b]]  # [T, K]
-                indices = topk_idx[b, :encoder_out_lens[b]]  # [T, K]
+                sequence_log_probs = log_probs[b, :encoder_out_lens[b]]  # [T, V]
                 
-                # CTC decoding with confidence threshold
+                # Get best path
+                best_path = torch.argmax(sequence_log_probs, dim=-1)  # [T]
+                
+                # CTC decoding - collapse repeated tokens and remove blanks
                 decoded = []
                 prev = -1
-                for t in range(probs.size(0)):
-                    # Only keep predictions with high confidence
-                    if probs[t, 0] > -1.0:  # log prob threshold
-                        token = indices[t, 0].item()
-                        if token != params.blank_id and token != prev:
-                            decoded.append(token)
-                            prev = token
+                for token in best_path:
+                    token = token.item()
+                    if token != params.blank_id and token != prev:
+                        decoded.append(token)
+                    prev = token
                 
                 hyp_tokens.append(decoded)
+                
+                # Debug logging
+                if b == 0:  # Log first sequence in batch
+                    logging.debug(f"Sequence {b} length: {encoder_out_lens[b]}")
+                    logging.debug(f"Raw best path: {best_path[:10].tolist()}")  # First 10 tokens
+                    logging.debug(f"Decoded tokens: {decoded[:10]}")  # First 10 decoded tokens
+                    
         else:
-            # Use transducer decoding after pre-training
+            # Regular encoder forward pass
+            encoder_out, encoder_out_lens = model.encoder(feature_pad, feature_lens_pad)
+            
+            # Project encoder output
+            if isinstance(model, DDP):
+                encoder_out = model.module.encoder_proj(encoder_out)
+            else:
+                encoder_out = model.encoder_proj(encoder_out)
+            
+            # Use transducer decoding
             hyp_tokens = greedy_search_batch(
                 model=model,
                 encoder_out=encoder_out,
@@ -1101,13 +1103,32 @@ def decode_one_batch_hyps(
             pred_tokens = pred_tokens.tolist()
         elif not isinstance(pred_tokens, list):
             pred_tokens = list(pred_tokens)
+        
+        # Debug logging for first sequence
+        if i == 0:
+            logging.debug(f"Prediction tokens before filtering: {pred_tokens[:10]}")
             
         # Remove any padding or special tokens
-        while pred_tokens and pred_tokens[-1] == params.blank_id:
-            pred_tokens.pop()
+        filtered_tokens = []
+        for token in pred_tokens:
+            if token != params.blank_id:
+                filtered_tokens.append(token)
+        
+        # Debug logging for first sequence
+        if i == 0:
+            logging.debug(f"Prediction tokens after filtering: {filtered_tokens[:10]}")
             
         # Convert to text
-        pred = sp.decode(pred_tokens)
+        try:
+            pred = sp.decode(filtered_tokens)
+        except Exception as e:
+            logging.warning(f"Failed to decode tokens {filtered_tokens}: {str(e)}")
+            pred = ""
+        
+        # Debug logging for first sequence
+        if i == 0:
+            logging.debug(f"Decoded prediction: {pred}")
+            
         preds.append(pred)
     
     return hyps, preds

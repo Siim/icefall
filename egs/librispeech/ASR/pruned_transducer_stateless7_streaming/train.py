@@ -1031,13 +1031,38 @@ def decode_one_batch_hyps(
             encoder_out = model.module.encoder_proj(encoder_out)
         else:
             encoder_out = model.encoder_proj(encoder_out)
-        
-        # Use greedy search batch for decoding
-        hyp_tokens = greedy_search_batch(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-        )
+            
+        # Use CTC decoding during pre-training epochs
+        if params.cur_epoch <= params.ctc_epochs:
+            # Project encoder output to vocab size
+            logits = model.simple_am_proj(encoder_out)  # [B, T, V]
+            
+            # Get CTC predictions
+            log_probs = torch.log_softmax(logits, dim=-1)
+            pred_tokens = log_probs.argmax(dim=-1)  # [B, T]
+            
+            # Convert predictions to text, removing repeated tokens and blanks
+            hyp_tokens = []
+            for seq in pred_tokens:
+                # Remove padding
+                seq = seq[:encoder_out_lens[0]]
+                
+                # CTC decoding - remove repeated and blanks
+                decoded = []
+                prev = -1
+                for t in seq:
+                    t = t.item()
+                    if t != params.blank_id and t != prev:
+                        decoded.append(t)
+                    prev = t
+                hyp_tokens.append(decoded)
+        else:
+            # Use transducer decoding after pre-training
+            hyp_tokens = greedy_search_batch(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+            )
     
     # Convert token IDs to text
     hyps = []

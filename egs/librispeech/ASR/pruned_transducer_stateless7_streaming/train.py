@@ -867,15 +867,19 @@ def compute_loss(
     
     # Get supervisions
     supervisions = batch["supervisions"]
+    feature_lens = supervisions["num_frames"].to(device)
     texts = supervisions["text"]
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
     
     if is_pre_training:
         # During pre-training, process full sequences without chunking
-        encoder_out = model.encoder(feature)
+        encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
+        encoder_out = model.encoder_proj(encoder_out)
+        
         loss = model(
             x=encoder_out,
+            x_lens=encoder_out_lens,
             y=y,
             prune_range=params.prune_range,
             am_scale=params.am_scale,
@@ -905,7 +909,9 @@ def compute_loss(
             padded_chunk = feature[:, start - left_pad:end + right_pad]
             
             # Get encoder output for chunk
-            chunk_out = model.encoder(padded_chunk)
+            chunk_len = torch.tensor([padded_chunk.shape[1]], device=device)
+            chunk_out, chunk_lens = model.encoder(padded_chunk, chunk_len)
+            chunk_out = model.encoder_proj(chunk_out)
             
             # Remove context frames
             if left_pad > 0:
@@ -917,11 +923,13 @@ def compute_loss(
         
         # Concatenate chunk outputs
         encoder_out = torch.cat(chunk_encoder_outs, dim=1)
+        encoder_out_lens = ((feature_lens.float() / model.encoder.downsample_factor).floor()).to(torch.int64)
         
         if is_progressive:
             # During progressive training, compute both streaming and full-sequence outputs
             with torch.no_grad():
-                full_encoder_out = model.encoder(feature)
+                full_encoder_out, full_lens = model.encoder(feature, feature_lens)
+                full_encoder_out = model.encoder_proj(full_encoder_out)
             
             # Compute streaming regularization loss
             streaming_reg_loss = F.mse_loss(encoder_out, full_encoder_out.detach())
@@ -929,6 +937,7 @@ def compute_loss(
             # Compute main loss
             main_loss = model(
                 x=encoder_out,
+                x_lens=encoder_out_lens,
                 y=y,
                 prune_range=params.prune_range,
                 am_scale=params.am_scale,
@@ -942,6 +951,7 @@ def compute_loss(
             # Fully streaming phase
             loss = model(
                 x=encoder_out,
+                x_lens=encoder_out_lens,
                 y=y,
                 prune_range=params.prune_range,
                 am_scale=params.am_scale,

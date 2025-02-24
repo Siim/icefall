@@ -592,7 +592,9 @@ def get_params() -> AttributeDict:
             "valid_interval": 3000,
             
             # Paper's training configuration
-            "non_streaming_epochs": 10,  # Train full attention model first
+            "pretrain_epochs": 5,  # Number of epochs for pre-training phase with full-sequence processing
+            "progressive_epochs": 10,  # Number of epochs for progressive training stage transitioning to streaming
+            "streaming_epochs": 15,  # Number of epochs for fully streaming training phase
             
             # Chunk configurations from paper
             "chunk_sizes": {
@@ -1017,7 +1019,7 @@ def compute_loss(
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
-    is_non_streaming: bool = True,
+    is_pre_training: bool = True,
     chunk_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, MetricsTracker]:
     """Compute loss following paper's approach.
@@ -1028,7 +1030,7 @@ def compute_loss(
         sp: Sentence piece processor
         batch: A batch of data
         is_training: Whether this is a training batch
-        is_non_streaming: Whether to use non-streaming mode
+        is_pre_training: Whether this is a pre-training batch
         chunk_size: Chunk size for streaming mode
     
     Returns:
@@ -1043,11 +1045,11 @@ def compute_loss(
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
     
-    if is_non_streaming:
-        # Non-streaming mode: process full sequence
+    if is_pre_training:
+        # Pre-training phase: process full sequence
         encoder_out = model.encoder(feature)
     else:
-        # Streaming mode: process in chunks
+        # Streaming phase: process in chunks
         encoder_out = process_streaming_chunks(
             model=model,
             feature=feature,
@@ -1172,6 +1174,7 @@ def compute_validation_loss(
             sp=sp,
             batch=batch,
             is_training=False,
+            is_pre_training=False
         )
         assert loss.requires_grad is False
         tot_loss = tot_loss + loss_info
@@ -1221,15 +1224,15 @@ def train_one_epoch(
     tot_loss = MetricsTracker()
     
     # Determine training phase
-    is_non_streaming = params.cur_epoch <= params.non_streaming_epochs
+    is_pre_training = params.cur_epoch <= params.pretrain_epochs
     
     # Set batch size and gradient accumulation based on phase
-    curr_batch_size = params.batch_size["non_streaming" if is_non_streaming else "streaming"]
-    grad_acc_steps = params.gradient_accumulation_steps["non_streaming" if is_non_streaming else "streaming"]
+    curr_batch_size = params.batch_size["non_streaming" if is_pre_training else "streaming"]
+    grad_acc_steps = params.gradient_accumulation_steps["non_streaming" if is_pre_training else "streaming"]
     
     logging.info(
         f"Epoch {params.cur_epoch}: "
-        f"{'Non-streaming' if is_non_streaming else 'Streaming'} phase, "
+        f"{'Pre-training' if is_pre_training else 'Streaming'} phase, "
         f"batch_size={curr_batch_size}, grad_acc_steps={grad_acc_steps}"
     )
     
@@ -1240,15 +1243,15 @@ def train_one_epoch(
             # Zero gradients
             optimizer.zero_grad()
             
-            if is_non_streaming:
-                # Non-streaming phase: full sequence processing
+            if is_pre_training:
+                # Pre-training phase: process full sequence
                 loss, loss_info = compute_loss(
                     params=params,
                     model=model,
                     sp=sp,
                     batch=batch,
                     is_training=True,
-                    is_non_streaming=True
+                    is_pre_training=True
                 )
             else:
                 # Streaming phase: evaluate with different chunk sizes
@@ -1259,7 +1262,7 @@ def train_one_epoch(
                     sp=sp,
                     batch=batch,
                     is_training=True,
-                    is_non_streaming=False,
+                    is_pre_training=False,
                     chunk_size=chunk_size
                 )
             
@@ -1311,9 +1314,9 @@ def train_one_epoch(
     
     logging.info(f'Mean loss: {tot_loss["loss"] / tot_loss["frames"]:.4f}')
     
-    # After non-streaming phase, evaluate with different chunk sizes
-    if params.cur_epoch == params.non_streaming_epochs:
-        logging.info("Non-streaming training complete. Evaluating streaming configurations...")
+    # After pre-training phase, evaluate with different chunk sizes
+    if params.cur_epoch == params.pretrain_epochs:
+        logging.info("Pre-training complete. Evaluating streaming configurations...")
         model.eval()
         with torch.no_grad():
             for name, size in params.chunk_sizes.items():
@@ -1599,6 +1602,7 @@ def scan_pessimistic_batches_for_oom(
                     sp=sp,
                     batch=batch,
                     is_training=True,
+                    is_pre_training=False
                 )
             loss.backward()
             optimizer.zero_grad()

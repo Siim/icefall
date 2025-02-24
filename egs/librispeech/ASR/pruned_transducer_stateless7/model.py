@@ -86,11 +86,13 @@ class Transducer(nn.Module):
         prune_range: int = 5,
         am_scale: float = 0.0,
         lm_scale: float = 0.0,
+        encoder_outputs_provided: bool = True,
     ) -> torch.Tensor:
         """
         Args:
           x:
-            A 3-D tensor of shape (N, T, C).
+            Either encoder outputs with shape (N, T, encoder_dim) if encoder_outputs_provided=True
+            or raw inputs with shape (N, T, C) if encoder_outputs_provided=False
           x_lens:
             A 1-D tensor of shape (N,). It contains the number of frames in `x`
             before padding.
@@ -106,6 +108,9 @@ class Transducer(nn.Module):
           lm_scale:
             The scale to smooth the loss with lm (output of predictor network)
             part
+          encoder_outputs_provided:
+            If True, x is treated as encoder outputs and doesn't need further processing by the encoder.
+            If False, x is treated as raw inputs that need to be processed by the encoder.
         Returns:
           Return the transducer loss.
         """
@@ -116,13 +121,17 @@ class Transducer(nn.Module):
         assert x.size(0) == x_lens.size(0) == y.dim0, f"Batch size mismatch: x={x.size(0)}, x_lens={x_lens.size(0)}, y={y.dim0}"
 
         # Get encoder output
-        encoder_out, x_lens = self.encoder(x, x_lens)
+        if encoder_outputs_provided:
+            # x is already encoder output
+            encoder_out = x
+        else:
+            # Process x through the encoder
+            encoder_out, x_lens = self.encoder(x, x_lens)
+            # Project XLSR output if needed
+            encoder_out = self.encoder_proj(encoder_out)
         
         # Ensure x_lens matches actual encoder output size
         x_lens = torch.minimum(x_lens, torch.tensor(encoder_out.size(1), device=x_lens.device))
-        
-        # Project XLSR output if needed
-        encoder_out = self.encoder_proj(encoder_out)
         
         assert torch.all(x_lens > 0), f"All x_lens must be positive, got {x_lens}"
         assert torch.all(x_lens <= encoder_out.size(1)), f"x_lens must not exceed encoder output size, got x_lens={x_lens}, output_size={encoder_out.size(1)}"

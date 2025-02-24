@@ -1089,8 +1089,10 @@ def compute_loss(
         encoder_out = model.encoder_proj(encoder_out)
     
     # Compute transducer loss
+    # Important: We provide the encoder output directly to the model
+    # instead of the raw audio, as XLSR encoder has already processed it
     simple_loss, pruned_loss = model(
-        x=encoder_out,
+        x=encoder_out,  # Using encoder output instead of raw audio
         x_lens=encoder_out_lens,
         y=y,
         prune_range=params.prune_range,

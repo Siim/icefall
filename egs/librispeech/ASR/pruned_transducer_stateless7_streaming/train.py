@@ -488,6 +488,13 @@ def get_parser():
         help="Weight for streaming regularization loss",
     )
 
+    parser.add_argument(
+        "--ctc-epochs",
+        type=int,
+        default=5,
+        help="Number of epochs for CTC pre-training",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -565,6 +572,7 @@ def get_params() -> AttributeDict:
             "subsampling_factor": 4,  # not passed in, this is fixed.
             "warm_step": 2000,
             "env_info": get_env_info(),
+            "ctc_epochs": 5,
         }
     )
 
@@ -815,11 +823,7 @@ def compute_loss(
     
     # Get supervisions
     supervisions = batch["supervisions"]
-    
-    # Get feature lengths from supervisions
     feature_lens = supervisions["num_frames"].to(device)
-    
-    # Get supervision segments
     texts = supervisions["text"]
     tokens = supervisions["tokens"].to(device)
     token_lens = supervisions["token_lens"].to(device)
@@ -834,13 +838,9 @@ def compute_loss(
         cached_tot_size=row_splits[-1].item()
     )
     
-    # Get total number of elements (using axis=1 for flattened size)
-    total_elements = shape.tot_size(1)  # Get total size along token dimension
-    
-    # Ensure values tensor matches shape's elements
+    # Get total number of elements
+    total_elements = shape.tot_size(1)
     values = tokens.flatten()[:total_elements].to(dtype=torch.int32)
-    
-    # Create RaggedTensor with proper shape and values
     ragged_y = k2.RaggedTensor(shape=shape, value=values)
     
     # Calculate loss with proper gradient context
@@ -853,7 +853,38 @@ def compute_loss(
             else:
                 encoder_out = model.encoder_proj(encoder_out)
             
-            # Use greedy search batch for decoding
+            # Use CTC loss for pre-training if in early epochs
+            if params.cur_epoch <= params.ctc_epochs:
+                # Project encoder output to vocab size
+                logits = model.simple_am_proj(encoder_out)  # [B, T, V]
+                
+                # Compute CTC loss
+                log_probs = torch.log_softmax(logits, dim=-1)
+                ctc_loss = torch.nn.functional.ctc_loss(
+                    log_probs.transpose(0, 1),  # [T, B, V]
+                    tokens,
+                    encoder_out_lens,
+                    token_lens,
+                    blank=params.blank_id,
+                    reduction='sum',
+                    zero_infinity=True,
+                )
+                
+                # Use only CTC loss during pre-training
+                simple_loss = ctc_loss
+                pruned_loss = ctc_loss
+            else:
+                # Use transducer loss after pre-training
+                simple_loss, pruned_loss = model(
+                    x=feature,
+                    x_lens=feature_lens,
+                    y=ragged_y,
+                    prune_range=params.prune_range,
+                    am_scale=params.am_scale,
+                    lm_scale=params.lm_scale,
+                )
+            
+            # Use greedy search for decoding
             hyp_tokens = greedy_search_batch(
                 model=model,
                 encoder_out=encoder_out,
@@ -875,8 +906,36 @@ def compute_loss(
             total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
                              for hyp, ref in zip(hyp_texts, texts))
             wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
+    else:
+        # Training mode
+        encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
+        if isinstance(model, DDP):
+            encoder_out = model.module.encoder_proj(encoder_out)
+        else:
+            encoder_out = model.encoder_proj(encoder_out)
             
-            # Compute loss
+        # Use CTC loss for pre-training if in early epochs
+        if params.cur_epoch <= params.ctc_epochs:
+            # Project encoder output to vocab size
+            logits = model.simple_am_proj(encoder_out)  # [B, T, V]
+            
+            # Compute CTC loss
+            log_probs = torch.log_softmax(logits, dim=-1)
+            ctc_loss = torch.nn.functional.ctc_loss(
+                log_probs.transpose(0, 1),  # [T, B, V]
+                tokens,
+                encoder_out_lens,
+                token_lens,
+                blank=params.blank_id,
+                reduction='sum',
+                zero_infinity=True,
+            )
+            
+            # Use only CTC loss during pre-training
+            simple_loss = ctc_loss
+            pruned_loss = ctc_loss
+        else:
+            # Use transducer loss after pre-training
             simple_loss, pruned_loss = model(
                 x=feature,
                 x_lens=feature_lens,
@@ -885,17 +944,9 @@ def compute_loss(
                 am_scale=params.am_scale,
                 lm_scale=params.lm_scale,
             )
-    else:
-        simple_loss, pruned_loss = model(
-            x=feature,
-            x_lens=feature_lens,
-            y=ragged_y,
-            prune_range=params.prune_range,
-            am_scale=params.am_scale,
-            lm_scale=params.lm_scale,
-        )
-        wer = 0.0  # Do not compute WER during training
+        wer = 0.0  # Don't compute WER during training
     
+    # Scale losses
     s = params.simple_loss_scale
     simple_loss_scale = (
         s

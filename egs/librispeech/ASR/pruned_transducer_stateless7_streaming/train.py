@@ -937,14 +937,14 @@ def process_streaming_chunks(
     attention_sink_size: int,
     left_context_chunks: int
 ) -> torch.Tensor:
-    """Process input features in streaming mode with chunks.
+    """Process input features in streaming mode with chunks following paper's approach.
     
     Args:
         model: The model to use
         feature: Input features (batch, time)
-        chunk_size: Size of each chunk in samples
-        attention_sink_size: Number of frames for attention sink
-        left_context_chunks: Number of left context chunks to use
+        chunk_size: Size of each chunk in samples (e.g., 5120 for 320ms)
+        attention_sink_size: Number of frames for attention sink (16 as per paper)
+        left_context_chunks: Number of left context chunks (1 as per paper)
     
     Returns:
         Encoder output tensor
@@ -956,47 +956,66 @@ def process_streaming_chunks(
     states = None
     chunk_outputs = []
     
-    # Calculate effective chunk size with overlap
-    chunk_overlap = chunk_size // 2
+    # Calculate chunk parameters
+    chunk_overlap = chunk_size // 2  # Half overlap as per paper
     effective_chunk_size = chunk_size - chunk_overlap
+    
+    # Calculate attention sink size in samples
+    sink_size = attention_sink_size * model.encoder.downsample_factor
     
     # Process each sequence in batch
     for b in range(batch_size):
         seq = feature[b:b+1]  # Keep batch dimension
         pos = 0
         seq_outputs = []
+        left_context = None
         
         while pos < seq.size(1):
-            # Get current chunk
+            # Get current chunk boundaries
             end_pos = min(pos + chunk_size, seq.size(1))
             chunk = seq[:, pos:end_pos]
             
+            # Add left context if available
+            if left_context is not None:
+                chunk = torch.cat([left_context, chunk], dim=1)
+            
             # Add attention sink if enabled
             if states is not None and attention_sink_size > 0:
-                sink = states[1]  # Attention sink cache
+                sink = states[1]  # Attention sink cache from previous chunk
                 if sink is not None:
+                    # Paper's approach: prepend attention sink to current chunk
                     chunk = torch.cat([sink, chunk], dim=1)
             
-            # Process chunk
-            chunk_out, _, states = model.encoder.streaming_forward(
+            # Process chunk through encoder
+            chunk_out, chunk_lens, new_states = model.encoder.streaming_forward(
                 chunk,
                 torch.tensor([chunk.size(1)], device=device),
                 states
             )
             
-            # Save output
-            if pos > 0:  # Remove overlap from previous chunk
-                chunk_out = chunk_out[:, chunk_overlap//model.encoder.downsample_factor:]
-            seq_outputs.append(chunk_out)
+            # Update states with new attention sink
+            if attention_sink_size > 0:
+                # Cache end of current chunk for attention sink (paper's approach)
+                states = [chunk, chunk_out[:, -attention_sink_size:]]
+            else:
+                states = new_states
             
-            # Update position
+            # Save left context for next chunk
+            if left_context_chunks > 0:
+                left_context = chunk[:, -chunk_overlap:]
+            
+            # Remove overlap from previous chunk's output
+            if pos > 0:
+                chunk_out = chunk_out[:, chunk_overlap//model.encoder.downsample_factor:]
+            
+            seq_outputs.append(chunk_out)
             pos = end_pos - chunk_overlap
         
         # Concatenate all chunks for this sequence
         seq_output = torch.cat(seq_outputs, dim=1)
         chunk_outputs.append(seq_output)
     
-    # Pad to max length and stack
+    # Pad sequences to max length
     max_len = max(output.size(1) for output in chunk_outputs)
     padded_outputs = []
     

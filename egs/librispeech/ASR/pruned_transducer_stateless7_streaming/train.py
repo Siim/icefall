@@ -1006,9 +1006,9 @@ def compute_validation_loss(
         if batch_idx % 100 == 0:
             logging.info(f"batch {batch_idx}, validation loss: {loss_info}")
             
-            # Decode a few examples for comparison
+            # Get hypotheses and predictions for the first few examples
             hyps, preds = decode_one_batch_hyps(params, model, sp, batch)
-            num_to_print = min(3, len(hyps))  # Print first 3 examples
+            num_to_print = min(3, len(hyps))
             
             logging.info("\nExample comparisons:")
             logging.info("-" * 80)
@@ -1311,7 +1311,16 @@ def run(rank, world_size, args):
             valid_cuts += librispeech.dev_other_cuts()
         valid_dl = librispeech.valid_dataloaders(valid_cuts)
 
-    scaler = torch.amp.GradScaler(device_type='cuda', enabled=params.use_fp16, init_scale=1.0)
+    if params.print_diagnostics:
+        scan_pessimistic_batches_for_oom(
+            model=model,
+            train_dl=train_dl,
+            optimizer=optimizer,
+            sp=sp,
+            params=params,
+        )
+
+    scaler = GradScaler(enabled=params.use_fp16, init_scale=1.0)
     if checkpoints and "grad_scaler" in checkpoints:
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])

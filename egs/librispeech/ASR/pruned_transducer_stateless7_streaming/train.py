@@ -86,20 +86,7 @@ from icefall.env import get_env_info
 from icefall.err import raise_grad_scale_is_too_small_error
 from icefall.hooks import register_inf_check_hooks
 from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
-from beam_search import (
-    beam_search,
-    fast_beam_search_nbest,
-    fast_beam_search_nbest_LG,
-    fast_beam_search_nbest_oracle,
-    fast_beam_search_one_best,
-    greedy_search,
-    greedy_search_batch,
-    modified_beam_search,
-    modified_beam_search_lm_rescore,
-    modified_beam_search_lm_rescore_LODR,
-    modified_beam_search_lm_shallow_fusion,
-    modified_beam_search_LODR,
-)
+from beam_search import greedy_search_batch  # Only import what we use for validation
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -592,9 +579,13 @@ def get_params() -> AttributeDict:
             "valid_interval": 3000,
             
             # Paper's training configuration
-            "pretrain_epochs": 5,  # Number of epochs for pre-training phase with full-sequence processing
-            "progressive_epochs": 10,  # Number of epochs for progressive training stage transitioning to streaming
-            "streaming_epochs": 15,  # Number of epochs for fully streaming training phase
+            "pretrain_epochs": 5,  # Pre-training phase
+            "streaming_epochs": 15, # Streaming phase
+            "beam_size": 4,        # Paper's beam width for decoding
+            
+            # Learning rate schedule from paper
+            "warmup_steps": 500,
+            "base_lr": 1.25e-3,
             
             # Chunk configurations from paper
             "chunk_sizes": {
@@ -629,7 +620,7 @@ def get_params() -> AttributeDict:
             
             # Original parameters
             "feature_dim": 80,
-            "subsampling_factor": 4,  # not passed in, this is fixed.
+            "subsampling_factor": 4,
             "warm_step": 2000,
             "env_info": get_env_info(),
         }
@@ -851,17 +842,9 @@ def evaluate_streaming(
     chunk_size: int,
     sp: spm.SentencePieceProcessor,
 ) -> Dict[str, float]:
-    """Evaluate model with streaming inference using specified chunk size.
-    
-    Args:
-        params: Training parameters
-        model: The model to evaluate
-        valid_dl: Validation dataloader
-        chunk_size: Chunk size in samples (e.g., 5120 for 320ms)
-        sp: SentencePieceProcessor for text processing
-    
-    Returns:
-        Dictionary containing metrics (WER, latency)
+    """Evaluate model with streaming inference using greedy search.
+    Note: We use greedy search for quick validation during training.
+    For actual model evaluation, use beam search with width=4 as per paper.
     """
     model.eval()
     total_words = 0
@@ -871,7 +854,6 @@ def evaluate_streaming(
     for batch_idx, batch in enumerate(valid_dl):
         try:
             with torch.no_grad():
-                # Get encoder output with streaming settings
                 feature = batch["inputs"].to(next(model.parameters()).device)
                 feature_lens = batch["supervisions"]["num_frames"].to(feature.device)
                 texts = batch["supervisions"]["text"]
@@ -885,7 +867,7 @@ def evaluate_streaming(
                     left_context_chunks=params.left_context_chunks
                 )
                 
-                # Decode with greedy search
+                # Quick validation with greedy search
                 hyp_tokens = greedy_search_batch(
                     model=model,
                     encoder_out=encoder_out,
@@ -1260,34 +1242,32 @@ def train_one_epoch(
     rank: int = 0,
 ) -> None:
     """Train the model for one epoch following paper's approach:
-    1. Non-streaming training first
-    2. Evaluate with different streaming configurations
+    1. Pre-training phase: Full sequence processing
+    2. Streaming phase: Chunk-based processing with attention sink
     """
     model.train()
     tot_loss = MetricsTracker()
     
-    # Determine training phase
+    # Determine training phase - simple binary choice
     is_pre_training = params.cur_epoch <= params.pretrain_epochs
     
-    # Set batch size and gradient accumulation based on phase
+    # Set batch size based on phase
     curr_batch_size = params.batch_size["non_streaming" if is_pre_training else "streaming"]
-    grad_acc_steps = params.gradient_accumulation_steps["non_streaming" if is_pre_training else "streaming"]
     
     logging.info(
         f"Epoch {params.cur_epoch}: "
         f"{'Pre-training' if is_pre_training else 'Streaming'} phase, "
-        f"batch_size={curr_batch_size}, grad_acc_steps={grad_acc_steps}"
+        f"batch_size={curr_batch_size}"
     )
     
     for batch_idx, batch in enumerate(train_dl):
         try:
             params.batch_idx_train += 1
-            
-            # Zero gradients
             optimizer.zero_grad()
             
+            # Simple phase selection
             if is_pre_training:
-                # Pre-training phase: process full sequence
+                # Pre-training: full sequence processing
                 loss, loss_info = compute_loss(
                     params=params,
                     model=model,
@@ -1297,8 +1277,7 @@ def train_one_epoch(
                     is_pre_training=True
                 )
             else:
-                # Streaming phase: evaluate with different chunk sizes
-                chunk_size = params.chunk_sizes["320ms"]  # Best performing from paper
+                # Streaming: use optimal chunk size from paper (320ms)
                 loss, loss_info = compute_loss(
                     params=params,
                     model=model,
@@ -1306,17 +1285,13 @@ def train_one_epoch(
                     batch=batch,
                     is_training=True,
                     is_pre_training=False,
-                    chunk_size=chunk_size
+                    chunk_size=params.chunk_sizes["320ms"]  # Paper's best performing size
                 )
             
-            # Scale loss for gradient accumulation
-            loss = loss / grad_acc_steps
             loss.backward()
-            
-            if (batch_idx + 1) % grad_acc_steps == 0:
-                clip_grad_norm_(model.parameters(), 5.0, 2.0)
-                optimizer.step()
-                scheduler.step()
+            clip_grad_norm_(model.parameters(), 5.0, 2.0)
+            optimizer.step()
+            scheduler.step()
             
             tot_loss = tot_loss + loss_info
             
@@ -1336,14 +1311,13 @@ def train_one_epoch(
                     
         except RuntimeError as e:
             if "out of memory" in str(e):
-                # Reduce batch size
+                # Reduce batch size if OOM
                 if curr_batch_size > 1:
                     curr_batch_size = max(1, curr_batch_size // 2)
                     logging.warning(
                         f'OOM error - reducing batch size to {curr_batch_size}. '
                         f'Memory usage: {torch.cuda.max_memory_allocated() // 1024 // 1024}MB'
                     )
-                    # Skip this batch and continue with reduced size
                     torch.cuda.empty_cache()
                     continue
                 else:
@@ -1458,17 +1432,28 @@ def run(rank, world_size, args):
         parameters_names=parameters_names,
     )
 
-    scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
+    # Paper uses warmup followed by decay
+    def lr_scheduler(step: int, epoch: int) -> float:
+        # Warmup phase
+        if step < params.warmup_steps:
+            return step / params.warmup_steps
+        # Decay phase based on steps and epochs
+        decay_factor = 0.05 * (params.num_epochs - epoch) / params.num_epochs
+        return max(0.05, decay_factor)  # Don't let LR go below 5% of base_lr
+
+    scheduler = Eden(
+        optimizer,
+        lr_batches=params.lr_batches,
+        lr_epochs=params.lr_epochs,
+        warmup_steps=params.warmup_steps,
+        custom_lr_func=lr_scheduler,
+    )
 
     if checkpoints and "optimizer" in checkpoints:
         logging.info("Loading optimizer state dict")
         optimizer.load_state_dict(checkpoints["optimizer"])
 
-    if (
-        checkpoints
-        and "scheduler" in checkpoints
-        and checkpoints["scheduler"] is not None
-    ):
+    if checkpoints and "scheduler" in checkpoints:
         logging.info("Loading scheduler state dict")
         scheduler.load_state_dict(checkpoints["scheduler"])
 

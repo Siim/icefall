@@ -845,51 +845,24 @@ def compute_loss(
                 for i in range(attention_mask.size(0)):
                     attention_mask[i, feature_lens[i]:] = 0
                 
-                # Forward through CTC model
+                # Forward through CTC model to get logits
                 outputs = model.encoder.model(
                     feature,
                     attention_mask=attention_mask,
-                    labels=tokens if is_training else None,  # Only provide labels during training
+                    output_hidden_states=True
                 )
                 
-                if is_training:
-                    # During training, use the CTC loss computed by the model
-                    ctc_loss = outputs.loss
-                    simple_loss = ctc_loss
-                    pruned_loss = ctc_loss
-                    wer = 0.0  # Don't compute WER during training
+                # Get logits and project to our vocabulary size if needed
+                logits = outputs.logits  # [batch, time, wav2vec2_vocab_size]
+                
+                # Project to our vocabulary size using the model's projection layer
+                if isinstance(model, DDP):
+                    logits = model.module.simple_am_proj(outputs.hidden_states[-1])
                 else:
-                    # During validation, compute WER from logits
-                    logits = outputs.logits
-                    
-                    # Get predictions (batch_size, sequence_length)
-                    predictions = torch.argmax(logits, dim=-1)
-                    
-                    # Convert predictions to text for WER calculation
-                    hyp_texts = []
-                    for i, length in enumerate(feature_lens):
-                        # Get sequence without padding
-                        pred = predictions[i, :length].tolist()
-                        
-                        # CTC decoding - remove repeated and blanks
-                        decoded = []
-                        prev = -1
-                        for token in pred:
-                            if token != params.blank_id and token != prev:
-                                decoded.append(token)
-                            prev = token
-                        
-                        # Convert to text
-                        text = sp.decode(decoded)
-                        hyp_texts.append(text)
-                    
-                    # Calculate WER
-                    total_words = sum(len(ref.split()) for ref in texts)
-                    total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
-                                    for hyp, ref in zip(hyp_texts, texts))
-                    wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
-                    
-                    # Compute loss for validation metrics
+                    logits = model.simple_am_proj(outputs.hidden_states[-1])
+                
+                if is_training:
+                    # During training, compute CTC loss
                     log_probs = torch.log_softmax(logits, dim=-1)
                     ctc_loss = torch.nn.functional.ctc_loss(
                         log_probs.transpose(0, 1),  # (T, B, V)
@@ -902,6 +875,50 @@ def compute_loss(
                     )
                     simple_loss = ctc_loss
                     pruned_loss = ctc_loss
+                    wer = 0.0  # Don't compute WER during training
+                else:
+                    # During validation, compute WER
+                    with torch.no_grad():
+                        # Get predictions
+                        predictions = torch.argmax(logits, dim=-1)
+                        
+                        # Convert predictions to text for WER calculation
+                        hyp_texts = []
+                        for i, length in enumerate(feature_lens):
+                            # Get sequence without padding
+                            pred = predictions[i, :length].tolist()
+                            
+                            # CTC decoding - remove repeated and blanks
+                            decoded = []
+                            prev = -1
+                            for token in pred:
+                                if token != params.blank_id and token != prev:
+                                    decoded.append(token)
+                                prev = token
+                            
+                            # Convert to text
+                            text = sp.decode(decoded)
+                            hyp_texts.append(text)
+                        
+                        # Calculate WER
+                        total_words = sum(len(ref.split()) for ref in texts)
+                        total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
+                                        for hyp, ref in zip(hyp_texts, texts))
+                        wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
+                        
+                        # Compute loss for validation metrics
+                        log_probs = torch.log_softmax(logits, dim=-1)
+                        ctc_loss = torch.nn.functional.ctc_loss(
+                            log_probs.transpose(0, 1),  # (T, B, V)
+                            tokens,
+                            feature_lens,
+                            token_lens,
+                            blank=params.blank_id,
+                            reduction='sum',
+                            zero_infinity=True
+                        )
+                        simple_loss = ctc_loss
+                        pruned_loss = ctc_loss
             else:
                 raise ValueError("Encoder model must be Wav2Vec2ForCTC during pre-training epochs")
         else:

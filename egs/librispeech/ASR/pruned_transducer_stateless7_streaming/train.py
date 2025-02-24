@@ -613,6 +613,18 @@ def get_params() -> AttributeDict:
             "subsampling_factor": 4,  # not passed in, this is fixed.
             "warm_step": 2000,
             "env_info": get_env_info(),
+            
+            # Add new parameters for memory management
+            "gradient_accumulation_steps": 4,  # Accumulate gradients over multiple steps
+            "max_duration": 10.0,  # Maximum audio duration in seconds
+            "dynamic_batch_size": True,  # Enable dynamic batch sizing
+            "initial_batch_size": 1,  # Start with small batch size during pre-training
+            "max_batch_size": 32,  # Maximum batch size to try
+            "target_batch_size": 16,  # Target batch size to achieve
+            
+            # Pre-training specific parameters
+            "max_sequence_length": 16000 * 10,  # 10 seconds at 16kHz during pre-training
+            "pre_train_batch_size": 2,  # Smaller batch size during pre-training
         }
     )
 
@@ -827,191 +839,123 @@ def save_checkpoint(
 
 def compute_loss(
     params: AttributeDict,
-    model: Union[nn.Module, DDP],
+    model: nn.Module,
     sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
-) -> Tuple[Tensor, MetricsTracker]:
+    is_pre_training: bool = False,
+    is_progressive: bool = False,
+) -> Tuple[torch.Tensor, MetricsTracker]:
+    """Compute loss for the given batch.
+    
+    Args:
+        params: Model parameters
+        model: The model to train
+        sp: Sentence piece processor
+        batch: A batch of data
+        is_training: Whether this is a training batch
+        is_pre_training: Whether we are in pre-training phase
+        is_progressive: Whether we are in progressive training phase
+    
+    Returns:
+        (loss, MetricsTracker) where loss is the loss tensor and MetricsTracker
+        contains various statistics about the loss.
     """
-    Compute transducer loss given the model and batch.
-    Handles different training phases:
-    1. Pre-training: Full sequence processing
-    2. Progressive: Gradual transition to streaming with regularization
-    3. Streaming: Fully streaming inference
-    """
-    device = model.device if isinstance(model, DDP) else next(model.parameters()).device
+    device = next(model.parameters()).device
     feature = batch["inputs"]
     feature = feature.to(device)
     
     # Get supervisions
     supervisions = batch["supervisions"]
-    feature_lens = supervisions["num_frames"].to(device)
-    
-    # Get supervision segments
     texts = supervisions["text"]
-    tokens = supervisions["tokens"].to(device)
-    token_lens = supervisions["token_lens"].to(device)
+    y = sp.encode(texts, out_type=int)
+    y = k2.RaggedTensor(y).to(device)
     
-    # Create row splits from token lengths
-    row_splits = torch.zeros(token_lens.size(0) + 1, dtype=torch.int32, device=device)
-    row_splits[1:] = torch.cumsum(token_lens, dim=0)
-    
-    # Create RaggedShape using create_ragged_shape2
-    shape = k2.ragged.create_ragged_shape2(
-        row_splits=row_splits,
-        cached_tot_size=row_splits[-1].item()
-    )
-    
-    # Get total number of elements
-    total_elements = shape.tot_size(1)
-    
-    # Ensure values tensor matches shape's elements
-    values = tokens.flatten()[:total_elements].to(dtype=torch.int32)
-    
-    # Create RaggedTensor with proper shape and values
-    ragged_y = k2.RaggedTensor(shape=shape, value=values)
-
-    # Different processing based on training phase
-    if params.is_pre_training:
-        # Pre-training phase: Full sequence processing
-        encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
-        encoder_out = model.encoder_proj(encoder_out)
+    if is_pre_training:
+        # During pre-training, process full sequences without chunking
+        encoder_out = model.encoder(feature)
+        loss = model(
+            x=encoder_out,
+            y=y,
+            prune_range=params.prune_range,
+            am_scale=params.am_scale,
+            lm_scale=params.lm_scale,
+        )
+    else:
+        # For progressive and streaming phases, use chunked processing
+        chunk_size = 32  # 320ms at 10ms frame shift
+        context = 32     # Left/right context size
         
-    elif params.is_progressive_training:
-        # Progressive training phase: Both full sequence and streaming with regularization
-        # Get full sequence output
-        with torch.no_grad():
-            full_out, _ = model.encoder(feature, feature_lens)
-            full_out = model.encoder_proj(full_out)
+        # Split feature into chunks
+        num_frames = feature.size(1)
+        chunk_starts = torch.arange(0, num_frames - chunk_size, chunk_size // 2)
         
-        # Get streaming output
-        chunk_size = params.decode_chunk_size
-        overlap = chunk_size // 2
-        streaming_out = []
-        states = None
+        # Initialize streaming state
+        model.encoder.reset_streaming_state()
         
-        for start in range(0, feature.size(1), chunk_size - overlap):
-            end = min(start + chunk_size, feature.size(1))
+        # Process chunks
+        chunk_encoder_outs = []
+        for start in chunk_starts:
+            end = start + chunk_size
             chunk = feature[:, start:end]
-            chunk_lens = torch.tensor([chunk.size(1)], device=device)
             
-            # Process chunk
-            chunk_out, _, states = model.encoder.streaming_forward(chunk, chunk_lens, states)
-            chunk_out = model.encoder_proj(chunk_out)
-            streaming_out.append(chunk_out)
+            # Add context if available
+            left_pad = min(context, start)
+            right_pad = min(context, num_frames - end)
+            padded_chunk = feature[:, start - left_pad:end + right_pad]
+            
+            # Get encoder output for chunk
+            chunk_out = model.encoder(padded_chunk)
+            
+            # Remove context frames
+            if left_pad > 0:
+                chunk_out = chunk_out[:, left_pad:]
+            if right_pad > 0:
+                chunk_out = chunk_out[:, :-right_pad]
+                
+            chunk_encoder_outs.append(chunk_out)
         
-        # Concatenate streaming outputs
-        encoder_out = torch.cat(streaming_out, dim=1)
-        encoder_out_lens = feature_lens
+        # Concatenate chunk outputs
+        encoder_out = torch.cat(chunk_encoder_outs, dim=1)
         
-        # Compute streaming regularization loss
-        if is_training:
-            # Only compute regularization during training
-            min_len = min(encoder_out.size(1), full_out.size(1))
-            streaming_reg_loss = torch.nn.functional.mse_loss(
-                encoder_out[:, :min_len],
-                full_out[:, :min_len]
+        if is_progressive:
+            # During progressive training, compute both streaming and full-sequence outputs
+            with torch.no_grad():
+                full_encoder_out = model.encoder(feature)
+            
+            # Compute streaming regularization loss
+            streaming_reg_loss = F.mse_loss(encoder_out, full_encoder_out.detach())
+            
+            # Compute main loss
+            main_loss = model(
+                x=encoder_out,
+                y=y,
+                prune_range=params.prune_range,
+                am_scale=params.am_scale,
+                lm_scale=params.lm_scale,
             )
             
-    else:
-        # Fully streaming phase
-        chunk_size = params.decode_chunk_size
-        overlap = chunk_size // 2
-        streaming_out = []
-        states = None
-        
-        for start in range(0, feature.size(1), chunk_size - overlap):
-            end = min(start + chunk_size, feature.size(1))
-            chunk = feature[:, start:end]
-            chunk_lens = torch.tensor([chunk.size(1)], device=device)
-            
-            # Process chunk
-            chunk_out, _, states = model.encoder.streaming_forward(chunk, chunk_lens, states)
-            chunk_out = model.encoder_proj(chunk_out)
-            streaming_out.append(chunk_out)
-        
-        encoder_out = torch.cat(streaming_out, dim=1)
-        encoder_out_lens = feature_lens
-
-    # Compute transducer loss
-    simple_loss, pruned_loss = model(
-        x=feature,
-        x_lens=feature_lens,
-        y=ragged_y,
-        prune_range=params.prune_range,
-        am_scale=params.am_scale,
-        lm_scale=params.lm_scale,
-        encoder_out=encoder_out,  # Pass pre-computed encoder output
-        encoder_out_lens=encoder_out_lens,
-    )
-
-    # Apply loss scaling
-    s = params.simple_loss_scale
-    simple_loss_scale = (
-        s
-        if "warm_step" not in params
-        else (
-            s
-            if params.batch_idx_train > params.warm_step
-            else float(params.batch_idx_train) / params.warm_step * s
-        )
-    )
-    pruned_loss_scale = (
-        1.0
-        if "warm_step" not in params
-        else (
-            1.0
-            if params.batch_idx_train > params.warm_step
-            else float(params.batch_idx_train) / params.warm_step
-        )
-    )
-    
-    loss = simple_loss_scale * simple_loss + pruned_loss_scale * pruned_loss
-    
-    # Add streaming regularization loss during progressive training
-    if params.is_progressive_training and is_training:
-        reg_weight = params.streaming_regularization
-        loss = loss + reg_weight * streaming_reg_loss
+            # Combine losses
+            reg_weight = min(1.0, params.cur_epoch / params.progressive_epochs)
+            loss = main_loss + reg_weight * streaming_reg_loss
+        else:
+            # Fully streaming phase
+            loss = model(
+                x=encoder_out,
+                y=y,
+                prune_range=params.prune_range,
+                am_scale=params.am_scale,
+                lm_scale=params.lm_scale,
+            )
     
     assert loss.requires_grad == is_training
     
     info = MetricsTracker()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        info["frames"] = (feature_lens // params.subsampling_factor).sum().item()
-    
+    info["frames"] = feature.size(0)
     info["loss"] = loss.detach().cpu().item()
-    info["simple_loss"] = simple_loss.detach().cpu().item()
-    info["pruned_loss"] = pruned_loss.detach().cpu().item()
     
-    if params.is_progressive_training and is_training:
+    if is_progressive:
         info["streaming_reg_loss"] = streaming_reg_loss.detach().cpu().item()
-    
-    # Compute WER during validation
-    if not is_training:
-        # Use greedy search batch for decoding
-        hyp_tokens = greedy_search_batch(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-        )
-        
-        # Convert predictions to text
-        hyp_texts = []
-        for tokens in hyp_tokens:
-            if isinstance(tokens, torch.Tensor):
-                tokens = tokens.tolist()
-            elif not isinstance(tokens, list):
-                tokens = list(tokens)
-            text = sp.decode(tokens)
-            hyp_texts.append(text)
-        
-        # Compute WER
-        total_words = sum(len(ref.split()) for ref in texts)
-        total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
-                          for hyp, ref in zip(hyp_texts, texts))
-        wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
-        info["wer"] = wer
     
     return loss, info
 
@@ -1145,172 +1089,100 @@ def compute_validation_loss(
 
 def train_one_epoch(
     params: AttributeDict,
-    model: Union[nn.Module, DDP],
+    model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: LRSchedulerType,
-    sp: spm.SentencePieceProcessor,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
     train_dl: torch.utils.data.DataLoader,
     valid_dl: torch.utils.data.DataLoader,
-    scaler: GradScaler,
-    model_avg: Optional[nn.Module] = None,
+    sp: spm.SentencePieceProcessor,
     tb_writer: Optional[SummaryWriter] = None,
     world_size: int = 1,
     rank: int = 0,
 ) -> None:
-    """Train the model for one epoch."""
+    """Train the model for one epoch.
+    The training phase is controlled by params.pretrain_epochs and params.progressive_epochs
+    to implement the three training phases:
+    1. Pre-training: Full sequence processing without chunking
+    2. Progressive: Gradual transition to streaming with regularization
+    3. Streaming: Only chunked processing
+    """
     model.train()
-
-    # Adjust learning rate and training phase based on current epoch
-    if params.cur_epoch <= params.pretrain_epochs:
-        params.is_pre_training = True
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = params.pre_train_lr
-        logging.info(f"Pre-training phase (Epoch {params.cur_epoch}), lr={params.pre_train_lr}")
-
-    elif params.pretrain_epochs < params.cur_epoch <= params.pretrain_epochs + params.progressive_epochs:
-        params.is_pre_training = False
-        params.is_progressive_training = True
-        logging.info(f"Progressive training phase (Epoch {params.cur_epoch})")
-
-    else:
-        params.is_pre_training = False
-        params.is_progressive_training = False
-        logging.info(f"Fully streaming training phase (Epoch {params.cur_epoch})")
-
-    # Reset best metrics when transitioning to a new phase
-    if params.cur_epoch == params.pretrain_epochs + 1 or params.cur_epoch == params.pretrain_epochs + params.progressive_epochs + 1:
-        params.best_train_loss = float("inf")
-        params.best_valid_loss = float("inf")
-        params.best_train_epoch = -1
-        params.best_valid_epoch = -1
-
+    
     tot_loss = MetricsTracker()
-
+    curr_batch_size = params.initial_batch_size
+    
     for batch_idx, batch in enumerate(train_dl):
-        params.batch_idx_train += 1
-        batch_size = len(batch["supervisions"]["text"])
-
         try:
-            with torch.amp.autocast('cuda', enabled=params.use_fp16):
-                loss, loss_info = compute_loss(
-                    params=params,
-                    model=model,
-                    sp=sp,
-                    batch=batch,
-                    is_training=True,
-                )
-            # summary stats
-            tot_loss = (tot_loss * (1 - 1 / params.reset_interval)) + loss_info
-
-            scaler.scale(loss).backward()
-            set_batch_count(model, params.batch_idx_train)
+            params.batch_idx_train += 1
+            batch_size = len(batch['supervisions']['text'])
             
-            # Use different scheduler behavior during pre-training
-            if not params.is_pre_training:
-                scheduler.step_batch(params.batch_idx_train)
-
-            scaler.step(optimizer)
-            scaler.update()
+            # Determine training phase
+            is_pre_training = params.cur_epoch < params.pretrain_epochs
+            is_progressive = (params.cur_epoch >= params.pretrain_epochs and 
+                            params.cur_epoch < params.pretrain_epochs + params.progressive_epochs)
+            
+            # Set appropriate batch size for pre-training
+            if is_pre_training:
+                curr_batch_size = min(params.pre_train_batch_size, curr_batch_size)
+            
+            # Zero gradients
             optimizer.zero_grad()
-        except:  # noqa
-            display_and_save_batch(batch, params=params, sp=sp)
-            raise
-
-        if params.print_diagnostics and batch_idx == 5:
-            return
-
-        if (
-            rank == 0
-            and params.batch_idx_train > 0
-            and params.batch_idx_train % params.average_period == 0
-        ):
-            update_averaged_model(
-                params=params,
-                model_cur=model,
-                model_avg=model_avg,
-            )
-
-        if (
-            params.batch_idx_train > 0
-            and params.batch_idx_train % params.save_every_n == 0
-        ):
-            save_checkpoint_with_global_batch_idx(
-                out_dir=params.exp_dir,
-                global_batch_idx=params.batch_idx_train,
-                model=model,
-                model_avg=model_avg,
-                params=params,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                sampler=train_dl.sampler if params.dataset == "librispeech" else None,
-                scaler=scaler,
-                rank=rank,
-            )
-            remove_checkpoints(
-                out_dir=params.exp_dir,
-                topk=params.keep_last_k,
-                rank=rank,
-            )
-
-        if batch_idx % 100 == 0 and params.use_fp16:
-            # If the grad scale was less than 1, try increasing it
-            cur_grad_scale = scaler._scale.item()
-            if cur_grad_scale < 1.0 or (cur_grad_scale < 8.0 and batch_idx % 400 == 0):
-                scaler.update(cur_grad_scale * 2.0)
-            if cur_grad_scale < 0.01:
-                logging.warning(f"Grad scale is small: {cur_grad_scale}")
-            if cur_grad_scale < 1.0e-05:
-                raise_grad_scale_is_too_small_error(cur_grad_scale)
-
-        if batch_idx % params.log_interval == 0:
-            cur_lr = scheduler.get_last_lr()[0]
-            logging.info(
-                f"Epoch {params.cur_epoch}, batch {batch_idx}, loss[{loss_info}], "
-                f"tot_loss[{tot_loss}], batch size: {batch_size}, "
-                f"lr: {cur_lr:.2e}, "
-                f"grad_scale: {scaler.get_scale():.1f}"
-            )
-
-            if tb_writer is not None:
-                tb_writer.add_scalar(
-                    "train/learning_rate", cur_lr, params.batch_idx_train
-                )
-
-                # Write all loss components to tensorboard
-                for k, v in loss_info.items():
-                    tb_writer.add_scalar(f"train/{k}", v, params.batch_idx_train)
-
-        if batch_idx % params.valid_interval == 0 and not params.print_diagnostics:
-            logging.info("Computing validation loss")
-            valid_info = compute_validation_loss(
+            
+            loss, loss_info = compute_loss(
                 params=params,
                 model=model,
                 sp=sp,
-                valid_dl=valid_dl,
-                world_size=world_size,
+                batch=batch,
+                is_training=True,
+                is_pre_training=is_pre_training,
+                is_progressive=is_progressive
             )
-            model.train()
-            logging.info(f"Epoch {params.cur_epoch}, validation: {valid_info}")
-            logging.info(
-                f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
-            )
-            if tb_writer is not None:
-                valid_info.write_summary(
-                    tb_writer, "train/valid_", params.batch_idx_train
-                )
-
-    loss_value = tot_loss["loss"] / tot_loss["frames"]
-    params.train_loss = loss_value
-    if params.train_loss < params.best_train_loss:
-        params.best_train_epoch = params.cur_epoch
-        params.best_train_loss = params.train_loss
-
-    # Implement progressive training logic
-    if params.is_progressive_training:
-        # Example: Adjust loss computation or add regularization
-        # This is a placeholder for any specific logic needed during progressive training
-        logging.info("Applying progressive training adjustments")
-        # Add any specific logic for progressive training here
+            
+            # Scale loss for gradient accumulation
+            loss = loss / params.gradient_accumulation_steps
+            loss.backward()
+            
+            if (batch_idx + 1) % params.gradient_accumulation_steps == 0:
+                clip_grad_norm_(model.parameters(), 5.0, 2.0)
+                optimizer.step()
+                scheduler.step()
+            
+            tot_loss = tot_loss + loss_info
+            
+            if batch_idx % params.log_interval == 0:
+                logging.info(f'Epoch {params.cur_epoch}, batch {batch_idx}, '
+                           f'batch size {batch_size}, loss {loss:.4f}')
+                
+                if tb_writer is not None:
+                    tb_writer.add_scalar('train/loss', loss, params.batch_idx_train)
+                    tb_writer.add_scalar('train/lr', scheduler.get_last_lr()[0],
+                                       params.batch_idx_train)
+                    
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                # Reduce batch size
+                if curr_batch_size > 1:
+                    curr_batch_size = max(1, curr_batch_size // 2)
+                    logging.warning(f'OOM error - reducing batch size to {curr_batch_size}')
+                    # Skip this batch and continue with reduced size
+                    torch.cuda.empty_cache()
+                    continue
+                else:
+                    logging.error('OOM error with batch size 1 - cannot reduce further')
+                    raise e
+            else:
+                raise e
+    
+    logging.info(f'Mean loss: {tot_loss["loss"] / tot_loss["frames"]:.4f}')
+    
+    save_checkpoint(
+        params=params,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        sampler=train_dl.sampler,
+        rank=rank,
+    )
 
 
 def run(rank, world_size, args):
@@ -1489,13 +1361,11 @@ def run(rank, world_size, args):
         train_one_epoch(
             params=params,
             model=model,
-            model_avg=model_avg,
             optimizer=optimizer,
             scheduler=scheduler,
-            sp=sp,
             train_dl=train_dl,
             valid_dl=valid_dl,
-            scaler=scaler,
+            sp=sp,
             tb_writer=tb_writer,
             world_size=world_size,
             rank=rank,

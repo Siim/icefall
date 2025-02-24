@@ -162,10 +162,35 @@ class EstonianASRDataset(Dataset):
             return self[next_idx]
 
 
-def collate_fn(batch: list) -> dict:
-    # Collate function pads raw waveforms along the time dimension
-    max_len = max(item['inputs'].size(1) for item in batch)
-    max_token_len = max(item['supervisions']['tokens'].size(0) for item in batch)
+def collate_fn(batch: list, max_duration: float = 10.0) -> dict:
+    """Collate function that respects maximum duration limits
+    Args:
+        batch: List of samples from the dataset
+        max_duration: Maximum audio duration in seconds
+    Returns:
+        Batched data with padded sequences
+    """
+    # Convert max duration to samples (at 16kHz)
+    max_samples = int(max_duration * 16000)
+    
+    # Filter and truncate sequences
+    filtered_batch = []
+    for item in batch:
+        if item['inputs'].size(1) > max_samples:
+            # Truncate sequence
+            item['inputs'] = item['inputs'][:, :max_samples]
+            item['supervisions']['num_frames'] = torch.tensor([max_samples])
+        filtered_batch.append(item)
+    
+    if not filtered_batch:
+        # If all sequences were filtered out, take first sequence and truncate it
+        item = batch[0]
+        item['inputs'] = item['inputs'][:, :max_samples]
+        item['supervisions']['num_frames'] = torch.tensor([max_samples])
+        filtered_batch = [item]
+    
+    # Get maximum length in batch
+    max_len = max(item['inputs'].size(1) for item in filtered_batch)
     
     padded_waveforms = []
     padded_tokens = []
@@ -174,7 +199,7 @@ def collate_fn(batch: list) -> dict:
     texts = []
     audio_paths = []
     
-    for item in batch:
+    for item in filtered_batch:
         # Handle waveform padding
         waveform = item['inputs']  # shape: (1, time)
         pad_len = max_len - waveform.size(1)
@@ -186,7 +211,7 @@ def collate_fn(batch: list) -> dict:
         
         # Handle token padding
         tokens = item['supervisions']['tokens']
-        token_pad_len = max_token_len - tokens.size(0)
+        token_pad_len = max(len(t) for t in tokens) - len(tokens)
         if token_pad_len > 0:
             # Pad with zeros
             token_pad = torch.zeros(token_pad_len, dtype=tokens.dtype)

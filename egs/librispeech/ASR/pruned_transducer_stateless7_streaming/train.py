@@ -1030,14 +1030,15 @@ def compute_loss(
         sp: Sentence piece processor
         batch: A batch of data
         is_training: Whether this is a training batch
-        is_pre_training: Whether this is a pre-training batch
-        chunk_size: Chunk size for streaming mode
+        is_pre_training: Whether this is a pre-training phase
+        chunk_size: Chunk size for streaming mode (in samples)
     
     Returns:
         (loss, MetricsTracker) containing loss and statistics
     """
     device = next(model.parameters()).device
     feature = batch["inputs"].to(device)
+    feature_lens = batch["supervisions"]["num_frames"].to(device)
     
     # Get supervisions
     supervisions = batch["supervisions"]
@@ -1046,32 +1047,55 @@ def compute_loss(
     y = k2.RaggedTensor(y).to(device)
     
     if is_pre_training:
-        # Pre-training phase: process full sequence
-        encoder_out = model.encoder(feature)
+        # Pre-training phase: full sequence processing without chunking
+        encoder_out, encoder_out_lens = model.encoder(
+            x=feature,
+            x_lens=feature_lens,
+            is_pre_training=True
+        )
     else:
-        # Streaming phase: process in chunks
+        # Streaming phase: process in chunks with attention sink
         encoder_out = process_streaming_chunks(
             model=model,
             feature=feature,
-            chunk_size=chunk_size,
+            chunk_size=chunk_size or params.chunk_sizes["320ms"],  # Default to best performing size
             attention_sink_size=params.attention_sink_size,
             left_context_chunks=params.left_context_chunks
         )
+        # Calculate encoder output lengths based on chunk processing
+        encoder_out_lens = ((feature_lens.float() / model.encoder.downsample_factor).floor()).to(torch.int64)
+        encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
+    
+    # Project encoder output if using XLSR
+    if hasattr(model, 'encoder_proj'):
+        encoder_out = model.encoder_proj(encoder_out)
     
     # Compute transducer loss
-    loss = model(
+    simple_loss, pruned_loss = model(
         x=encoder_out,
+        x_lens=encoder_out_lens,
         y=y,
         prune_range=params.prune_range,
         am_scale=params.am_scale,
         lm_scale=params.lm_scale,
     )
     
+    # Combine losses according to paper
+    if is_pre_training:
+        # During pre-training, use only simple loss for better convergence
+        loss = simple_loss
+    else:
+        # During streaming, combine both losses with scaling
+        loss = params.simple_loss_scale * simple_loss + (1 - params.simple_loss_scale) * pruned_loss
+    
     assert loss.requires_grad == is_training
     
     info = MetricsTracker()
     info["frames"] = feature.size(0)
     info["loss"] = loss.detach().cpu().item()
+    if not is_pre_training:
+        info["simple_loss"] = simple_loss.detach().cpu().item()
+        info["pruned_loss"] = pruned_loss.detach().cpu().item()
     
     return loss, info
 

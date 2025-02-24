@@ -551,7 +551,7 @@ def get_params() -> AttributeDict:
             
             # XLSR specific parameters
             "use_xlsr": True,
-            "xlsr_model_name": "facebook/wav2vec2-xls-r-300m",
+            "xlsr_model_name": "TalTechNLP/xls-r-300m-et",
             "attention_sink_size": 16,  # Paper's optimal setting
             "decode_chunk_size": 5120,  # 320ms at 16kHz
             "left_context_chunks": 1,   # Paper's optimal setting
@@ -573,19 +573,41 @@ def get_params() -> AttributeDict:
 
 def get_encoder_model(params: AttributeDict) -> nn.Module:
     if getattr(params, 'use_xlsr', False):
-        # Create XLSR encoder with streaming capabilities built-in
-        encoder = XLSREncoder(
-            model_name=params.xlsr_model_name,
-            decode_chunk_size=params.decode_chunk_size,  # 320ms at 16kHz
-            chunk_overlap=params.decode_chunk_size // 2,  # Half of chunk size
-            use_attention_sink=True,
-            attention_sink_size=params.attention_sink_size,  # 16 frames (paper's optimal)
-            frame_duration=params.frame_duration,  # 25ms per frame
-            frame_stride=params.frame_stride,    # 20ms stride
-            min_chunk_size=2560,   # 160ms at 16kHz (16 frames)
-            max_chunk_size=20480,  # 1280ms at 16kHz (128 frames)
-            left_context_chunks=params.left_context_chunks  # 1 chunk (paper's optimal)
-        )
+        from transformers import Wav2Vec2Processor
+        # First try to load Estonian-specific model and processor
+        model_names = [
+            "TalTechNLP/xls-r-300m-et",  # TalTechNLP Estonian XLSR
+            "tartuNLP/wav2vec2-large-xls-r-300m-et",  # Estonian from TartuNLP
+            "facebook/wav2vec2-xls-r-300m",  # Base multilingual
+        ]
+        
+        for model_name in model_names:
+            try:
+                # Create processor and store it in params for later use
+                params.wav2vec2_processor = Wav2Vec2Processor.from_pretrained(model_name)
+                logging.info(f"Successfully loaded processor from {model_name}")
+                
+                # Create XLSR encoder with streaming capabilities built-in
+                encoder = XLSREncoder(
+                    model_name=model_name,
+                    decode_chunk_size=params.decode_chunk_size,  # 320ms at 16kHz
+                    chunk_overlap=params.decode_chunk_size // 2,  # Half of chunk size
+                    use_attention_sink=True,
+                    attention_sink_size=params.attention_sink_size,  # 16 frames (paper's optimal)
+                    frame_duration=params.frame_duration,  # 25ms per frame
+                    frame_stride=params.frame_stride,    # 20ms stride
+                    min_chunk_size=2560,   # 160ms at 16kHz (16 frames)
+                    max_chunk_size=20480,  # 1280ms at 16kHz (128 frames)
+                    left_context_chunks=params.left_context_chunks  # 1 chunk (paper's optimal)
+                )
+                logging.info(f"Successfully loaded XLSR encoder from {model_name}")
+                break
+            except Exception as e:
+                logging.warning(f"Could not load {model_name}: {str(e)}")
+                continue
+        else:
+            raise ValueError("Could not load any pre-trained XLSR model")
+            
         # Verify the encoder is properly initialized
         assert isinstance(encoder, XLSREncoder), f"Expected XLSREncoder, got {type(encoder)}"
         return encoder
@@ -815,13 +837,8 @@ def compute_loss(
     # Get total number of elements (using axis=1 for flattened size)
     total_elements = shape.tot_size(1)  # Get total size along token dimension
     
-    # Debug logging
-    logging.debug(f"Shape expects {total_elements} elements")
-    logging.debug(f"Original flattened tokens size: {tokens.flatten().size(0)}")
-    
     # Ensure values tensor matches shape's elements
     values = tokens.flatten()[:total_elements].to(dtype=torch.int32)
-    logging.debug(f"Final values size: {values.size(0)}")
     
     # Create RaggedTensor with proper shape and values
     ragged_y = k2.RaggedTensor(shape=shape, value=values)
@@ -829,6 +846,37 @@ def compute_loss(
     # Calculate loss with proper gradient context
     if not is_training:
         with torch.no_grad():
+            # Get encoder output for decoding
+            encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
+            if isinstance(model, DDP):
+                encoder_out = model.module.encoder_proj(encoder_out)
+            else:
+                encoder_out = model.encoder_proj(encoder_out)
+            
+            # Use greedy search batch for decoding
+            hyp_tokens = greedy_search_batch(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+            )
+            
+            # Convert predictions to text
+            hyp_texts = []
+            for tokens in hyp_tokens:
+                if isinstance(tokens, torch.Tensor):
+                    tokens = tokens.tolist()
+                elif not isinstance(tokens, list):
+                    tokens = list(tokens)
+                text = sp.decode(tokens)
+                hyp_texts.append(text)
+            
+            # Compute WER
+            total_words = sum(len(ref.split()) for ref in texts)
+            total_errors = sum(editdistance.eval(hyp.split(), ref.split()) 
+                             for hyp, ref in zip(hyp_texts, texts))
+            wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
+            
+            # Compute loss
             simple_loss, pruned_loss = model(
                 x=feature,
                 x_lens=feature_lens,
@@ -837,48 +885,6 @@ def compute_loss(
                 am_scale=params.am_scale,
                 lm_scale=params.lm_scale,
             )
-            
-            # Compute WER using greedy search decoding
-            # Get encoder output for decoding
-            encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
-            if hasattr(model, 'encoder_proj'):
-                encoder_out = model.encoder_proj(encoder_out)
-            
-            # Process each sample individually to avoid shape mismatches
-            hyp_tokens = []
-            blank_id = model.decoder.blank_id if hasattr(model.decoder, 'blank_id') else 0
-            batch_size = encoder_out.size(0)
-            
-            for i in range(batch_size):
-                cur_len = encoder_out_lens[i].item()
-                if cur_len <= 0:
-                    hyp_tokens.append([blank_id])
-                    continue
-                    
-                # Get encoder output for this sample
-                cur_encoder_out = encoder_out[i:i+1, :cur_len]  # Keep batch dim
-                cur_encoder_lens = torch.tensor([cur_len], device=device, dtype=torch.int32)
-                
-                # Use greedy search on single sample
-                from beam_search import greedy_search
-                try:
-                    cur_hyp = greedy_search(
-                        model=model,
-                        encoder_out=cur_encoder_out,
-                        max_sym_per_frame=1,
-                    )
-                    hyp_tokens.append(cur_hyp if len(cur_hyp) > 0 else [blank_id])
-                except Exception as e:
-                    logging.warning(f"Greedy search failed for sample {i}: {str(e)}")
-                    hyp_tokens.append([blank_id])
-            
-            # Decode token sequences to texts
-            hyp_texts = [sp.decode(tokens) for tokens in hyp_tokens]
-            
-            # Compute word error rate (WER)
-            total_words = sum(len(ref.split()) for ref in texts)
-            total_errors = sum(editdistance.eval(hyp.split(), ref.split()) for hyp, ref in zip(hyp_texts, texts))
-            wer = 100.0 * total_errors / total_words if total_words > 0 else float('inf')
     else:
         simple_loss, pruned_loss = model(
             x=feature,
@@ -949,15 +955,27 @@ def decode_one_batch_hyps(
     supervisions = batch["supervisions"]
     feature_lens = supervisions["num_frames"].to(device)
     
-    # Get encoder output
+    # Get encoder output with streaming settings
     with torch.no_grad():
-        encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
+        # Add right context padding for streaming
+        right_context = params.decode_chunk_len // 2
+        feature_lens_pad = feature_lens + right_context
+        feature_pad = torch.nn.functional.pad(
+            feature,
+            pad=(0, 0, 0, right_context),
+            value=LOG_EPS,
+        )
+        
+        # Get encoder output
+        encoder_out, encoder_out_lens = model.encoder(feature_pad, feature_lens_pad)
+        
+        # Project encoder output
         if isinstance(model, DDP):
             encoder_out = model.module.encoder_proj(encoder_out)
         else:
             encoder_out = model.encoder_proj(encoder_out)
         
-        # Get predictions using greedy search
+        # Use greedy search batch for decoding
         hyp_tokens = greedy_search_batch(
             model=model,
             encoder_out=encoder_out,
@@ -982,6 +1000,12 @@ def decode_one_batch_hyps(
             pred_tokens = pred_tokens.tolist()
         elif not isinstance(pred_tokens, list):
             pred_tokens = list(pred_tokens)
+            
+        # Remove any padding or special tokens
+        while pred_tokens and pred_tokens[-1] == params.blank_id:
+            pred_tokens.pop()
+            
+        # Convert to text
         pred = sp.decode(pred_tokens)
         preds.append(pred)
     
@@ -1275,7 +1299,17 @@ def run(rank, world_size, args):
         from estonian_dataset import EstonianASRDataset, collate_fn
         logging.info("Using Estonian dataset")
         
-        train_dataset = EstonianASRDataset(params.train_txt, base_path=params.audio_base_path, sp=sp)
+        # Get processor from params (set during encoder initialization)
+        processor = getattr(params, 'wav2vec2_processor', None)
+        if processor is None:
+            logging.warning("No XLSR processor found, will use basic audio normalization")
+        
+        train_dataset = EstonianASRDataset(
+            params.train_txt, 
+            base_path=params.audio_base_path, 
+            sp=sp,
+            processor=processor
+        )
         train_dl = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=params.batch_size,
@@ -1284,7 +1318,12 @@ def run(rank, world_size, args):
             num_workers=2,
         )
         
-        valid_dataset = EstonianASRDataset(params.val_txt, base_path=params.audio_base_path, sp=sp)
+        valid_dataset = EstonianASRDataset(
+            params.val_txt, 
+            base_path=params.audio_base_path, 
+            sp=sp,
+            processor=processor
+        )
         valid_dl = torch.utils.data.DataLoader(
             valid_dataset,
             batch_size=params.batch_size,

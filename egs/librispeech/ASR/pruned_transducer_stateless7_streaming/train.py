@@ -827,6 +827,13 @@ def compute_loss(
     feature = batch["inputs"]
     feature = feature.to(device)
     
+    # Fix input shape for XLSR - remove extra dimensions
+    if feature.ndim == 4:  # [batch, channel, time, extra_dim]
+        feature = feature.squeeze(-1)  # Remove last dimension
+    if feature.ndim == 3:  # [batch, channel, time]
+        feature = feature.squeeze(1)  # Remove channel dimension
+    assert feature.ndim == 2, f"Expected 2D input (batch, time), got shape {feature.shape}"
+    
     # Get supervisions
     supervisions = batch["supervisions"]
     feature_lens = supervisions["num_frames"].to(device)

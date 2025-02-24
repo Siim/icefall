@@ -168,6 +168,14 @@ class EstonianASRDataset(Dataset):
 
 
 def collate_fn(batch: list) -> dict:
+    """Collate function for DataLoader that properly handles padding and shapes.
+    
+    Args:
+        batch: List of samples from EstonianASRDataset
+        
+    Returns:
+        Dictionary with batched data
+    """
     # Collate function pads raw waveforms along the time dimension
     max_len = max(item['inputs'].size(1) for item in batch)
     max_token_len = max(item['supervisions']['tokens'].size(0) for item in batch)
@@ -206,7 +214,6 @@ def collate_fn(batch: list) -> dict:
     
     # Stack to get tensors
     inputs = torch.cat(padded_waveforms, dim=0)  # (batch, time)
-    inputs = inputs.unsqueeze(-1)  # Add channel dimension at the end
     tokens = torch.stack(padded_tokens)  # (batch, max_token_len)
     token_lens = torch.cat(token_lens)  # (batch,)
     

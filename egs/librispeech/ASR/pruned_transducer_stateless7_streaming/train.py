@@ -1592,7 +1592,6 @@ def run(rank, world_size, args):
         optimizer,
         lr_batches=params.lr_batches,
         lr_epochs=params.lr_epochs,
-        warmup_steps=params.warmup_steps,
         custom_lr_func=lr_scheduler,
     )
 

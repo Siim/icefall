@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 from typing import Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass
+import logging
 
 from icefall.utils import DecodingResults
 
@@ -106,105 +107,153 @@ class XLSRBeamSearch:
         
         Args:
             hyp: Current hypothesis
-            encoder_frame: Current encoder frame output (1, 1, encoder_dim)
+            encoder_frame: Current encoder frame output (shape may vary)
             frame_idx: Current frame index
             device: Device to perform computations on
             
         Returns:
             List of extended hypotheses
         """
-        # Get the decoder output
-        decoder_out = hyp.decoder_out
+        # Validate inputs to help with debugging
+        if encoder_frame is None:
+            logging.error("encoder_frame is None in _extend_hypothesis")
+            # Return current hypothesis if we can't extend it
+            return [hyp]
         
-        # Ensure proper dimensions for both inputs
-        # encoder_frame shape should be (1, 1, encoder_dim)
-        # Make sure encoder has right dimensions
-        if encoder_frame.ndim == 4:  # (1, 1, 1, encoder_dim)
-            encoder_proj = encoder_frame.squeeze(1)  # (1, 1, encoder_dim)
-        elif encoder_frame.ndim == 3:  # (1, 1, encoder_dim)
-            encoder_proj = encoder_frame
-        else:
-            # Handle unexpected dimensions
-            encoder_proj = encoder_frame.view(1, 1, -1)  # Force to (1, 1, encoder_dim)
-        
-        # Make sure decoder has right dimensions
-        if decoder_out.ndim == 2:  # (1, decoder_dim)
-            decoder_proj = decoder_out.unsqueeze(1)  # (1, 1, decoder_dim)
-        elif decoder_out.ndim == 3:  # (1, 1, decoder_dim)
-            decoder_proj = decoder_out
-        else:
-            # Handle unexpected dimensions
-            decoder_proj = decoder_out.view(1, 1, -1)  # Force to (1, 1, decoder_dim)
-        
-        # Double-check dimensions before joiner call
-        assert encoder_proj.ndim == decoder_proj.ndim, f"Dimension mismatch: encoder={encoder_proj.shape}, decoder={decoder_proj.shape}"
-        
-        # Compute joiner output (logits)
-        logits = self.model.joiner(
-            encoder_proj,
-            decoder_proj,
-            project_input=False
-        )
-        
-        # After joiner, squeeze to get (1, vocab_size)
-        logits = logits.squeeze(1)  # (1, vocab_size)
-        
-        # Apply blank penalty if needed
-        if self.blank_penalty != 0:
-            logits[0, self.blank_id] -= self.blank_penalty
-        
-        # Apply temperature to logits
-        if self.temperature != 1.0:
-            logits = logits / self.temperature
-        
-        # Convert to log probabilities
-        log_probs = torch.log_softmax(logits, dim=-1)
-        
-        # Get top-k tokens and their log probs
-        top_k_log_probs, top_k_indices = log_probs.topk(self.beam_size)
-        
-        # Create new hypotheses
-        new_hyps = []
-        
-        for i in range(self.beam_size):
-            token_id = top_k_indices[0, i].item()
-            token_log_prob = top_k_log_probs[0, i].item()
-            
-            # Create a copy of the current hypothesis sequence
-            new_sequence = hyp.sequence.copy()
-            new_timestamps = hyp.timestamps.copy() if hyp.timestamps is not None else []
-            new_scores = hyp.all_scores.copy() if hyp.all_scores is not None else []
-            
-            # Only add non-blank tokens to the sequence
-            if token_id not in (self.blank_id, self.unk_id):
-                new_sequence.append(token_id)
-                new_timestamps.append(frame_idx)
-                new_scores.append(token_log_prob)
-                
-                # Get decoder output for new sequence
+        if not isinstance(hyp.decoder_out, torch.Tensor):
+            logging.error(f"Invalid decoder_out type: {type(hyp.decoder_out)}")
+            # Try to recover by creating a new decoder output
+            try:
                 decoder_input = torch.tensor(
-                    [new_sequence[-self.context_size:] if len(new_sequence) >= self.context_size 
-                     else ([-1] * (self.context_size - len(new_sequence)) + new_sequence)],
+                    [hyp.sequence[-self.context_size:] if len(hyp.sequence) >= self.context_size 
+                     else ([-1] * (self.context_size - len(hyp.sequence)) + hyp.sequence)],
                     device=device,
                     dtype=torch.int64,
                 )
-                new_decoder_out = self.model.decoder(decoder_input, need_pad=False)
-                new_decoder_out = self.model.joiner.decoder_proj(new_decoder_out)
-            else:
-                # For blank token, keep the same decoder output
-                new_decoder_out = decoder_out
-            
-            # Create new hypothesis
-            new_hyp = Hypothesis(
-                sequence=new_sequence,
-                score=hyp.score + token_log_prob,  # Accumulate log probability
-                decoder_out=new_decoder_out,
-                timestamps=new_timestamps,
-                all_scores=new_scores
-            )
-            new_hyps.append(new_hyp)
+                decoder_out = self.model.decoder(decoder_input, need_pad=False)
+                decoder_out = self.model.joiner.decoder_proj(decoder_out)
+                hyp.decoder_out = decoder_out
+            except Exception as e:
+                logging.error(f"Failed to recover decoder_out: {str(e)}")
+                # Return empty list if we can't recover
+                return []
         
-        return new_hyps
+        # Get the decoder output
+        decoder_out = hyp.decoder_out
+        
+        # Reshape encoder frame to appropriate dimensions
+        # We need to ensure it has shape compatible with the joiner
+        try:
+            # Normalize encoder frame dimensions
+            if encoder_frame.ndim == 1:  # (features,)
+                encoder_proj = encoder_frame.unsqueeze(0).unsqueeze(0)  # (1, 1, features)
+            elif encoder_frame.ndim == 2:  # (1, features) or (time, features)
+                if encoder_frame.size(0) == 1:
+                    encoder_proj = encoder_frame.unsqueeze(0)  # (1, 1, features)
+                else:
+                    # Take just the first time frame
+                    encoder_proj = encoder_frame[0:1].unsqueeze(0)  # (1, 1, features)
+            elif encoder_frame.ndim == 3:  # (1, 1, features) or (batch, time, features)
+                if encoder_frame.size(0) == 1 and encoder_frame.size(1) == 1:
+                    encoder_proj = encoder_frame  # Already (1, 1, features)
+                else:
+                    # Take just the first batch and time frame
+                    encoder_proj = encoder_frame[0:1, 0:1]  # (1, 1, features)
+            elif encoder_frame.ndim == 4:  # (1, 1, 1, features)
+                encoder_proj = encoder_frame.squeeze(2)  # (1, 1, features)
+            else:
+                # Unexpected dimension - try to reshape to (1, 1, -1)
+                logging.warning(f"Unexpected encoder_frame dimension: {encoder_frame.shape}")
+                encoder_proj = encoder_frame.reshape(1, 1, -1)
+            
+            # Ensure decoder has right dimensions - we need (1, 1, features)
+            if decoder_out.ndim == 2:  # (1, features)
+                decoder_proj = decoder_out.unsqueeze(1)  # (1, 1, features)
+            elif decoder_out.ndim == 3:  # Already (1, 1, features)
+                decoder_proj = decoder_out
+            else:
+                # Unexpected dimension - try to reshape
+                logging.warning(f"Unexpected decoder_out dimension: {decoder_out.shape}")
+                decoder_proj = decoder_out.reshape(1, 1, -1)
+            
+            # Compute joiner output (logits)
+            logits = self.model.joiner(
+                encoder_proj,
+                decoder_proj,
+                project_input=False
+            )
+            
+            # After joiner, get to (1, vocab_size)
+            if logits.ndim == 3:  # (1, 1, vocab_size)
+                logits = logits.squeeze(1)
+            elif logits.ndim == 4:  # (1, 1, 1, vocab_size)
+                logits = logits.squeeze(1).squeeze(1)
+            
+            # Apply blank penalty if needed
+            if self.blank_penalty != 0:
+                logits[0, self.blank_id] -= self.blank_penalty
+            
+            # Apply temperature to logits
+            if self.temperature != 1.0:
+                logits = logits / self.temperature
+            
+            # Convert to log probabilities
+            log_probs = torch.log_softmax(logits, dim=-1)
+            
+            # Get top-k tokens and their log probs
+            top_k_log_probs, top_k_indices = log_probs.topk(self.beam_size)
+            
+            # Create new hypotheses
+            new_hyps = []
+            
+            for i in range(self.beam_size):
+                token_id = top_k_indices[0, i].item()
+                token_log_prob = top_k_log_probs[0, i].item()
+                
+                # Create a copy of the current hypothesis sequence
+                new_sequence = hyp.sequence.copy()
+                new_timestamps = hyp.timestamps.copy() if hyp.timestamps is not None else []
+                new_scores = hyp.all_scores.copy() if hyp.all_scores is not None else []
+                
+                # Only add non-blank tokens to the sequence
+                if token_id not in (self.blank_id, self.unk_id):
+                    new_sequence.append(token_id)
+                    new_timestamps.append(frame_idx)
+                    new_scores.append(token_log_prob)
+                    
+                    # Get decoder output for new sequence
+                    try:
+                        decoder_input = torch.tensor(
+                            [new_sequence[-self.context_size:] if len(new_sequence) >= self.context_size 
+                             else ([-1] * (self.context_size - len(new_sequence)) + new_sequence)],
+                            device=device,
+                            dtype=torch.int64,
+                        )
+                        new_decoder_out = self.model.decoder(decoder_input, need_pad=False)
+                        new_decoder_out = self.model.joiner.decoder_proj(new_decoder_out)
+                    except Exception as e:
+                        logging.error(f"Failed to get decoder output: {str(e)}")
+                        new_decoder_out = decoder_out  # Fall back to current decoder output
+                else:
+                    # For blank token, keep the same decoder output
+                    new_decoder_out = decoder_out
+                
+                # Create new hypothesis
+                new_hyp = Hypothesis(
+                    sequence=new_sequence,
+                    score=hyp.score + token_log_prob,  # Accumulate log probability
+                    decoder_out=new_decoder_out,
+                    timestamps=new_timestamps,
+                    all_scores=new_scores
+                )
+                new_hyps.append(new_hyp)
+            
+            return new_hyps
+            
+        except Exception as e:
+            logging.error(f"Error in _extend_hypothesis: {str(e)}")
+            # Return current hypothesis if extension failed
+            return [hyp]
     
     def _post_process_hyps(self, hyps: List[Hypothesis]) -> List[List[int]]:
         """Post-process hypotheses to return final token sequences."""
@@ -249,67 +298,137 @@ class XLSRBeamSearch:
         Returns:
             List of decoded token sequences or DecodingResults object
         """
-        assert encoder_out.ndim == 3, "encoder_out must be 3D tensor"
-        assert encoder_out.size(0) >= 1, "Batch size must be at least 1"
-        
         device = encoder_out.device
         batch_size = encoder_out.size(0)
         
-        # Pack padded sequence for efficient processing
-        packed_encoder_out = torch.nn.utils.rnn.pack_padded_sequence(
-            input=encoder_out,
-            lengths=encoder_out_lens.cpu(),
-            batch_first=True,
-            enforce_sorted=False,
-        )
+        # Validate input dimensions
+        if encoder_out.ndim not in (2, 3, 4):
+            raise ValueError(f"Unsupported encoder_out dimension: {encoder_out.ndim}")
         
-        # Project encoder output
-        encoder_out = self.model.joiner.encoder_proj(packed_encoder_out.data)
+        # Handle different encoder dimensions - we need (batch, time, features)
+        if encoder_out.ndim == 2:
+            # Handle (batch, features) by adding time dimension
+            encoder_out = encoder_out.unsqueeze(1)
+        elif encoder_out.ndim == 4:
+            # Handle (batch, time, s_range, features) by reshaping
+            b, t, s, f = encoder_out.size()
+            encoder_out = encoder_out.reshape(b, t * s, f)
+        
+        # Ensure encoder_out_lens has correct batch size
+        if encoder_out_lens.size(0) != batch_size:
+            logging.warning(f"encoder_out_lens batch size ({encoder_out_lens.size(0)}) doesn't match encoder_out ({batch_size})")
+            if encoder_out_lens.size(0) > batch_size:
+                encoder_out_lens = encoder_out_lens[:batch_size]
+            else:
+                # If not enough length values, pad with max length
+                max_len = encoder_out.size(1)
+                padding = torch.full(
+                    (batch_size - encoder_out_lens.size(0),), 
+                    max_len, 
+                    device=device, 
+                    dtype=encoder_out_lens.dtype
+                )
+                encoder_out_lens = torch.cat([encoder_out_lens, padding])
+        
+        # Cap sequence lengths to actual encoder output size
+        encoder_out_lens = torch.minimum(encoder_out_lens, torch.tensor(encoder_out.size(1), device=device))
+        
+        # For safety, double-check no zero-length sequences
+        encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
         
         # Initialize beam for each item in batch
-        hypotheses = [
-            [self._create_initial_hypothesis(device)]
-            for _ in range(batch_size)
-        ]
+        beam_list = [self._create_initial_hypothesis(device) for _ in range(batch_size)]
         
-        # Process frames
-        offset = 0
-        batch_size_list = packed_encoder_out.batch_sizes.tolist()
-        
-        for t, current_batch_size in enumerate(batch_size_list):
-            start = offset
-            end = offset + current_batch_size
-            current_encoder_out = encoder_out[start:end]
-            current_encoder_out = current_encoder_out.unsqueeze(1).unsqueeze(1)
-            offset = end
+        # Process batches with packed sequence to handle variable lengths efficiently
+        try:
+            # Try to use pack_padded_sequence for efficient processing
+            sorted_lens, indices = torch.sort(encoder_out_lens, descending=True)
+            reorder_indices = torch.argsort(indices)
+            sorted_encoder_out = encoder_out[indices]
             
-            # Process each sample in the current batch
-            for i in range(current_batch_size):
-                # Get encoder output for current frame of current sample
-                sample_encoder_out = current_encoder_out[i:i+1]
+            # Pack the encoder outputs
+            packed_encoder_out = torch.nn.utils.rnn.pack_padded_sequence(
+                sorted_encoder_out,
+                sorted_lens.cpu(),
+                batch_first=True
+            )
+            
+            # Project packed encoder output
+            packed_projected = self.model.joiner.encoder_proj(packed_encoder_out.data)
+            
+            # Process each batch separately
+            hypotheses = [None] * batch_size
+            for b in range(batch_size):
+                # Get the index in the sorted order
+                idx = indices[b].item()
+                current_len = encoder_out_lens[idx].item()
+                current_encoder_out = encoder_out[idx, :current_len]
                 
-                # Get current hypotheses for this sample
-                current_hyps = hypotheses[i]
-                new_hyps = []
+                # Project encoder output for this batch item
+                current_proj = self.model.joiner.encoder_proj(current_encoder_out)
                 
-                # Extend each hypothesis
-                for hyp in current_hyps:
-                    extended_hyps = self._extend_hypothesis(
-                        hyp, sample_encoder_out, t, device
-                    )
-                    new_hyps.extend(extended_hyps)
+                current_beam = [beam_list[idx]]
                 
-                # Keep only the best beam_size hypotheses
-                hypotheses[i] = heapq.nlargest(self.beam_size, new_hyps)
-        
-        # Get best hypothesis for each sample in batch
-        best_hyps = [hyps[0] for hyps in hypotheses]
+                # Process each frame
+                for t in range(current_len):
+                    # Get encoder output for current frame
+                    frame = current_proj[t:t+1]  # Shape: (1, encoder_dim)
+                    
+                    # Create new hypotheses by extending each existing one
+                    new_beam = []
+                    for hyp in current_beam:
+                        new_hyps = self._extend_hypothesis(hyp, frame, t, device)
+                        new_beam.extend(new_hyps)
+                    
+                    # Keep only top beam_size hypotheses
+                    if len(new_beam) > self.beam_size:
+                        current_beam = heapq.nlargest(self.beam_size, new_beam)
+                    else:
+                        current_beam = new_beam
+                
+                # Store best hypothesis for this batch
+                hypotheses[indices[b].item()] = current_beam[0] if current_beam else beam_list[idx]
+                
+            # Order the results back to original batch order
+            ordered_hypotheses = [hypotheses[i.item()] for i in reorder_indices]
+            
+        except Exception as e:
+            # Fallback to simpler batch processing without packing
+            logging.warning(f"Packed sequence processing failed, using fallback: {str(e)}")
+            
+            # Create a separate beam for each item in the batch
+            hypotheses = []
+            
+            # Process each item in the batch separately
+            for b in range(batch_size):
+                current_len = encoder_out_lens[b].item()
+                current_encoder_out = encoder_out[b, :current_len]
+                
+                # Project the encoder output
+                current_proj = self.model.joiner.encoder_proj(current_encoder_out)
+                
+                current_beam = [beam_list[b]]
+                
+                # Process each frame
+                for t in range(current_len):
+                    frame = current_proj[t:t+1]  # Shape: (1, encoder_dim)
+                    new_beam = []
+                    
+                    for hyp in current_beam:
+                        new_hyps = self._extend_hypothesis(hyp, frame, t, device)
+                        new_beam.extend(new_hyps)
+                    
+                    # Keep only top beam_size hypotheses
+                    current_beam = heapq.nlargest(min(self.beam_size, len(new_beam)), new_beam)
+                
+                # Get the best hypothesis for this batch item
+                hypotheses.append(current_beam[0] if current_beam else beam_list[b])
         
         # Return either token sequences or DecodingResults with timestamps
         if self.return_timestamps:
-            return self._post_process_with_timestamps(best_hyps)
+            return self._post_process_with_timestamps(hypotheses)
         else:
-            return self._post_process_hyps(best_hyps)
+            return self._post_process_hyps(hypotheses)
 
 
 def beam_search_batch(

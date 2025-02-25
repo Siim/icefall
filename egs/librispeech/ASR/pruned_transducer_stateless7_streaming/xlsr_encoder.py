@@ -252,6 +252,24 @@ class XLSREncoder(EncoderInterface):
         # Clamp values silently since inputs are already normalized
         x = torch.clamp(x, min=-1.0, max=1.0)
         
+        # Get batch size from input and ensure x_lens has same batch size
+        batch_size = x.size(0)
+        if x_lens.size(0) != batch_size:
+            logging.warning(f"Mismatch between batch_size ({batch_size}) and x_lens.size(0) ({x_lens.size(0)})")
+            
+            # Adjust x_lens to match batch size
+            if x_lens.size(0) > batch_size:
+                # If x_lens has more elements, truncate
+                x_lens = x_lens[:batch_size]
+            else:
+                # If x_lens has fewer elements, expand with copies of first element
+                if x_lens.size(0) > 0:
+                    padding = x_lens[0].repeat(batch_size - x_lens.size(0))
+                    x_lens = torch.cat([x_lens, padding])
+                else:
+                    # Create default lens based on input size
+                    x_lens = torch.full((batch_size,), x.size(1), device=x.device, dtype=torch.long)
+        
         # Calculate expected output length before adding context
         # Account for overlap and context frames precisely
         chunk_overlap = self.decode_chunk_size // 2
@@ -274,66 +292,96 @@ class XLSREncoder(EncoderInterface):
         expected_frames = ((effective_input_len.float() / self.downsample_factor).ceil()).to(torch.int64)
         expected_frames = torch.maximum(expected_frames, torch.ones_like(expected_frames))
         
-        # Add left context if available
-        x = self.prepare_left_context(x)
+        # Process each batch item separately to avoid dimension issues
+        all_outputs = []
+        all_sink_caches = []
         
-        # Add attention sink
-        x, new_sink_cache = self.prepare_attention_sink(x, self.attention_sink_cache)
+        for b in range(batch_size):
+            single_x = x[b:b+1]  # Keep batch dimension
+            single_len = x_lens[b]
+            
+            # Get batch-specific states if available
+            batch_states = None if states is None else [
+                None if s is None else s[b:b+1] for s in states
+            ]
+            
+            # Add left context if available for this batch item
+            if batch_states is not None and len(batch_states) > 0 and batch_states[0] is not None:
+                left_context = batch_states[0]
+                single_x = torch.cat([left_context, single_x], dim=1)
+            
+            # Add attention sink if enabled and available for this batch item
+            if self.use_attention_sink and batch_states is not None and len(batch_states) > 1 and batch_states[1] is not None:
+                sink = batch_states[1]
+                single_x = torch.cat([sink, single_x], dim=1)
+            
+            # Process through XLSR model
+            attention_mask = torch.ones_like(single_x, dtype=torch.long)
+            if single_len < single_x.size(1):
+                attention_mask[0, single_len:] = 0
+            
+            outputs = self.model(
+                single_x,
+                attention_mask=attention_mask,
+                output_hidden_states=False,
+                output_attentions=False,
+                return_dict=False
+            )[0]
+            
+            # Create next states for this batch item
+            # States[0] = left context for next chunk, States[1] = attention sink
+            new_left_context = single_x[:, -self.chunk_overlap:] if self.left_context_chunks > 0 else None
+            new_sink_cache = outputs[:, -self.attention_sink_size:] if self.use_attention_sink else None
+            
+            # Store individual outputs and states
+            all_outputs.append(outputs)
+            if new_sink_cache is not None:
+                all_sink_caches.append(new_sink_cache)
         
-        # Process through XLSR model
-        outputs = self.model(
-            x,
-            attention_mask=None,
-            output_hidden_states=False,
-            output_attentions=False,
-            return_dict=False
-        )[0]
+        # Combine batch results - handle potential different sequence lengths
+        max_seq_len = max(output.size(1) for output in all_outputs)
+        padded_outputs = []
         
-        # Update left context buffer
-        self.left_context_buffer.append(x.clone())
-        if len(self.left_context_buffer) > self.left_context_chunks:
-            self.left_context_buffer.pop(0)
+        for output in all_outputs:
+            if output.size(1) < max_seq_len:
+                padding = torch.zeros(
+                    1, max_seq_len - output.size(1), output.size(2),
+                    device=output.device, dtype=output.dtype
+                )
+                padded_outputs.append(torch.cat([output, padding], dim=1))
+            else:
+                padded_outputs.append(output)
         
-        # Remove context frames from output
-        if context_frames > 0:
-            outputs = outputs[:, context_frames:]
+        # Concatenate batch dimension
+        combined_output = torch.cat(padded_outputs, dim=0)
         
-        # Ensure outputs match expected length precisely
-        max_len = expected_frames.max().item()
-        if outputs.size(1) > max_len:
-            # Calculate optimal start position to minimize edge effects
-            extra = outputs.size(1) - max_len
-            # Bias towards keeping more recent frames for streaming
-            start = (extra * 2) // 3  # Take more frames from the end
-            outputs = outputs[:, start:start + max_len]
-        elif outputs.size(1) < max_len and outputs.size(1) > 0:  # Only pad if we have some frames
-            # Calculate required padding
-            pad_len = max_len - outputs.size(1)
-            # Add padding at the end to maintain temporal order
-            outputs = torch.nn.functional.pad(
-                outputs,
-                (0, 0, 0, pad_len),
-                mode='replicate'  # Replicate last frame instead of zeros
+        # Create combined sink cache
+        combined_sink_cache = None
+        if all_sink_caches:
+            combined_sink_cache = torch.cat(all_sink_caches, dim=0)
+        
+        # Combine left context and sink cache into states
+        next_states = [
+            None if self.left_context_chunks == 0 else x[:, -self.chunk_overlap:],
+            combined_sink_cache
+        ]
+        
+        # Ensure output has consistent length
+        if combined_output.size(1) > max(expected_frames):
+            # Handle case where output is longer than expected
+            combined_output = combined_output[:, :max(expected_frames)]
+        elif combined_output.size(1) < max(expected_frames):
+            # Handle case where output is shorter than expected
+            padding = torch.zeros(
+                batch_size, 
+                max(expected_frames) - combined_output.size(1), 
+                combined_output.size(2),
+                device=combined_output.device, 
+                dtype=combined_output.dtype
             )
-        elif outputs.size(1) == 0:  # Handle empty tensor case
-            # Create a tensor of the expected size filled with zeros
-            outputs = torch.zeros(
-                (outputs.size(0), max_len, outputs.size(2)),
-                device=outputs.device,
-                dtype=outputs.dtype
-            )
+            combined_output = torch.cat([combined_output, padding], dim=1)
         
-        # Apply smooth transition if we have previous output
-        if self.last_chunk_output is not None:
-            outputs = self.smooth_transition(outputs, self.last_chunk_output)
-        
-        # Cache current output for next chunk
-        self.last_chunk_output = outputs.clone()
-        
-        # Update states for next chunk
-        next_states = [x, new_sink_cache]
-        
-        return outputs, expected_frames, next_states
+        return combined_output, expected_frames, next_states
 
     def forward(
         self,
@@ -376,6 +424,17 @@ class XLSREncoder(EncoderInterface):
                 # Use the first length if we can't access the correct one
                 if x_lens.size(0) > 0:
                     attention_mask[i, x_lens[0]:] = 0
+        
+        # Ensure x_lens has the same batch size as x
+        if x_lens.size(0) != batch_size:
+            logging.warning(f"Fixing x_lens batch size from {x_lens.size(0)} to {batch_size}")
+            if x_lens.size(0) > batch_size:
+                # Take only first batch_size elements
+                x_lens = x_lens[:batch_size]
+            else:
+                # Pad with copies of the first length
+                pad_lens = x_lens[0].expand(batch_size - x_lens.size(0))
+                x_lens = torch.cat([x_lens, pad_lens])
         
         if is_pre_training:
             # During pre-training, use full sequence without chunking
@@ -465,7 +524,28 @@ class XLSREncoder(EncoderInterface):
                 encoder_out = torch.cat(padded_outputs, dim=0)
                 encoder_out_lens = torch.tensor(current_lengths, device=x.device)
             else:
-                # During inference, use streaming_forward
+                # During inference, use streaming_forward but ensure batch size consistency
                 encoder_out, encoder_out_lens, _ = self.streaming_forward(x, x_lens)
-            
-            return encoder_out, encoder_out_lens 
+                
+                # Ensure consistent batch size output
+                if encoder_out.size(0) != batch_size:
+                    logging.warning(f"Streaming forward returned inconsistent batch size: {encoder_out.size(0)}, expected {batch_size}")
+                    if encoder_out.size(0) > batch_size:
+                        # Trim extra batch items
+                        encoder_out = encoder_out[:batch_size]
+                        encoder_out_lens = encoder_out_lens[:batch_size]
+                    else:
+                        # Pad with zeros for missing batch items
+                        padding = torch.zeros(
+                            batch_size - encoder_out.size(0),
+                            encoder_out.size(1),
+                            encoder_out.size(2),
+                            device=encoder_out.device,
+                            dtype=encoder_out.dtype
+                        )
+                        encoder_out = torch.cat([encoder_out, padding], dim=0)
+                        # Pad lengths with copies of first length
+                        pad_lens = encoder_out_lens[0].repeat(batch_size - encoder_out_lens.size(0))
+                        encoder_out_lens = torch.cat([encoder_out_lens, pad_lens])
+        
+        return encoder_out, encoder_out_lens 

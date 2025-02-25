@@ -41,19 +41,49 @@ class Joiner(nn.Module):
         """
         Args:
           encoder_out:
-            Output from the encoder. Its shape is (N, T, s_range, C).
+            Output from the encoder. Its shape is typically:
+            - (N, T, C) for 3D inputs (from XLSR encoder)
+            - (N, T, s_range, C) for 4D inputs 
+            - (N, C) for 2D inputs
           decoder_out:
-            Output from the decoder. Its shape is (N, T, s_range, C).
-           project_input:
+            Output from the decoder. Should have matching dimensions:
+            - (N, T, C) for 3D inputs
+            - (N, T, s_range, C) for 4D inputs
+            - (N, C) for 2D inputs
+          project_input:
             If true, apply input projections encoder_proj and decoder_proj.
             If this is false, it is the user's responsibility to do this
             manually.
         Returns:
-          Return a tensor of shape (N, T, s_range, C).
+          Return a tensor matching the input dimensions (N, T, [s_range], C).
         """
-        assert encoder_out.ndim == decoder_out.ndim
-        assert encoder_out.ndim in (2, 4)
-
+        # Handle dimension matching for different encoder types (XLSR vs Zipformer)
+        assert encoder_out.ndim in (2, 3, 4), f"Encoder output has unsupported dimension: {encoder_out.ndim}"
+        assert decoder_out.ndim in (2, 3, 4), f"Decoder output has unsupported dimension: {decoder_out.ndim}"
+        
+        # When dimensions don't match, we need to reshape appropriately
+        if encoder_out.ndim != decoder_out.ndim:
+            # Case: encoder_out is 3D (N,T,C) and decoder_out is 2D (N,C)
+            if encoder_out.ndim == 3 and decoder_out.ndim == 2:
+                # Expand decoder_out to match encoder time dimension
+                decoder_out = decoder_out.unsqueeze(1).expand(-1, encoder_out.size(1), -1)
+            # Case: encoder_out is 2D (N,C) and decoder_out is 3D (N,T,C)
+            elif encoder_out.ndim == 2 and decoder_out.ndim == 3:
+                # Expand encoder_out to match decoder time dimension
+                encoder_out = encoder_out.unsqueeze(1).expand(-1, decoder_out.size(1), -1)
+            # Handle 4D cases by reshaping to 3D when necessary
+            elif encoder_out.ndim == 4 and decoder_out.ndim == 3:
+                # Reshape 4D encoder output to 3D by merging T and s_range dimensions
+                batch_size, T, s_range, channels = encoder_out.size()
+                encoder_out = encoder_out.reshape(batch_size, T * s_range, channels)
+            elif encoder_out.ndim == 3 and decoder_out.ndim == 4:
+                # Add missing s_range dimension to encoder output
+                encoder_out = encoder_out.unsqueeze(2)
+        
+        # Debug logging for dimensions
+        # import logging
+        # logging.debug(f"Joiner shapes: encoder={encoder_out.shape}, decoder={decoder_out.shape}")
+        
         if project_input:
             logit = self.encoder_proj(encoder_out) + self.decoder_proj(decoder_out)
         else:

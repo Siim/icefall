@@ -124,12 +124,12 @@ class Transducer(nn.Module):
 
         # Get encoder output
         if encoder_outputs_provided:
-            # x is already encoder output
-            encoder_out = x
+            # x is already encoder output but may still need projection if from XLSR
+            encoder_out = self.encoder_proj(x)
         else:
             # Process x through the encoder
             encoder_out, x_lens = self.encoder(x, x_lens)
-            # Project XLSR output if needed
+            # Apply encoder projection 
             encoder_out = self.encoder_proj(encoder_out)
         
         # Ensure x_lens matches actual encoder output size

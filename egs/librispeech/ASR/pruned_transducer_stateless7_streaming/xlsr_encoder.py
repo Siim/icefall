@@ -32,152 +32,85 @@ class EncoderInterface(nn.Module):
         self,
         x: torch.Tensor,
         x_lens: torch.Tensor,
-        states: Optional[List[List[Optional[torch.Tensor]]]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[List[Optional[torch.Tensor]]]]:
+        states: Optional[List[torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
+        """Streaming forward pass
+        Args:
+            x: Input tensor (batch, time) or (batch, time, 1)
+            x_lens: Length of each sequence in batch
+            states: Optional cached states from previous chunk
+        Returns:
+            (encoder_out, encoder_out_lens, next_states)
         """
-        Memory-optimized streaming forward pass
-        """
-        # Ensure input is float and in correct shape
-        x = x.float()
-        if x.ndim == 3:
-            x = x.squeeze(-1)
+        raise NotImplementedError
+
+    def get_init_state(self, device: Optional[torch.device] = None) -> List[Optional[torch.Tensor]]:
+        """Get initial states for streaming inference"""
+        raise NotImplementedError
+
+class XLSREncoder(EncoderInterface):
+    def __init__(
+        self, 
+        model_name: str = "TalTechNLP/xls-r-300m-et",
+        decode_chunk_size: int = 5120,  # 320ms at 16kHz (paper's best performing)
+        chunk_overlap: int = None,  # Will be set to decode_chunk_size // 2
+        use_attention_sink: bool = True,
+        attention_sink_size: int = 16,  # Paper's optimal setting
+        frame_duration: float = 0.025,  # 25ms per frame (from paper)
+        frame_stride: float = 0.020,  # 20ms stride (from paper)
+        min_chunk_size: int = 2560,  # 160ms at 16kHz (16 frames)
+        max_chunk_size: int = 20480,  # 1280ms at 16kHz (128 frames)
+        left_context_chunks: int = 1,  # Paper's optimal setting
+    ) -> None:
+        super().__init__()
+        from transformers import Wav2Vec2Model, Wav2Vec2Config
         
-        # Get batch size
-        batch_size = x.size(0)
-        device = x.device
+        # Load model with masking disabled for inference
+        config = Wav2Vec2Config.from_pretrained(model_name)
+        config.mask_time_prob = 0.0
+        config.mask_time_length = 1
+        config.mask_feature_prob = 0.0
+        config.mask_feature_length = 1
+        self.model = Wav2Vec2Model.from_pretrained(model_name, config=config)
         
-        # CRITICAL FIX: Ensure x_lens has correct batch dimension
-        if x_lens.size(0) != batch_size:
-            # Fix x_lens to match batch size by padding or truncating
-            if x_lens.size(0) > batch_size:
-                # Truncate
-                x_lens = x_lens[:batch_size]
-            else:
-                # Pad with full lengths
-                padding = torch.full(
-                    (batch_size - x_lens.size(0),),
-                    x.size(1),  # Use the full sequence length
-                    device=device,
-                    dtype=x_lens.dtype
-                )
-                x_lens = torch.cat([x_lens, padding])
+        # The downsample factor is 320 for wav2vec2/XLSR models
+        self.downsample_factor = 320
         
-        # Force expected frame downsampling (critical for XLSR)
-        feature_downsampling = 320  # Fixed for XLSR
+        # Frame parameters (from paper)
+        self.frame_duration = frame_duration
+        self.frame_stride = frame_stride
         
-        # Calculate reasonable expected frame counts to avoid explosion
-        expected_frames = ((x_lens.float() / feature_downsampling).ceil()).to(torch.int64)
-        expected_frames = torch.maximum(expected_frames, torch.ones_like(expected_frames))
-        max_expected_frames = expected_frames.max().item()
+        # Calculate frames per chunk
+        self.frames_per_chunk = int(decode_chunk_size / self.downsample_factor)
         
-        # Process batch with memory optimizations
-        all_outputs = []
-        new_states = []
+        # Streaming parameters
+        self.decode_chunk_size = decode_chunk_size
+        self.chunk_overlap = chunk_overlap if chunk_overlap is not None else decode_chunk_size // 2
+        self.min_chunk_size = min_chunk_size
+        self.max_chunk_size = max_chunk_size
+        self.left_context_chunks = left_context_chunks
         
-        # Use mixed precision for forward pass
-        with torch.cuda.amp.autocast(enabled=True):
-            for b in range(batch_size):
-                # Get single sequence
-                single_x = x[b:b+1]
-                single_len = x_lens[b]
-                
-                # Get states for this sequence
-                if states is not None and b < len(states) and states[b] is not None:
-                    # Unpack states
-                    past_hidden_states = states[b][0]  # Previous hidden states for left context
-                    attention_sink_cache = states[b][1]  # Attention sink frames
-                else:
-                    past_hidden_states = None
-                    attention_sink_cache = None
-                
-                # Create attention mask for current chunk
-                attention_mask = torch.ones_like(single_x, dtype=torch.long)
-                if single_len < single_x.size(1):
-                    attention_mask[0, single_len:] = 0
-                
-                # Forward through XLSR model
-                outputs = self.model(
-                    single_x,
-                    attention_mask=attention_mask,
-                    output_hidden_states=True,
-                    return_dict=True
-                )
-                
-                hidden_states = outputs.hidden_states[-1]  # Last layer hidden states
-                
-                # Save current output states
-                current_frames = min(hidden_states.size(1), self.frames_per_chunk)
-                
-                # Prepare for next step
-                # 1. Left context: Last frames from current chunk
-                new_left_context = hidden_states[:, -self.chunk_overlap//self.downsample_factor:]
-                
-                # 2. Attention sink: First few frames if enabled
-                if self.use_attention_sink:
-                    new_attention_sink = hidden_states[:, :self.attention_sink_size]
-                else:
-                    new_attention_sink = None
-                
-                # Save states for this batch item
-                new_states.append([new_left_context, new_attention_sink])
-                
-                # CRITICAL FIX: When processing chunks, we need to properly handle overlap regions
-                # to avoid frame duplication. The paper carefully removes overlapping regions.
-                
-                # If we have previous states with left context frames, need to handle overlaps
-                if states is not None and b < len(states) and states[b] is not None and states[b][0] is not None:
-                    # Adjust the attention mask to account for overlap with previous chunk
-                    overlap_frames = self.chunk_overlap // self.downsample_factor
-                    
-                    # Only use the non-overlapping portion of the output
-                    # This is crucial to prevent output frame duplication
-                    if hidden_states.size(1) > overlap_frames:
-                        hidden_states = hidden_states[:, overlap_frames:]
-                
-                # Custom control for output size to prevent explosion
-                if hidden_states.size(1) > max_expected_frames * 2:
-                    self.logger.warning(
-                        f"Trimming excessive frame count: {hidden_states.size(1)} -> {max_expected_frames}"
-                    )
-                    hidden_states = hidden_states[:, :max_expected_frames]
-                
-                all_outputs.append(hidden_states)
+        # Attention sink parameters (from paper)
+        self.use_attention_sink = use_attention_sink
+        self.attention_sink_size = attention_sink_size
         
-        # Add logging for frame count comparison
-        for b in range(batch_size):
-            actual_frames = all_outputs[b].size(1)
-            expected = expected_frames[b].item()
-            ratio = actual_frames / expected if expected > 0 else float('inf')
-            
-            if ratio > 1.5 or ratio < 0.5:  # Log significant discrepancies
-                self.logger.warning(
-                    f"Frame count mismatch in batch {b}: expected={expected}, "
-                    f"actual={actual_frames}, ratio={ratio:.2f}"
-                )
+        # Initialize streaming state
+        self.reset_streaming_state()
         
-        # Combine all outputs - pad to max length
-        max_len = max(output.size(1) for output in all_outputs)
-        padded_outputs = []
+        # Ensure output_dim matches joiner input
+        self.output_dim = 1024  # For XLS-R 300M
         
-        for output in all_outputs:
-            if output.size(1) < max_len:
-                padding = torch.zeros(
-                    1, max_len - output.size(1), output.size(2),
-                    device=device, dtype=output.dtype
-                )
-                padded_outputs.append(torch.cat([output, padding], dim=1))
-            else:
-                padded_outputs.append(output)
+        # Define standard chunk sizes from paper
+        self.chunk_sizes = {
+            "320ms": 5120,   # 16 frames
+            "640ms": 10240,  # 32 frames
+            "1280ms": 20480, # 64 frames
+            "2560ms": 40960  # 128 frames
+        }
         
-        encoder_out = torch.cat(padded_outputs, dim=0)
-        encoder_out_lens = torch.tensor([min(out.size(1), max_len) for out in all_outputs], device=device)
-        
-        # Force overall output to match expected size
-        if encoder_out.size(1) > max_expected_frames:
-            encoder_out = encoder_out[:, :max_expected_frames]
-            encoder_out_lens = torch.clamp(encoder_out_lens, max=max_expected_frames)
-        
-        return encoder_out, encoder_out_lens, new_states
+        # Validate chunk size is one of paper's configurations
+        assert decode_chunk_size in self.chunk_sizes.values(), \
+            f"Chunk size {decode_chunk_size} not in paper's configurations: {list(self.chunk_sizes.values())}"
 
     def get_init_state(self, device: Optional[torch.device] = None) -> List[Optional[torch.Tensor]]:
         """Get initial states for streaming inference"""
@@ -186,7 +119,7 @@ class EncoderInterface(nn.Module):
         return [None]  # Initial state is None since we'll build it from first chunk
 
     def reset_streaming_state(self):
-        """Reset all streaming state variables to ensure clean inference"""
+        """Reset all streaming state variables"""
         self.cached_features = None
         self.cached_len = 0
         self.current_chunk_size = self.decode_chunk_size
@@ -195,13 +128,50 @@ class EncoderInterface(nn.Module):
         self.attention_sink_cache = None
         self.context_cache = None
         self.last_chunk_output = None
-        self.left_context_buffer = []
-        self.past_context = None
-        self.is_streaming = False
+        self.left_context_buffer = []  # Store left context chunks
+        self.past_context = None  # Add past context for streaming
+        self.is_streaming = False  # Track streaming state
+
+    def initialize_streaming(self, device=None):
+        """Initialize streaming state for inference
         
-        # Also clear model's cache if supported
-        if hasattr(self.model, "clear_cache"):
-            self.model.clear_cache()
+        Args:
+            device: The device to initialize states on
+        """
+        if device is None:
+            device = next(self.parameters()).device
+        
+        self.reset_streaming_state()
+        self.is_streaming = True
+        
+        # Initialize empty left context buffer
+        self.left_context_buffer = []
+        
+        # Initialize empty attention sink cache
+        self.attention_sink_cache = None
+        
+        # Initialize last chunk output as None
+        self.last_chunk_output = None
+        
+        return self.get_init_state(device)
+    
+    def update_streaming_state(self, states: List[torch.Tensor]):
+        """Update streaming state from the provided states
+        
+        Args:
+            states: States returned from the previous streaming_forward call
+        """
+        if states is None or len(states) < 2:
+            return
+        
+        # Update left context buffer if needed
+        if states[0] is not None:
+            if len(self.left_context_buffer) >= self.left_context_chunks:
+                self.left_context_buffer.pop(0)
+            self.left_context_buffer.append(states[0])
+        
+        # Update attention sink cache
+        self.attention_sink_cache = states[1]
 
     def prepare_chunk_with_context(self, chunk: torch.Tensor, left_context: torch.Tensor = None, right_context: torch.Tensor = None) -> torch.Tensor:
         """Prepare chunk with left and right context for better boundary handling"""
@@ -224,15 +194,7 @@ class EncoderInterface(nn.Module):
         return chunk
 
     def smooth_transition(self, current_output: torch.Tensor, previous_output: torch.Tensor = None) -> torch.Tensor:
-        """Apply smooth transition between chunks using sinusoidal interpolation
-        
-        Args:
-            current_output: Current chunk output
-            previous_output: Previous chunk output
-            
-        Returns:
-            Smoothed output tensor
-        """
+        """Apply smooth transition between chunks using sinusoidal interpolation"""
         if previous_output is None:
             return current_output
             
@@ -240,7 +202,7 @@ class EncoderInterface(nn.Module):
         overlap_size = min(
             previous_output.size(1),  # Previous chunk size
             current_output.size(1),   # Current chunk size
-            self.frames_per_chunk // 4  # Use 25% of frame size for transition
+            self.frames_per_chunk     # Maximum overlap
         )
         
         if overlap_size <= 0:
@@ -263,40 +225,44 @@ class EncoderInterface(nn.Module):
         
         return current_output
 
-    def prepare_attention_sink(self, chunk: torch.Tensor, sink_cache: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def prepare_attention_sink(self, chunk: torch.Tensor, sink_cache: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Prepare attention sink following paper's approach.
         Args:
             chunk: Input tensor (batch, time)
             sink_cache: Optional cached sink from previous chunk
         Returns:
-            (chunk_with_sink, new_sink_cache, attention_mask)
+            (chunk_with_sink, new_sink_cache)
         """
         if not self.use_attention_sink:
-            return chunk, None, None
+            return chunk, None
             
         # Calculate sink size in samples (16 frames as per paper)
-        sink_size = self.attention_sink_size * self.downsample_factor
+        sink_size = min(
+            self.attention_sink_size * self.downsample_factor, 
+            chunk.size(1)  # Ensure we don't exceed chunk size
+        )
         
         if sink_cache is None:
             # For first chunk, use beginning of chunk as sink
-            new_sink_cache = chunk[:, :sink_size]
+            if chunk.size(1) >= sink_size:
+                new_sink_cache = chunk[:, :sink_size].detach().clone()
+            else:
+                # If chunk is smaller than sink size, use the entire chunk
+                new_sink_cache = chunk.detach().clone()
+            # First time, don't add sink to input
             chunk_with_sink = chunk
         else:
             # Concatenate sink with current chunk
             chunk_with_sink = torch.cat([sink_cache, chunk], dim=1)
             # Update sink cache with end of current chunk
-            new_sink_cache = chunk[:, -sink_size:]
+            if chunk.size(1) >= sink_size:
+                new_sink_cache = chunk[:, -sink_size:].detach().clone()
+            else:
+                # If chunk is smaller than sink size, use the entire chunk
+                new_sink_cache = chunk.detach().clone()
             
-        # Add masking for attention constraints
-        seq_len = chunk_with_sink.size(1)
-        mask = torch.zeros(seq_len, device=chunk.device)
-        
-        # Allow attention to sink and current chunk only
-        mask[:sink_size] = 1  # Attention sink
-        mask[sink_size:sink_size+self.decode_chunk_size] = 1  # Current chunk
-        
-        return chunk_with_sink, new_sink_cache, mask
+        return chunk_with_sink, new_sink_cache
 
     def prepare_left_context(self, chunk: torch.Tensor) -> torch.Tensor:
         """
@@ -309,336 +275,275 @@ class EncoderInterface(nn.Module):
         if not self.left_context_chunks or not self.left_context_buffer:
             return chunk
             
-        # Take up to left_context_chunks previous chunks (1 as per paper)
-        context = self.left_context_buffer[-self.left_context_chunks:]
-        context_tensor = torch.cat(context, dim=1)
+        # Take up to left_context_chunks previous chunks
+        context = self.left_context_buffer[-min(self.left_context_chunks, len(self.left_context_buffer)):]
+        
+        # Ensure all context tensors have the same batch size
+        batch_size = chunk.size(0)
+        valid_context = []
+        
+        for ctx in context:
+            if ctx.size(0) == batch_size:
+                valid_context.append(ctx)
+            else:
+                # If batch size doesn't match, we need to adjust
+                if ctx.size(0) < batch_size:
+                    # Expand by repeating
+                    ctx = ctx.repeat(batch_size // ctx.size(0) + 1, 1)[:batch_size]
+                else:
+                    # Trim
+                    ctx = ctx[:batch_size]
+                valid_context.append(ctx)
+        
+        if not valid_context:
+            return chunk
+            
+        context_tensor = torch.cat(valid_context, dim=1)
         
         return torch.cat([context_tensor, chunk], dim=1)
 
-    def process_streaming_chunks(self, model, feature, chunk_size, attention_sink_size, left_context_chunks):
-        """Process input in streaming chunks following paper's approach
-        
-        Args:
-            model: The XLSR model
-            feature: Input feature tensor (batch, time)
-            chunk_size: Size of chunks in samples
-            attention_sink_size: Size of attention sink in frames
-            left_context_chunks: Number of left context chunks to use
-            
-        Returns:
-            Processed encoder output
+    def streaming_forward(
+        self,
+        x: torch.Tensor,
+        x_lens: torch.Tensor,
+        states: Optional[List[torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor]]:
         """
-        batch_size = feature.size(0)
-        device = feature.device
-        
-        # Create storage for outputs
-        all_encoder_outputs = []
-        
-        # Process each sequence separately
-        for b in range(batch_size):
-            seq = feature[b:b+1]  # Keep batch dimension
-            seq_len = seq.size(1)
-            
-            # Process in chunks
-            pos = 0
-            encoder_chunks = []
-            
-            # Initialize states for streaming
-            states = None
-            
-            while pos < seq_len:
-                # Get current chunk with proper bounds checking
-                end_pos = min(pos + chunk_size, seq_len)
-                chunk = seq[:, pos:end_pos]
-                
-                # Process chunk with streaming forward
-                # Note how we're initializing states as None for first chunk, then using returned states
-                encoder_out, _, states = self.streaming_forward(
-                    chunk, 
-                    torch.tensor([chunk.size(1)], device=device),
-                    states=[states] if states is not None else None
-                )
-                
-                # Add to output chunks
-                encoder_chunks.append(encoder_out)
-                
-                # Move position forward (with overlap as in paper)
-                pos = end_pos - (chunk_size // 2)
-                pos = max(pos, end_pos - chunk_size // 2)  # Ensure we make forward progress
-            
-            # Concatenate chunks along time dimension
-            if encoder_chunks:
-                # Simple concatenation for now - could use better chunk merging in the future
-                sequence_output = torch.cat(encoder_chunks, dim=1)
-                all_encoder_outputs.append(sequence_output)
-            else:
-                # Fallback if no chunks were processed (shouldn't happen)
-                logging.warning(f"No chunks processed for batch item {b}")
-                dummy_output = torch.zeros((1, 1, self.output_dim), device=device)
-                all_encoder_outputs.append(dummy_output)
-        
-        # Combine all batch outputs - pad to max length
-        max_len = max(out.size(1) for out in all_encoder_outputs)
-        padded_outputs = []
-        
-        for output in all_encoder_outputs:
-            if output.size(1) < max_len:
-                padding = torch.zeros(
-                    1, max_len - output.size(1), output.size(2),
-                    device=device, dtype=output.dtype
-                )
-                padded_outputs.append(torch.cat([output, padding], dim=1))
-            else:
-                padded_outputs.append(output)
-        
-        # Return combined output
-        return torch.cat(padded_outputs, dim=0)
-
-    def forward(self, x: torch.Tensor, x_lens: torch.Tensor, is_pre_training: bool = False):
-        """Memory-efficient forward pass for XLSR encoder"""
-        # Standard processing
+        Streaming forward pass with proper context and attention sink handling
+        Args:
+            x: Input tensor (batch, time) or (batch, time, 1)
+            x_lens: Length of each sequence in batch
+            states: Optional cached states from previous chunk
+        Returns:
+            (encoder_out, encoder_out_lens, next_states)
+        """
+        # Ensure input is float and in correct shape
         x = x.float()
         if x.ndim == 3:
             x = x.squeeze(-1)
+        assert x.ndim == 2, f"Expected 2D input (batch, time), got shape {x.shape}"
         
-        # Calculate expected output length precisely
-        expected_frames = ((x_lens.float() / 320).ceil()).to(torch.int64)
-        max_expected_len = expected_frames.max().item()
+        # Clamp values silently since inputs are already normalized
+        x = torch.clamp(x, min=-1.0, max=1.0)
+        
+        # Store original input for context updates
+        original_x = x.clone()
+        original_x_lens = x_lens.clone()
+        
+        # Calculate expected output length before adding context
+        # Account for overlap and context frames precisely
+        chunk_overlap = self.decode_chunk_size // 2
+        context_frames = 0
+        
+        # For subsequent chunks, adjust for overlap
+        if states is not None and states[0] is not None:
+            effective_input_len = x_lens - chunk_overlap
+            # Add small correction factor for chunk boundary alignment
+            boundary_correction = self.downsample_factor // 16  # 20 samples at 16kHz
+            effective_input_len = effective_input_len + boundary_correction
+        else:
+            # For first chunk, use full length
+            effective_input_len = x_lens
+            
+        # Calculate expected frames precisely using ceil instead of floor
+        expected_frames = ((effective_input_len.float() / self.downsample_factor).ceil()).to(torch.int64)
+        expected_frames = torch.maximum(expected_frames, torch.ones_like(expected_frames))
+        
+        # Add left context if available
+        context_added = False
+        if self.left_context_chunks > 0 and self.left_context_buffer:
+            x = self.prepare_left_context(x)
+            context_added = True
+            context_frames += self.left_context_chunks * (self.decode_chunk_size // self.downsample_factor)
+        
+        # Add attention sink if enabled
+        if self.use_attention_sink:
+            x, new_sink_cache = self.prepare_attention_sink(x, self.attention_sink_cache)
+            if self.attention_sink_cache is not None:
+                context_added = True
+                context_frames += self.attention_sink_size
+        else:
+            new_sink_cache = None
+            
+        # Process through XLSR model
+        outputs = self.model(
+            x,
+            attention_mask=None,
+            output_hidden_states=False,
+            output_attentions=False,
+            return_dict=False
+        )[0]
+        
+        # Update left context buffer with original input
+        self.left_context_buffer.append(original_x.clone())
+        if len(self.left_context_buffer) > self.left_context_chunks:
+            self.left_context_buffer.pop(0)
+        
+        # Remove context frames from output if context was added
+        if context_added and context_frames > 0 and outputs.size(1) > context_frames:
+            outputs = outputs[:, context_frames:]
+        
+        # Ensure outputs match expected length precisely
+        max_len = expected_frames.max().item()
+        if outputs.size(1) > max_len:
+            # Calculate optimal start position to minimize edge effects
+            extra = outputs.size(1) - max_len
+            # Bias towards keeping more recent frames for streaming
+            start = (extra * 2) // 3  # Take more frames from the end
+            outputs = outputs[:, start:start + max_len]
+        elif outputs.size(1) < max_len and outputs.size(1) > 0:  # Only pad if we have some frames
+            # Calculate required padding
+            pad_len = max_len - outputs.size(1)
+            # Add padding at the end to maintain temporal order
+            outputs = torch.nn.functional.pad(
+                outputs,
+                (0, 0, 0, pad_len),
+                mode='replicate'  # Replicate last frame instead of zeros
+            )
+        elif outputs.size(1) == 0:  # Handle empty tensor case
+            # Create a tensor of the expected size filled with zeros
+            outputs = torch.zeros(
+                (outputs.size(0), max_len, outputs.size(2)),
+                device=outputs.device,
+                dtype=outputs.dtype
+            )
+        
+        # Apply smooth transition if we have previous output
+        if self.last_chunk_output is not None:
+            outputs = self.smooth_transition(outputs, self.last_chunk_output)
+        
+        # Cache current output for next chunk
+        self.last_chunk_output = outputs.clone()
+        
+        # Update states for next chunk
+        next_states = [original_x.clone(), new_sink_cache]
+        
+        return outputs, expected_frames, next_states
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        x_lens: torch.Tensor,
+        is_pre_training: bool = False
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Non-streaming forward pass with option for pre-training mode
+        
+        Args:
+            x: Input tensor (batch, time) or (batch, time, 1)
+            x_lens: Length of each sequence in batch
+            is_pre_training: Whether we're in pre-training mode (no streaming/chunks)
+            
+        Returns:
+            (encoder_out, encoder_out_lens)
+        """
+        batch_size = x.size(0)
+        
+        # Ensure input is float and in correct shape
+        x = x.float()
+        if x.ndim == 3:  # (batch, time, channel)
+            x = x.squeeze(-1)
+        elif x.ndim == 1:  # (time,)
+            x = x.unsqueeze(0)  # Add batch dimension
+        
+        assert x.ndim == 2, f"Expected 2D input (batch, time), got shape {x.shape}"
+        
+        # Clamp values silently since inputs are already normalized
+        x = torch.clamp(x, min=-1.0, max=1.0)
         
         # Create attention mask
         attention_mask = torch.ones_like(x, dtype=torch.long)
-        for i in range(x.size(0)):
-            if i < x_lens.size(0) and x_lens[i] < x.size(1):
-                attention_mask[i, x_lens[i]:] = 0
+        for i in range(batch_size):
+            attention_mask[i, x_lens[i]:] = 0
         
-        # Run XLSR with gradient checkpointing to save memory
-        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
-            # Enable gradient checkpointing during forward pass
-            self.model.gradient_checkpointing_enable()
+        if is_pre_training:
+            # During pre-training, use full sequence without chunking
+            outputs = self.model(
+                x,
+                attention_mask=attention_mask,
+                output_hidden_states=False,
+                output_attentions=False,
+                return_dict=False
+            )[0]
             
-            # Run model with appropriate mask
-            if is_pre_training:
-                outputs = self.model(
-                    x,
-                    attention_mask=attention_mask,
-                    output_hidden_states=False,
-                    return_dict=True
-                )
+            # Calculate output lengths
+            encoder_out_lens = ((x_lens.float() / self.downsample_factor).floor()).to(torch.int64)
+            encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
+            
+            return outputs, encoder_out_lens
+        else:
+            # Use streaming mode with chunks
+            if self.training:
+                # During training with streaming, simulate chunked processing
+                outputs = []
+                current_lengths = []
+                
+                for i in range(batch_size):
+                    # Process each sequence in the batch
+                    seq_len = x_lens[i]
+                    sequence = x[i, :seq_len]
+                    
+                    # Process in chunks
+                    chunk_outputs = []
+                    pos = 0
+                    self.past_context = None  # Reset past context for each sequence
+                    
+                    while pos < seq_len:
+                        # Get current chunk
+                        chunk_size = min(self.decode_chunk_size, seq_len - pos)
+                        chunk = sequence[pos:pos + chunk_size]
+                        
+                        # Add left context if available
+                        if self.past_context is not None:
+                            chunk = torch.cat([self.past_context, chunk], dim=0)
+                        
+                        # Process chunk
+                        chunk_output = self.model(
+                            chunk.unsqueeze(0),
+                            attention_mask=torch.ones_like(chunk).unsqueeze(0),
+                            output_hidden_states=False,
+                            output_attentions=False,
+                            return_dict=False
+                        )[0]
+                        
+                        # Add attention sink if enabled
+                        if self.use_attention_sink:
+                            chunk_output = torch.cat([
+                                self.attention_sink_cache.unsqueeze(0).expand(1, -1, -1) if self.attention_sink_cache is not None else chunk_output[:, :self.attention_sink_size],
+                                chunk_output
+                            ], dim=1)
+                        
+                        chunk_outputs.append(chunk_output)
+                        
+                        # Update position and save context
+                        pos += chunk_size - self.chunk_overlap
+                        if pos < seq_len:
+                            self.past_context = chunk[-self.chunk_overlap:]
+                    
+                    # Concatenate chunks
+                    sequence_output = torch.cat(chunk_outputs, dim=1)
+                    outputs.append(sequence_output)
+                    current_lengths.append(sequence_output.size(1))
+                
+                # Pad to max length
+                max_len = max(current_lengths)
+                padded_outputs = []
+                for output, length in zip(outputs, current_lengths):
+                    if length < max_len:
+                        padding = torch.zeros(
+                            1,
+                            max_len - length,
+                            output.size(-1),
+                            device=output.device,
+                            dtype=output.dtype
+                        )
+                        padded_outputs.append(torch.cat([output, padding], dim=1))
+                    else:
+                        padded_outputs.append(output)
+                
+                encoder_out = torch.cat(padded_outputs, dim=0)
+                encoder_out_lens = torch.tensor(current_lengths, device=x.device)
             else:
-                streaming_mask = self.create_streaming_mask(
-                    x, attention_mask, self.decode_chunk_size, self.left_context_chunks
-                )
-                outputs = self.model(
-                    x,
-                    attention_mask=streaming_mask,
-                    output_hidden_states=False,
-                    return_dict=True
-                )
-                
-            # Get output and force specific length
-            hidden_states = outputs.last_hidden_state
+                # During inference, use streaming_forward
+                encoder_out, encoder_out_lens, _ = self.streaming_forward(x, x_lens)
             
-            # Strictly enforce expected frame count to prevent memory explosion
-            if hidden_states.size(1) > max_expected_len:
-                hidden_states = hidden_states[:, :max_expected_len]
-        
-        # Calculate exact output lengths
-        encoder_out_lens = torch.clamp(expected_frames, max=max_expected_len)
-        
-        return hidden_states, encoder_out_lens
-
-    def set_chunk_size(self, chunk_size: int):
-        """Set the chunk size for streaming inference
-        
-        Args:
-            chunk_size: Size of chunk in samples
-        """
-        if chunk_size not in self.chunk_sizes.values():
-            self.logger.warning(
-                f"Chunk size {chunk_size} not in paper's configurations: "
-                f"{list(self.chunk_sizes.values())}. Using anyway, but consider changing."
-            )
-        
-        self.decode_chunk_size = chunk_size
-        self.chunk_overlap = int(chunk_size * 0.4)  # 40% overlap as per paper
-        
-        # Update frames per chunk based on new chunk size
-        self.frames_per_chunk = chunk_size // self.samples_per_frame
-        
-        self.logger.info(f"Set chunk size to {chunk_size} samples ({chunk_size/16000*1000:.1f} ms), "
-                         f"{self.frames_per_chunk} frames per chunk, "
-                         f"overlap: {self.chunk_overlap} samples ({self.chunk_overlap/16000*1000:.1f} ms)")
-
-    def apply_attention_sink_mask(self, x, attention_mask=None):
-        """Apply attention sink masking as described in the paper
-        
-        Args:
-            x: Input features (batch, time, dim)
-            attention_mask: Optional existing mask
-            
-        Returns:
-            Modified attention mask allowing attention to sink frames
-        """
-        batch_size = x.size(0)
-        seq_len = x.size(1)
-        
-        # Create attention mask if not provided
-        if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_len), 
-                                        device=x.device, 
-                                        dtype=torch.long)
-        
-        if not self.use_attention_sink:
-            return attention_mask
-        
-        # Create custom attention mask for streaming with attention sink
-        # This is the key implementation from the paper
-        extended_mask = torch.zeros((batch_size, seq_len, seq_len), 
-                                   device=x.device, 
-                                   dtype=torch.bool)
-        
-        for b in range(batch_size):
-            # Allow each position to attend to itself and previous positions in chunk
-            for i in range(seq_len):
-                # Find start of current chunk
-                chunk_size = self.frames_per_chunk
-                chunk_start = max(0, i - i % chunk_size)
-                
-                # Allow attention to current chunk
-                extended_mask[b, i, chunk_start:i+1] = True
-                
-                # Allow attention to sink frames (first N frames)
-                if self.attention_sink_size > 0:
-                    sink_end = min(self.attention_sink_size, seq_len)
-                    extended_mask[b, i, :sink_end] = True
-        
-        # Combine with original mask to respect padding
-        final_mask = extended_mask & attention_mask.unsqueeze(-1)
-        
-        return final_mask
-
-    def create_streaming_mask(
-        self, 
-        x: torch.Tensor, 
-        attention_mask: torch.Tensor, 
-        chunk_size: int,
-        left_context_chunks: int = 1
-    ) -> torch.Tensor:
-        """Create streaming attention mask with optional attention sink
-        
-        Args:
-            x: Input tensor (batch, time)
-            attention_mask: Base mask for padding
-            chunk_size: Size of chunk in samples
-            left_context_chunks: Number of chunks to use as left context
-            
-        Returns:
-            Extended attention mask for streaming
-        """
-        batch_size, seq_len = x.shape
-        frame_chunk_size = chunk_size // self.samples_per_frame
-        
-        # Create mask that limits attention to current and previous chunks
-        streaming_mask = torch.zeros(
-            (batch_size, seq_len, seq_len), 
-            dtype=torch.bool, 
-            device=x.device
-        )
-        
-        for b in range(batch_size):
-            for i in range(seq_len):
-                current_chunk_idx = i // frame_chunk_size
-                
-                # Start of visible context
-                context_start = max(0, (current_chunk_idx - left_context_chunks) * frame_chunk_size)
-                
-                # Allow attention to current position and all positions back to context start
-                streaming_mask[b, i, context_start:i+1] = True
-                
-                # Add attention sink if enabled
-                if self.use_attention_sink and self.attention_sink_size > 0:
-                    sink_end = min(self.attention_sink_size, seq_len)
-                    streaming_mask[b, i, :sink_end] = True
-        
-        # Apply original attention mask for padding
-        extended_mask = streaming_mask & attention_mask.unsqueeze(-1).bool()
-        
-        # Convert to transformers attention mask format (1 = attend, 0 = mask)
-        transformers_mask = extended_mask.long()
-        
-        return transformers_mask
-
-class XLSREncoder(EncoderInterface):
-    def __init__(
-        self, 
-        model_name: str = "TalTechNLP/xls-r-300m-et",
-        decode_chunk_size: int = 5120,  # 320ms at 16kHz
-        chunk_overlap: int = None,
-        use_attention_sink: bool = True,
-        attention_sink_size: int = 16,  # Paper's optimal setting
-        frame_duration: float = 0.025,  # 25ms per frame
-        frame_stride: float = 0.020,  # 20ms stride
-        min_chunk_size: int = 2560,  # 160ms at 16kHz
-        max_chunk_size: int = 20480,  # 1280ms at 16kHz
-        left_context_chunks: int = 1,  # Paper's optimal setting
-    ) -> None:
-        super().__init__()
-        self.logger = logging.getLogger(self.__class__.__name__)
-        
-        # Load model with masking disabled for inference
-        from transformers import Wav2Vec2Model, Wav2Vec2Config
-        
-        config = Wav2Vec2Config.from_pretrained(model_name)
-        config.mask_time_prob = 0.0
-        config.mask_time_length = 1
-        config.mask_feature_prob = 0.0
-        config.mask_feature_length = 1
-        self.model = Wav2Vec2Model.from_pretrained(model_name, config=config)
-        
-        # The downsample factor for wav2vec2/XLSR models
-        self.downsample_factor = 320
-        
-        # Conversion factors between samples and frames
-        self.sample_rate = 16000
-        self.frame_duration = frame_duration  # 25ms
-        self.frame_stride = frame_stride      # 20ms
-        
-        # Samples per frame (320 samples at 16kHz with 20ms stride)
-        self.samples_per_frame = int(self.sample_rate * self.frame_stride)
-        
-        # Frames per chunk calculation
-        self.frames_per_chunk = decode_chunk_size // self.samples_per_frame
-        self.logger.info(f"Chunk size: {decode_chunk_size} samples = {decode_chunk_size/16000*1000:.1f}ms = {self.frames_per_chunk} frames")
-        
-        # Streaming parameters
-        self.decode_chunk_size = decode_chunk_size
-        self.chunk_overlap = chunk_overlap if chunk_overlap is not None else int(decode_chunk_size * 0.4)
-        self.logger.info(f"Using chunk overlap of {self.chunk_overlap} samples ({self.chunk_overlap/16000*1000:.1f}ms)")
-        self.min_chunk_size = min_chunk_size
-        self.max_chunk_size = max_chunk_size
-        self.left_context_chunks = left_context_chunks
-        
-        # Attention sink parameters
-        self.use_attention_sink = use_attention_sink
-        self.attention_sink_size = attention_sink_size
-        
-        # Initialize streaming state
-        self.reset_streaming_state()
-        
-        # Output dimension
-        self.output_dim = 1024  # Fixed for XLS-R 300M
-        
-        # Standard chunk sizes from paper (in samples)
-        self.chunk_sizes = {
-            "320ms": 5120,   # 16 frames
-            "640ms": 10240,  # 32 frames
-            "1280ms": 20480, # 64 frames
-            "2560ms": 40960  # 128 frames
-        }
-
-        # Validate chunk size is one of paper's configurations
-        if decode_chunk_size not in self.chunk_sizes.values():
-            self.logger.warning(
-                f"Chunk size {decode_chunk_size} not in paper's configurations: "
-                f"{list(self.chunk_sizes.values())}. Using anyway, but consider changing."
-            ) 
+            return encoder_out, encoder_out_lens 

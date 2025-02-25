@@ -1275,10 +1275,17 @@ def compute_validation_loss(
             logging.warning("No validation batches available, skipping validation")
             return tot_loss
             
-        # Randomly select a batch and sample
+        # Randomly select a batch
         random_batch = random.choice(val_batches)
         batch_size = random_batch["inputs"].size(0)
-        random_idx = random.randint(0, batch_size - 1)
+        
+        # Handle case where batch size might be 1
+        if batch_size == 1:
+            random_idx = 0
+        else:
+            random_idx = random.randint(0, batch_size - 1)
+        
+        logging.info(f"Validating with sample from batch with size {batch_size}, using index {random_idx}")
         
         # Extract just the single sample
         single_sample = {
@@ -1293,32 +1300,39 @@ def compute_validation_loss(
             # Get hypothesis and prediction
             hyps, preds = decode_one_batch_hyps(params, model, sp, single_sample)
             
-            # Calculate WER for this single sample
-            hyp = hyps[0]
-            pred = preds[0]
-            hyp_words = hyp.split()
-            pred_words = pred.split()
-            errors = editdistance.eval(hyp_words, pred_words)
-            wer = 100.0 * errors / max(1, len(hyp_words))
-            
-            # Display the result
-            logging.info("\nRandom validation sample:")
-            logging.info("-" * 80)
-            logging.info(f"REFERENCE: {hyp}")
-            logging.info(f"PREDICTION: {pred}")
-            logging.info(f"WER: {wer:.2f}%")
-            logging.info(f"Word errors: {errors}/{len(hyp_words)}")
-            logging.info("-" * 80)
-            
-            if tb_writer is not None:
-                tb_writer.add_scalar('valid/wer_sample', wer, params.batch_idx_train)
+            # Make sure we have results before accessing them
+            if len(hyps) > 0 and len(preds) > 0:
+                # Calculate WER for this single sample
+                hyp = hyps[0]
+                pred = preds[0]
+                hyp_words = hyp.split()
+                pred_words = pred.split()
+                errors = editdistance.eval(hyp_words, pred_words)
+                wer = 100.0 * errors / max(1, len(hyp_words))
+                
+                # Display the result
+                logging.info("\nRandom validation sample:")
+                logging.info("-" * 80)
+                logging.info(f"REFERENCE: {hyp}")
+                logging.info(f"PREDICTION: {pred}")
+                logging.info(f"WER: {wer:.2f}%")
+                logging.info(f"Word errors: {errors}/{len(hyp_words)}")
+                logging.info("-" * 80)
+                
+                if tb_writer is not None:
+                    tb_writer.add_scalar('valid/wer_sample', wer, params.batch_idx_train)
+            else:
+                logging.warning("No results returned from decode_one_batch_hyps")
                 
             # Free memory
-            del single_sample, hyps, preds
+            del single_sample
+            if 'hyps' in locals(): del hyps
+            if 'preds' in locals(): del preds
             torch.cuda.empty_cache()
             
     except Exception as e:
         logging.warning(f"Error during minimal validation: {str(e)}")
+        logging.warning("Exception details:", exc_info=True)  # Print full stack trace
         torch.cuda.empty_cache()
     
     return tot_loss

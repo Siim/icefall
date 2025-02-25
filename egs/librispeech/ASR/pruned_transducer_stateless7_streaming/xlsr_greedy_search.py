@@ -90,7 +90,7 @@ def greedy_search(
         3: Counter(),  # Count 3-grams
         4: Counter(),  # Count 4-grams
     }
-    recent_tokens = deque(maxlen=8)  # Keep track of recent tokens
+    recent_tokens = []  # Keep track of recent tokens (max 8)
     consecutive_blanks = 0  # Count consecutive blank tokens
     token_diversity = set()  # Track unique tokens
     
@@ -113,40 +113,50 @@ def greedy_search(
                 project_input=False
             ).squeeze(0).squeeze(0)  # Remove batch dims
             
+            # Get vocabulary size
+            vocab_size = logits.size(0)
+            
             # Apply blank penalty
             if blank_penalty != 0:
                 logits[blank_id] -= blank_penalty
             
-            # Apply repetition penalties
+            # Apply repetition penalties - ensure tokens are within vocabulary bounds
             if len(recent_tokens) > 0:
-                last_token = recent_tokens[-1]
+                # Trim recent tokens list to last 8 tokens
+                if len(recent_tokens) > 8:
+                    recent_tokens = recent_tokens[-8:]
                 
-                # Penalize recently seen tokens
+                # Safely penalize recently seen tokens
                 for token in recent_tokens:
-                    if token != blank_id:
+                    if token != blank_id and 0 <= token < vocab_size:
                         logits[token] /= repetition_penalty
                 
                 # Extra penalty for the immediately preceding token
-                if last_token != blank_id:
+                last_token = recent_tokens[-1]
+                if last_token != blank_id and 0 <= last_token < vocab_size:
                     logits[last_token] /= 1.5  # Additional penalty for immediate repetition
             
             # Check for severe repetition patterns
             severe_repetition = False
             if len(hyp) > context_size + 4:
-                # Check for n-gram repetitions
-                for n, counter in n_gram_counters.items():
-                    if len(hyp) >= context_size + n:
-                        # Create n-gram from the most recent tokens
-                        ng = tuple(hyp[-(n):])
-                        if ng in counter and counter[ng] > 3:  # If we've seen this n-gram more than 3 times
+                try:
+                    # Check for n-gram repetitions
+                    for n, counter in n_gram_counters.items():
+                        if len(hyp) >= context_size + n:
+                            # Create n-gram from the most recent tokens
+                            ng = tuple(hyp[-n:])
+                            if ng in counter and counter[ng] > 3:  # If we've seen this n-gram more than 3 times
+                                severe_repetition = True
+                                break
+                    
+                    # Check token diversity ratio
+                    if len(token_diversity) > 0 and sym_per_utt > 20:
+                        diversity_ratio = len(token_diversity) / sym_per_utt
+                        if diversity_ratio < 0.2:  # Less than 20% unique tokens
                             severe_repetition = True
-                            break
-                
-                # Check token diversity ratio
-                if len(token_diversity) > 0 and sym_per_utt > 20:
-                    diversity_ratio = len(token_diversity) / sym_per_utt
-                    if diversity_ratio < 0.2:  # Less than 20% unique tokens
-                        severe_repetition = True
+                except Exception as e:
+                    logging.warning(f"Error checking repetition patterns: {e}")
+                    # Continue without repetition detection if it fails
             
             # Hard-stop for severe repetition - favor blank token
             if severe_repetition:
@@ -173,24 +183,36 @@ def greedy_search(
                 hyp.append(y)
                 timestamp.append(t)
                 token_diversity.add(y)
+                
+                # Add token to recent tokens list
                 recent_tokens.append(y)
                 
                 # Update n-gram counters for repetition detection
-                for n in n_gram_counters:
-                    if len(hyp) >= context_size + n:
-                        n_gram_counters[n][tuple(hyp[-n:])] += 1
+                try:
+                    for n in n_gram_counters:
+                        if len(hyp) >= context_size + n:
+                            n_gram = tuple(hyp[-n:])
+                            n_gram_counters[n][n_gram] += 1
+                except Exception as e:
+                    logging.warning(f"Error updating n-gram counters: {e}")
                 
                 # Prepare decoder for next step
-                decoder_input = torch.tensor([hyp[-context_size:]], device=device).reshape(
-                    1, context_size
-                )
-                
-                decoder_out = model.decoder(decoder_input, need_pad=False)
-                decoder_out = model.joiner.decoder_proj(decoder_out)
-                
-                # Update counters
-                sym_per_utt += 1
-                sym_per_frame += 1
+                try:
+                    decoder_input = torch.tensor([hyp[-context_size:]], device=device).reshape(
+                        1, context_size
+                    )
+                    
+                    decoder_out = model.decoder(decoder_input, need_pad=False)
+                    decoder_out = model.joiner.decoder_proj(decoder_out)
+                    
+                    # Update counters
+                    sym_per_utt += 1
+                    sym_per_frame += 1
+                except Exception as e:
+                    logging.warning(f"Error updating decoder: {e}")
+                    # If decoder update fails, move to next frame
+                    sym_per_frame = 0
+                    t += 1
         
         except Exception as e:
             logging.warning(f"Error during greedy search: {e}")
@@ -238,6 +260,14 @@ def greedy_search_batch(
       If return_timestamps is False, return a list of decoded results.
       Else, return a DecodingResults object with decoded results and timestamps.
     """
+    # First, try to import the standard greedy search as fallback
+    try:
+        from beam_search import greedy_search_batch as std_greedy_search_batch
+        fallback_available = True
+    except ImportError:
+        fallback_available = False
+        logging.warning("Standard greedy search not available as fallback")
+
     # Handle early training phase
     epoch = getattr(model, "cur_epoch", 100)
     early_training = epoch <= 2
@@ -248,75 +278,158 @@ def greedy_search_batch(
         repetition_penalty = max(repetition_penalty, 3.0)  # Stronger repetition penalty
         max_output_length = min(max_output_length, 50)  # Shorter outputs in early training
     
-    # Input validation
-    device = next(model.parameters()).device
-    batch_size = encoder_out.size(0)
-    
-    # Ensure encoder_out is 3D (batch, time, feature_dim)
-    if encoder_out.ndim == 2:
-        if encoder_out.size(0) == 1:
-            encoder_out = encoder_out.unsqueeze(1)  # (1, 1, feature_dim)
-        else:
-            encoder_out = encoder_out.unsqueeze(0)  # (1, time, feature_dim)
-    elif encoder_out.ndim == 4:
-        # Handle (batch, time, s_range, feature_dim) from pruned RNN-T loss
-        b, t, s, f = encoder_out.size()
-        encoder_out = encoder_out.reshape(b, t * s, f)
-        
-    # Ensure encoder_out_lens matches batch size
-    if encoder_out_lens.size(0) != batch_size:
-        logging.warning(
-            f"encoder_out_lens batch size {encoder_out_lens.size(0)} doesn't match encoder_out {batch_size}"
-        )
-        # Fix lengths to match batch size
-        if encoder_out_lens.size(0) > batch_size:
-            encoder_out_lens = encoder_out_lens[:batch_size]
-        else:
-            encoder_out_lens = torch.cat([
-                encoder_out_lens,
-                torch.full((batch_size - encoder_out_lens.size(0),), 
-                          encoder_out.size(1), 
-                          device=device,
-                          dtype=encoder_out_lens.dtype)
-            ])
-            
-    # Clamp lengths to actual encoder output size
-    encoder_out_lens = torch.clamp(encoder_out_lens, min=1, max=encoder_out.size(1))
-    
+    # Get blank ID early to handle fallback more gracefully
     blank_id = model.decoder.blank_id
     
-    # Process each item in the batch
-    all_hyps = []
-    all_timestamps = [] if return_timestamps else None
-    
-    for b in range(batch_size):
-        # Extract a single item's encoder output
-        enc_len = encoder_out_lens[b].item()
-        enc_out_item = encoder_out[b:b+1, :enc_len]
+    # Input validation
+    try:
+        device = next(model.parameters()).device
+        batch_size = encoder_out.size(0)
         
-        # Process with greedy search
-        result = greedy_search(
-            model=model,
-            encoder_out=enc_out_item,
-            max_sym_per_frame=1,  # Standard transducer allows 1 symbol per step
-            blank_penalty=blank_penalty,
-            max_output_length=max_output_length,
-            repetition_penalty=repetition_penalty,
-            return_timestamps=return_timestamps,
-        )
+        # Ensure encoder_out is 3D (batch, time, feature_dim)
+        if encoder_out.ndim == 2:
+            if encoder_out.size(0) == 1:
+                encoder_out = encoder_out.unsqueeze(1)  # (1, 1, feature_dim)
+            else:
+                encoder_out = encoder_out.unsqueeze(0)  # (1, time, feature_dim)
+        elif encoder_out.ndim == 4:
+            # Handle (batch, time, s_range, feature_dim) from pruned RNN-T loss
+            b, t, s, f = encoder_out.size()
+            encoder_out = encoder_out.reshape(b, t * s, f)
+            
+        # Ensure encoder_out_lens matches batch size
+        if encoder_out_lens.size(0) != batch_size:
+            logging.warning(
+                f"encoder_out_lens batch size {encoder_out_lens.size(0)} doesn't match encoder_out {batch_size}"
+            )
+            # Fix lengths to match batch size
+            if encoder_out_lens.size(0) > batch_size:
+                encoder_out_lens = encoder_out_lens[:batch_size]
+            else:
+                encoder_out_lens = torch.cat([
+                    encoder_out_lens,
+                    torch.full((batch_size - encoder_out_lens.size(0),), 
+                              encoder_out.size(1), 
+                              device=device,
+                              dtype=encoder_out_lens.dtype)
+                ])
+                
+        # Clamp lengths to actual encoder output size
+        encoder_out_lens = torch.clamp(encoder_out_lens, min=1, max=encoder_out.size(1))
         
-        # Extract results
-        if return_timestamps:
-            all_hyps.append(result.hyps[0])
-            all_timestamps.append(result.timestamps[0])
+        # If we're in very early training, just use standard greedy search for stability
+        if early_training and epoch == 1 and fallback_available:
+            logging.info("Using standard greedy search for stability in early training")
+            return std_greedy_search_batch(
+                model=model,
+                encoder_out=encoder_out, 
+                encoder_out_lens=encoder_out_lens,
+                blank_penalty=blank_penalty,
+                return_timestamps=return_timestamps
+            )
+        
+        # Process each item in the batch
+        all_hyps = []
+        all_timestamps = [] if return_timestamps else None
+        
+        error_count = 0
+        max_errors = batch_size // 2  # Allow up to half the batch to fail before falling back
+        
+        for b in range(batch_size):
+            try:
+                # Extract a single item's encoder output
+                enc_len = encoder_out_lens[b].item()
+                enc_out_item = encoder_out[b:b+1, :enc_len]
+                
+                # Process with greedy search
+                result = greedy_search(
+                    model=model,
+                    encoder_out=enc_out_item,
+                    max_sym_per_frame=1,  # Standard transducer allows 1 symbol per step
+                    blank_penalty=blank_penalty,
+                    max_output_length=max_output_length,
+                    repetition_penalty=repetition_penalty,
+                    return_timestamps=return_timestamps,
+                )
+                
+                # Extract results
+                if return_timestamps:
+                    all_hyps.append(result.hyps[0])
+                    all_timestamps.append(result.timestamps[0])
+                else:
+                    all_hyps.append(result)
+                    
+            except Exception as e:
+                error_count += 1
+                logging.error(f"Error processing batch item {b}: {str(e)}")
+                
+                # Fall back to standard greedy search for this item if available
+                if fallback_available:
+                    try:
+                        logging.warning(f"Trying standard greedy search for item {b}")
+                        # Extract this single item
+                        single_enc_out = encoder_out[b:b+1]
+                        single_enc_lens = encoder_out_lens[b:b+1]
+                        
+                        single_result = std_greedy_search_batch(
+                            model=model,
+                            encoder_out=single_enc_out,
+                            encoder_out_lens=single_enc_lens,
+                            blank_penalty=blank_penalty,
+                            return_timestamps=return_timestamps
+                        )
+                        
+                        # Add the result
+                        if return_timestamps:
+                            all_hyps.append(single_result.hyps[0])
+                            all_timestamps.append(single_result.timestamps[0])
+                        else:
+                            all_hyps.append(single_result[0])
+                        continue
+                    except Exception as fallback_e:
+                        logging.error(f"Fallback also failed for item {b}: {str(fallback_e)}")
+                
+                # Add an empty result in case of error
+                all_hyps.append([])
+                if return_timestamps:
+                    all_timestamps.append([])
+                
+                # If too many errors, break and try fallback
+                if error_count > max_errors:
+                    logging.warning(f"Too many errors ({error_count}/{batch_size}), trying fallback")
+                    raise RuntimeError(f"XLSR greedy search failed on too many items: {error_count}/{batch_size}")
+        
+        # Format and return results
+        if not return_timestamps:
+            return all_hyps
         else:
-            all_hyps.append(result)
-    
-    # Format and return results
-    if not return_timestamps:
-        return all_hyps
-    else:
-        return DecodingResults(
-            hyps=all_hyps,
-            timestamps=all_timestamps,
-        ) 
+            return DecodingResults(
+                hyps=all_hyps,
+                timestamps=all_timestamps,
+            )
+            
+    except Exception as e:
+        logging.warning(f"Enhanced greedy search failed with error: {str(e)}")
+        
+        # Fall back to standard greedy search if available
+        if fallback_available:
+            logging.warning("Falling back to standard greedy search for entire batch")
+            try:
+                return std_greedy_search_batch(
+                    model=model,
+                    encoder_out=encoder_out,
+                    encoder_out_lens=encoder_out_lens,
+                    blank_penalty=blank_penalty,
+                    return_timestamps=return_timestamps
+                )
+            except Exception as fallback_e:
+                logging.error(f"Fallback also failed: {str(fallback_e)}")
+                
+        # If we get here, both methods failed or fallback wasn't available
+        # Return empty results as a last resort
+        if return_timestamps:
+            empty_hyps = [[] for _ in range(batch_size)]
+            empty_timestamps = [[] for _ in range(batch_size)]
+            return DecodingResults(hyps=empty_hyps, timestamps=empty_timestamps)
+        else:
+            return [[] for _ in range(batch_size)] 

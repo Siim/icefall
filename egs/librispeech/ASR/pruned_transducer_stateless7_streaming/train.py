@@ -1406,11 +1406,18 @@ def run(rank, world_size, args):
     parameters_names.append(
         [name_param_pair[0] for name_param_pair in model.named_parameters()]
     )
+
+    # Configure optimizer according to paper's specification
     optimizer = ScaledAdam(
         model.parameters(),
         lr=params.base_lr,
-        clipping_scale=2.0,
+        clipping_scale=2.0,  # Default from paper
         parameters_names=parameters_names,
+        # Add additional parameters from paper
+        beta1=0.9,
+        beta2=0.98,
+        weight_decay=0.01,
+        eps=1e-8
     )
 
     # Paper uses warmup followed by decay

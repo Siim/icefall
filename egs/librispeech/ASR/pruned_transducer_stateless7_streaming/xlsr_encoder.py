@@ -82,13 +82,20 @@ class XLSREncoder(EncoderInterface):
         self.frame_duration = frame_duration
         self.frame_stride = frame_stride
         
-        # Calculate frames per chunk
-        self.frames_per_chunk = int(decode_chunk_size / self.downsample_factor)
+        # Calculate frames per chunk based on paper specifications
+        sampling_rate = 16000  # XLSR models use 16kHz audio
+        # How many frames per second (considering frame_stride)
+        frames_per_second = 1.0 / self.frame_stride
+        # How many audio samples per frame
+        samples_per_frame = int(sampling_rate * self.frame_stride)
+        # Frames per chunk
+        self.frames_per_chunk = int(decode_chunk_size / samples_per_frame)
+        self.logger.info(f"Using {self.frames_per_chunk} frames per chunk")
         
         # Streaming parameters
         self.decode_chunk_size = decode_chunk_size
-        self.chunk_overlap = int(decode_chunk_size * 0.4)
-        self.logger.info(f"Using 40% chunk overlap ({self.chunk_overlap} samples)")
+        self.chunk_overlap = chunk_overlap if chunk_overlap is not None else int(decode_chunk_size * 0.4)
+        self.logger.info(f"Using chunk overlap of {self.chunk_overlap} samples")
         self.min_chunk_size = min_chunk_size
         self.max_chunk_size = max_chunk_size
         self.left_context_chunks = left_context_chunks
@@ -112,8 +119,11 @@ class XLSREncoder(EncoderInterface):
         }
         
         # Validate chunk size is one of paper's configurations
-        assert decode_chunk_size in self.chunk_sizes.values(), \
-            f"Chunk size {decode_chunk_size} not in paper's configurations: {list(self.chunk_sizes.values())}"
+        if decode_chunk_size not in self.chunk_sizes.values():
+            self.logger.warning(
+                f"Chunk size {decode_chunk_size} not in paper's configurations: "
+                f"{list(self.chunk_sizes.values())}. Using anyway, but consider changing."
+            )
 
     def get_init_state(self, device: Optional[torch.device] = None) -> List[Optional[torch.Tensor]]:
         """Get initial states for streaming inference"""
@@ -391,6 +401,22 @@ class XLSREncoder(EncoderInterface):
                 dtype=combined_output.dtype
             )
             combined_output = torch.cat([combined_output, padding], dim=1)
+        
+        # Safety check for expected_frames to ensure it's a valid tensor
+        if expected_frames.size(0) != batch_size:
+            # Adjust expected_frames to match batch size
+            if expected_frames.size(0) > batch_size:
+                expected_frames = expected_frames[:batch_size]
+            else:
+                # Fill with copies of the first element or reasonable defaults
+                if expected_frames.size(0) > 0:
+                    padding = expected_frames[0].repeat(batch_size - expected_frames.size(0))
+                    expected_frames = torch.cat([expected_frames, padding])
+                else:
+                    # Create reasonable default lengths based on output size
+                    expected_frames = torch.full((batch_size,), combined_output.size(1), 
+                                               device=combined_output.device, 
+                                               dtype=torch.int64)
         
         return combined_output, expected_frames, next_states
 

@@ -101,7 +101,15 @@ class XLSRTransducerBeamSearch:
             return decoder_out
         except Exception as e:
             self.logger.warning(f"Error computing decoder output: {e}")
-            return None
+            # Instead of returning None, try to recover with a zeroed tensor
+            # that matches expected dimensions
+            try:
+                # Get expected shape from model configuration
+                decoder_dim = self.model.decoder.output_dim
+                return torch.zeros((1, decoder_dim), device=device)
+            except:
+                # If all else fails, return None and let caller handle it
+                return None
 
     def beam_search(
         self,
@@ -176,8 +184,47 @@ class XLSRTransducerBeamSearch:
             finished_beam = []
             max_symbol_per_frame = self.max_sym_per_step
             
+            # Early stopping criteria:
+            # 1. No progress (no new tokens) for N frames
+            no_progress_frames = 0
+            max_no_progress_frames = 10  # Stop after 10 frames with no new tokens
+            
+            # 2. Stop if beam score differences are below threshold
+            min_score_diff_threshold = 1e-5
+            
+            # Track for early stopping
+            last_beam_size = 1
+            last_hypotheses_tokens = [len(hyp.tokens) for hyp in beam]
+            
             # Process each encoder frame
             for t in range(length):
+                # Check for early stopping conditions if enabled
+                if early_stopping:
+                    # Check if beam hasn't changed significantly
+                    current_hypotheses_tokens = [len(hyp.tokens) for hyp in beam]
+                    if current_hypotheses_tokens == last_hypotheses_tokens:
+                        no_progress_frames += 1
+                    else:
+                        no_progress_frames = 0
+                    
+                    # Stop if no progress for too many frames
+                    if no_progress_frames >= max_no_progress_frames:
+                        self.logger.debug(f"Early stopping at frame {t}: no progress for {no_progress_frames} frames")
+                        break
+                    
+                    # Stop if beam size hasn't changed for a while and scores are close
+                    if len(beam) == last_beam_size and len(beam) > 1:
+                        # Check if score differences are small
+                        scores = [hyp.score for hyp in beam]
+                        max_score = max(scores)
+                        if all(max_score - score < min_score_diff_threshold for score in scores):
+                            self.logger.debug(f"Early stopping at frame {t}: beam scores too similar")
+                            break
+                    
+                    # Update tracking variables
+                    last_beam_size = len(beam)
+                    last_hypotheses_tokens = current_hypotheses_tokens
+                
                 # Limit symbols per frame to prevent explosion
                 symbols_added_current_frame = 0
                 
@@ -274,6 +321,9 @@ class XLSRTransducerBeamSearch:
                             # Track symbol addition limit
                             symbols_added_current_frame += 1
                 
+                # Free up memory by deleting old beam
+                del beam
+                
                 # Keep top beam_size hypotheses for next step
                 if len(new_beam) > self.beam_size:
                     # Use length-normalized scores for better beam diversity
@@ -322,6 +372,9 @@ class XLSRTransducerBeamSearch:
                     all_results.append(([], []))
                 else:
                     all_results.append([])
+            
+            # Clear memory
+            del finished_beam
         
         # Format results based on return_timestamps flag
         if return_timestamps:

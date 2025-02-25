@@ -2125,7 +2125,7 @@ def compute_loss(
         info["loss_stabilized"] = True
     
     # Add this function to log encoder outputs
-    def analyze_encoder_outputs(encoder_out, encoder_out_lens, epoch, iteration):
+    def analyze_encoder_outputs(encoder_out, encoder_out_lens, epoch, batch_idx=None):
         """Diagnose encoder output health"""
         try:
             # Check for NaNs/Infs
@@ -2138,8 +2138,9 @@ def compute_loss(
             min_val = encoder_out.min().item()
             max_val = encoder_out.max().item()
             
+            batch_str = f"i{batch_idx}" if batch_idx is not None else ""
             logging.info(
-                f"Encoder stats [e{epoch}i{iteration}]: "
+                f"Encoder stats [e{epoch}{batch_str}]: "
                 f"mean={mean:.3f}, std={std:.3f}, min={min_val:.3f}, max={max_val:.3f}, "
                 f"has_nan={has_nan}, has_inf={has_inf}"
             )
@@ -2150,7 +2151,7 @@ def compute_loss(
             logging.warning(f"Error analyzing encoder output: {str(e)}")
 
     # Add this call inside compute_loss after encoder forward pass
-    analyze_encoder_outputs(encoder_out, encoder_out_lens, params.cur_epoch, batch_idx)
+    analyze_encoder_outputs(encoder_out, encoder_out_lens, params.cur_epoch)  # Use 0 as default
     
     return loss, info
 

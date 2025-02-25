@@ -397,6 +397,10 @@ class EncoderInterface(nn.Module):
             if i < x_lens.size(0) and x_lens[i] < x.size(1):
                 attention_mask[i, x_lens[i]:] = 0
         
+        # Calculate output lengths right away to ensure they're always defined
+        encoder_out_lens = ((x_lens.float() / self.downsample_factor).floor()).to(torch.int64)
+        encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
+        
         if is_pre_training:
             # During pre-training, use full attention without chunking
             outputs = self.model(
@@ -423,11 +427,7 @@ class EncoderInterface(nn.Module):
                 return_dict=True
             )
             hidden_states = outputs.last_hidden_state
-            
-            # Calculate output lengths
-            encoder_out_lens = ((x_lens.float() / self.downsample_factor).floor()).to(torch.int64)
-            encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
-            
+        
         return hidden_states, encoder_out_lens
 
     def set_chunk_size(self, chunk_size: int):

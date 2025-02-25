@@ -90,6 +90,7 @@ from icefall.err import raise_grad_scale_is_too_small_error
 from icefall.hooks import register_inf_check_hooks
 from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
 from beam_search import greedy_search_batch  # Only import what we use for validation
+from xlsr_beam_search import beam_search_batch  # Import our new beam search implementation
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -1241,11 +1242,12 @@ def decode_one_batch_hyps(
                     )
                     encoder_out_lens = torch.cat([encoder_out_lens, pad_lens])
         
-        # Use greedy search batch for decoding
-        hyp_tokens = greedy_search_batch(
+        # Use beam search batch for decoding as specified in the paper (beam width = 4)
+        hyp_tokens = beam_search_batch(
             model=model,
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
+            beam_size=4,  # Paper's recommended beam width
         )
     
     # Convert token IDs to text

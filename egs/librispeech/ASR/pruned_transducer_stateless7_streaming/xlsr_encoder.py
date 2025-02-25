@@ -63,6 +63,8 @@ class XLSREncoder(EncoderInterface):
         left_context_chunks: int = 1,  # Paper's optimal setting
     ) -> None:
         super().__init__()
+        self.logger = logging.getLogger(self.__class__.__name__)
+        
         from transformers import Wav2Vec2Model, Wav2Vec2Config
         
         # Load model with masking disabled for inference

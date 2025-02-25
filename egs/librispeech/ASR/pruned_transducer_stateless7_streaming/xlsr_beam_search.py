@@ -280,7 +280,7 @@ class XLSRTransducerBeamSearch:
                     # Add 1 to avoid divide-by-zero for empty hypotheses
                     beam = sorted(
                         new_beam,
-                        key=lambda x: x.score / (len([t for t in x.tokens if t != self.blank_id]) + 1),
+                        key=lambda x: x.score / (len([t for t in x.tokens if t != self.blank_id]) + 1e-8),
                         reverse=True
                     )[:self.beam_size]
                 else:

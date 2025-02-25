@@ -591,8 +591,8 @@ def get_params() -> AttributeDict:
             "valid_interval": 500,
             
             # Paper's training configuration
-            "pretrain_epochs": 5,  # Pre-training phase
-            "streaming_epochs": 15, # Streaming phase
+            "pretrain_epochs": 3,    # Paper's pretrain phase
+            "streaming_epochs": 7,   # Paper's streaming phase
             "beam_size": 4,        # Paper's beam width for decoding
             
             # Learning rate schedule from paper
@@ -1089,6 +1089,14 @@ def train_one_epoch(
     """
     model.train()
     tot_loss = MetricsTracker()
+    
+    # Add this at start of epoch
+    if params.cur_epoch <= params.pretrain_epochs + 3:
+        chunk_sizes = [5120, 10240, 20480]  # 320,640,1280ms from paper
+        curr_chunk = random.choice(chunk_sizes)
+        if hasattr(model.encoder, 'set_chunk_size'):
+            model.encoder.set_chunk_size(curr_chunk)
+        logging.info(f"Epoch {params.cur_epoch}: Using chunk size {curr_chunk//16000*1000}ms")
     
     # Determine training phase
     is_pre_training = params.cur_epoch <= params.pretrain_epochs

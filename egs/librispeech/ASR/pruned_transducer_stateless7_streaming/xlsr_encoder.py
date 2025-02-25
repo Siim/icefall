@@ -85,7 +85,8 @@ class XLSREncoder(EncoderInterface):
         
         # Streaming parameters
         self.decode_chunk_size = decode_chunk_size
-        self.chunk_overlap = chunk_overlap if chunk_overlap is not None else decode_chunk_size // 2
+        self.chunk_overlap = int(decode_chunk_size * 0.4)
+        self.logger.info(f"Using 40% chunk overlap ({self.chunk_overlap} samples)")
         self.min_chunk_size = min_chunk_size
         self.max_chunk_size = max_chunk_size
         self.left_context_chunks = left_context_chunks
@@ -184,17 +185,17 @@ class XLSREncoder(EncoderInterface):
         
         return current_output
 
-    def prepare_attention_sink(self, chunk: torch.Tensor, sink_cache: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def prepare_attention_sink(self, chunk: torch.Tensor, sink_cache: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Prepare attention sink following paper's approach.
         Args:
             chunk: Input tensor (batch, time)
             sink_cache: Optional cached sink from previous chunk
         Returns:
-            (chunk_with_sink, new_sink_cache)
+            (chunk_with_sink, new_sink_cache, attention_mask)
         """
         if not self.use_attention_sink:
-            return chunk, None
+            return chunk, None, None
             
         # Calculate sink size in samples (16 frames as per paper)
         sink_size = self.attention_sink_size * self.downsample_factor
@@ -209,7 +210,15 @@ class XLSREncoder(EncoderInterface):
             # Update sink cache with end of current chunk
             new_sink_cache = chunk[:, -sink_size:]
             
-        return chunk_with_sink, new_sink_cache
+        # Add masking for attention constraints
+        seq_len = chunk_with_sink.size(1)
+        mask = torch.zeros(seq_len, device=chunk.device)
+        
+        # Allow attention to sink and current chunk only
+        mask[:sink_size] = 1  # Attention sink
+        mask[sink_size:sink_size+self.decode_chunk_size] = 1  # Current chunk
+        
+        return chunk_with_sink, new_sink_cache, mask
 
     def prepare_left_context(self, chunk: torch.Tensor) -> torch.Tensor:
         """

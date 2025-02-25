@@ -13,11 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import heapq
 import math
 import torch
 import torch.nn as nn
-from typing import Dict, List, Optional, Tuple, Union, Any
+from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
 import logging
 
@@ -27,770 +26,304 @@ from icefall.utils import DecodingResults
 @dataclass
 class Hypothesis:
     """Hypothesis class for beam search."""
-    # Sequence of token ids
-    sequence: List[int]
+    # Sequence of token ids (not including initial blanks or padding)
+    tokens: List[int]
     # Log probability of the sequence
     score: float
-    # Decoder hidden states
+    # Decoder hidden states for continuing the hypothesis
     decoder_out: Optional[torch.Tensor] = None
-    # Timestamps for token emission
+    # Timestamps in frames for token emission (for return_timestamps=True)
     timestamps: Optional[List[int]] = None
-    # All scores for analysis
-    all_scores: Optional[List[float]] = None
-
-    def __lt__(self, other):
-        """Compare hypotheses based on score for heap operations."""
-        # Higher score is better (hence the negative)
-        return -self.score < -other.score
 
 
-class XLSRBeamSearch:
-    """Beam search implementation for XLSR-Transducer as described in the paper."""
+class XLSRTransducerBeamSearch:
+    """Simple beam search implementation for XLSR-Transducer following the paper.
+    
+    From the paper: "We perform beam search with width 4 for all the decoding experiments."
+    """
     def __init__(
         self,
         model: nn.Module,
-        beam_size: int = 4,  # Paper's recommended beam width
-        blank_penalty: float = 10.0,  # Even higher blank penalty to prevent repetitions
-        temperature: float = 1.4,  # Higher temperature for more diversity
-        return_timestamps: bool = False,
-        max_symb_per_frame: int = 2,  # Reduced to prevent excessive tokens per frame
-        max_output_length: int = 50,  # Shorter maximum output for early training
+        beam_size: int = 4,  # Paper specifies beam width 4
+        blank_id: Optional[int] = None,
+        blank_bias: float = 0.0,  # Bias for blank token (positive = favor blank)
+        max_sym_per_step: int = 1,  # Max symbols per step from the paper
+        max_states: int = 32,  # Maximum number of states to maintain
     ):
         """Initialize beam search.
         
         Args:
             model: The transducer model
-            beam_size: Width of beam for search
-            blank_penalty: Penalty applied to blank token (higher reduces insertions)
-            temperature: Softmax temperature for logits
-            return_timestamps: Whether to return timestamps along with hypotheses
-            max_symb_per_frame: Maximum symbols emitted per frame (prevents loops)
-            max_output_length: Maximum allowed output length to prevent runaway generation
+            beam_size: Width of beam for search (paper uses 4)
+            blank_id: ID of blank token (if None, use model.decoder.blank_id)
+            blank_bias: Bias added to blank token logits (positive favors blanks)
+            max_sym_per_step: Maximum symbols emitted per step
+            max_states: Maximum number of states to maintain before pruning (memory control)
         """
         self.model = model
         self.beam_size = beam_size
-        self.blank_penalty = blank_penalty
-        self.temperature = temperature
-        self.return_timestamps = return_timestamps
-        self.max_symb_per_frame = max_symb_per_frame
-        self.max_output_length = max_output_length
+        self.blank_id = blank_id if blank_id is not None else model.decoder.blank_id
+        self.blank_bias = blank_bias
+        self.max_sym_per_step = max_sym_per_step
+        self.max_states = max_states
+        self.context_size = getattr(model.decoder, "context_size", 1)
         
-        self.blank_id = model.decoder.blank_id
-        self.context_size = model.decoder.context_size
-        self.unk_id = getattr(model, "unk_id", self.blank_id)
+        # Set up logger for diagnostics
+        self.logger = logging.getLogger("XLSRTransducerBeamSearch")
         
-        # Keep track of number of symbols per frame to prevent loops
-        self.symb_per_frame = {}
-        
-        # Set of detected patterns to avoid
-        self.pattern_cache = set()
-        
-        # Track number of tokens emitted per frame
-        self.tokens_per_frame = {}
-        
-        # Force early termination after specific number of repetitions
-        self.max_pattern_repetitions = 2
-        
-    def _create_initial_hypothesis(self, device: torch.device) -> Hypothesis:
-        """Create the initial hypothesis with blank token."""
-        # Initial context with blank token
-        initial_sequence = [-1] * (self.context_size - 1) + [self.blank_id]
-        
-        # Get the decoder output for this sequence
-        decoder_input = torch.tensor(
-            [initial_sequence],
-            device=device,
-            dtype=torch.int64,
-        )
-        
-        decoder_out = self.model.decoder(decoder_input, need_pad=False)
-        decoder_out = self.model.joiner.decoder_proj(decoder_out)
-        
-        return Hypothesis(
-            sequence=initial_sequence,
-            score=0.0,  # Start with log probability of 0 (probability of 1)
-            decoder_out=decoder_out,
-            timestamps=[],
-            all_scores=[]
-        )
-    
-    def _check_for_repetitions(self, sequence: List[int]) -> bool:
-        """Check for repetitive patterns in sequence.
-        
-        Returns:
-            True if repetitions detected, False otherwise
-        """
-        # Not enough tokens to check for repetitions
-        if len(sequence) < 8:
-            return False
-        
-        # Check for exact token repetitions
-        seq = [t for t in sequence if t not in (-1, self.blank_id)]
-        if len(seq) < 6:
-            return False
-        
-        # Get just the actual tokens (no padding or blanks)
-        for n in [1, 2, 3, 4]:
-            # Need at least 3 repetitions to consider it a pattern
-            if len(seq) >= n * 3:
-                # Look for exact token repetitions
-                for i in range(len(seq) - 2*n):
-                    if seq[i:i+n] == seq[i+n:i+2*n] == seq[i+2*n:i+3*n]:
-                        return True
-                    
-                # Check recent 2/3 of sequence for repetitions
-                recent = seq[-int(len(seq)*0.67):]
-                if len(recent) >= n * 3:
-                    for i in range(len(recent) - 2*n):
-                        if recent[i:i+n] == recent[i+n:i+2*n]:
-                            return True
-        
-        # Check for token frequency anomalies
-        if len(seq) >= 10:
-            # Count frequency of each token
-            counter = {}
-            for token in seq:
-                counter[token] = counter.get(token, 0) + 1
+    def _get_initial_tokens(self, device) -> List[int]:
+        """Get initial token sequence for decoder."""
+        # Handle different context sizes for different decoders
+        if self.context_size > 1:
+            # For context_size > 1, we need padding + blank
+            return [-1] * (self.context_size - 1) + [self.blank_id]
+        else:
+            # For context_size = 1, just the blank
+            return [self.blank_id]
             
-            # If any token appears more than 40% of the time, it's suspicious
-            for token, count in counter.items():
-                if count > 0.4 * len(seq) and len(seq) > 10:
-                    return True
+    def _get_decoder_output(self, tokens: List[int], device: torch.device) -> torch.Tensor:
+        """Get decoder output for a token sequence."""
+        # Ensure we have at least context_size tokens
+        if len(tokens) < self.context_size:
+            # Pad with -1 for missing context
+            context = [-1] * (self.context_size - len(tokens)) + tokens
+        else:
+            # Take last context_size tokens
+            context = tokens[-self.context_size:]
+            
+        # Create input tensor
+        decoder_input = torch.tensor([context], device=device, dtype=torch.int64)
         
-        return False
-    
-    def _extend_hypothesis(
+        # Get decoder output
+        try:
+            decoder_out = self.model.decoder(decoder_input, need_pad=False)
+            decoder_out = self.model.joiner.decoder_proj(decoder_out)
+            return decoder_out
+        except Exception as e:
+            self.logger.warning(f"Error computing decoder output: {e}")
+            return None
+
+    def beam_search(
         self,
-        hyp: Hypothesis,
-        encoder_frame: torch.Tensor,
-        frame_idx: int,
-        device: torch.device
-    ) -> List[Hypothesis]:
-        """Extend a hypothesis with the next frame.
+        encoder_out: torch.Tensor,
+        encoder_out_lens: torch.Tensor,
+        return_timestamps: bool = False,
+        early_stopping: bool = True,
+    ) -> Union[List[List[int]], DecodingResults]:
+        """Perform beam search on a batch of encoder outputs.
         
         Args:
-            hyp: Current hypothesis
-            encoder_frame: Current encoder frame output (shape may vary)
-            frame_idx: Current frame index
-            device: Device to perform computations on
+            encoder_out: Output from the encoder, shape (batch, time, feature_dim)
+            encoder_out_lens: Length of each sequence, shape (batch)
+            return_timestamps: Whether to return timestamps with hypotheses
+            early_stopping: Whether to enable early stopping for efficiency
             
         Returns:
-            List of extended hypotheses
+            Either List of token sequences or DecodingResults with timestamps
         """
-        # Initialize frame token counter if needed
-        if frame_idx not in self.tokens_per_frame:
-            self.tokens_per_frame[frame_idx] = 0
-            
-        # Check for token limit per frame
-        if self.tokens_per_frame[frame_idx] >= self.max_symb_per_frame:
-            # Return only a blank extension
-            try:
-                # Create blank hypothesis 
-                new_hyp = Hypothesis(
-                    sequence=hyp.sequence.copy(),
-                    score=hyp.score,
-                    decoder_out=hyp.decoder_out,
-                    timestamps=hyp.timestamps.copy() if hyp.timestamps is not None else [],
-                    all_scores=hyp.all_scores.copy() if hyp.all_scores is not None else []
-                )
-                return [new_hyp]
-            except Exception:
-                return [hyp]
-                
-        # Input validation 
-        if encoder_frame is None:
-            logging.error("encoder_frame is None in _extend_hypothesis")
-            return [hyp]  # Return current hypothesis without extension
-        
-        # Check for very early in training - use only blank tokens for stability
-        non_blank_tokens = [t for t in hyp.sequence if t not in (-1, self.blank_id)]
-        very_early_training = frame_idx < 5 and not non_blank_tokens
-        
-        # Early termination for extremely long sequences
-        if len(non_blank_tokens) > self.max_output_length:
-            logging.warning(f"Hypothesis exceeded max length ({self.max_output_length}), stopping generation")
-            return [hyp]  # Return current hypothesis without extension
-            
-        # Early termination for repetitive patterns
-        if self._check_for_repetitions(hyp.sequence):
-            logging.warning(f"Detected repetition pattern at frame {frame_idx}, stopping generation")
-            return [hyp]
-        
-        if not isinstance(hyp.decoder_out, torch.Tensor):
-            logging.error(f"Invalid decoder_out type: {type(hyp.decoder_out)}")
-            try:
-                # Attempt to recreate decoder output
-                decoder_input = torch.tensor(
-                    [hyp.sequence[-self.context_size:] if len(hyp.sequence) >= self.context_size 
-                     else ([-1] * (self.context_size - len(hyp.sequence)) + hyp.sequence)],
-                    device=device,
-                    dtype=torch.int64,
-                )
-                decoder_out = self.model.decoder(decoder_input, need_pad=False)
-                hyp.decoder_out = self.model.joiner.decoder_proj(decoder_out)
-            except Exception as e:
-                logging.error(f"Failed to recover decoder_out: {str(e)}")
-                return [hyp]  # Return current hypothesis without extension
-        
-        try:
-            # Normalize encoder_frame dimensions based on its shape
-            if encoder_frame.ndim == 1:  # (D,)
-                encoder_frame = encoder_frame.unsqueeze(0).unsqueeze(0)  # (1, 1, D)
-            elif encoder_frame.ndim == 2:  # (1, D) or (T, D)
-                if encoder_frame.size(0) == 1:
-                    encoder_frame = encoder_frame.unsqueeze(0)  # (1, 1, D)
-                else:
-                    encoder_frame = encoder_frame[0:1].unsqueeze(0)  # (1, 1, D)
-            elif encoder_frame.ndim == 3:  # (B, T, D) or (1, 1, D)
-                if encoder_frame.size(0) > 1 or encoder_frame.size(1) > 1:
-                    encoder_frame = encoder_frame[0:1, 0:1]  # Take just first batch and time
-            
-            # Ensure decoder_out has the right dimensions (1, 1, D)
-            decoder_out = hyp.decoder_out
-            if decoder_out.ndim == 2:  # (1, D)
-                decoder_out = decoder_out.unsqueeze(1)  # (1, 1, D)
-            
-            # Compute joiner output (logits)
-            logits = self.model.joiner(
-                encoder_frame,
-                decoder_out,
-                project_input=False
-            )
-            
-            # After joiner, get to (1, vocab_size)
-            logits = logits.squeeze(0).squeeze(0)  # (vocab_size,)
-            
-            # Apply blank penalty and temperature adjustments
-            if self.blank_penalty != 0:
-                # No blank penalty for very early in training
-                if not very_early_training:
-                    logits[self.blank_id] -= self.blank_penalty
-                
-                # Add extreme penalty for repeated blank tokens
-                if len(hyp.sequence) >= 3 and hyp.sequence[-1] == self.blank_id and hyp.sequence[-2] == self.blank_id:
-                    logits[self.blank_id] -= 50.0  # Much higher penalty
-            
-            if self.temperature != 1.0:
-                logits = logits / self.temperature
-                
-            # Even stronger penalties for repetitive patterns
-            if len(hyp.sequence) >= 6:
-                # Check for simple repetition (same token repeated)
-                last_token = hyp.sequence[-1]
-                if last_token != self.blank_id and last_token == hyp.sequence[-3] and last_token == hyp.sequence[-5]:
-                    # Extreme penalty - effectively remove this token
-                    logits[last_token] = float('-inf')
-                
-                # Check for alternating pattern (A B A B A B...)
-                if (hyp.sequence[-1] == hyp.sequence[-3] and 
-                    hyp.sequence[-2] == hyp.sequence[-4]):
-                    # Extreme penalty for both tokens
-                    token1 = hyp.sequence[-1]
-                    token2 = hyp.sequence[-2]
-                    if token1 != self.blank_id:
-                        logits[token1] = float('-inf')
-                    if token2 != self.blank_id:
-                        logits[token2] = float('-inf')
-                
-                # Check for 3-grams that repeat
-                if len(hyp.sequence) >= 9:
-                    if (hyp.sequence[-3:] == hyp.sequence[-6:-3]):
-                        # Block all tokens in the 3-gram
-                        for token in set(hyp.sequence[-3:]):
-                            if token != self.blank_id and token != -1:
-                                logits[token] = float('-inf')
-            
-            # Apply softmax to convert to probabilities
-            log_probs = torch.log_softmax(logits, dim=-1)
-            
-            # Top-k tokens from log probabilities
-            k = min(self.beam_size, log_probs.size(-1))
-            top_k_log_probs, top_k_indices = log_probs.topk(k)
-            
-            # Create new hypotheses
-            new_hyps = []
-            
-            # Track if we've seen a non-blank token
-            seen_non_blank = False
-            
-            # Limit number of non-blank tokens per frame to prevent infinite looping
-            non_blank_count = 0
-            max_non_blank = self.max_symb_per_frame
-            
-            # For very early training, only allow blank tokens
-            if very_early_training:
-                # Only consider blank tokens
-                blank_log_prob = log_probs[self.blank_id].item()
-                new_hyp = Hypothesis(
-                    sequence=hyp.sequence.copy(),
-                    score=hyp.score + blank_log_prob,
-                    decoder_out=decoder_out,
-                    timestamps=hyp.timestamps.copy() if hyp.timestamps is not None else [],
-                    all_scores=hyp.all_scores.copy() if hyp.all_scores is not None else []
-                )
-                return [new_hyp]
-            
-            # For normal processing, consider all tokens
-            for i in range(k):
-                token_id = top_k_indices[i].item()
-                token_log_prob = top_k_log_probs[i].item()
-                
-                # Skip tokens with very low probability 
-                if token_log_prob < -15.0 and token_id != self.blank_id:
-                    continue
-                    
-                # For blank tokens, always add to beam
-                if token_id == self.blank_id:
-                    # Create a copy of the current sequence (should not change for blank)
-                    new_sequence = hyp.sequence.copy()
-                    
-                    # Create copies of timestamp and score arrays
-                    new_timestamps = hyp.timestamps.copy() if hyp.timestamps is not None else []
-                    new_scores = hyp.all_scores.copy() if hyp.all_scores is not None else []
-                    
-                    # Keep the same decoder output for blank tokens
-                    new_decoder_out = decoder_out
-                    
-                    # Create the new hypothesis
-                    new_hyp = Hypothesis(
-                        sequence=new_sequence,
-                        score=hyp.score + token_log_prob,
-                        decoder_out=new_decoder_out,
-                        timestamps=new_timestamps,
-                        all_scores=new_scores
-                    )
-                    new_hyps.append(new_hyp)
-                else:
-                    # Token is non-blank - enforce max non-blank tokens per frame
-                    if non_blank_count >= max_non_blank:
-                        continue
-                    
-                    # Update counter
-                    non_blank_count += 1
-                    seen_non_blank = True
-                    
-                    # Update frame token counter
-                    self.tokens_per_frame[frame_idx] += 1
-                    
-                    # Create a copy of the current sequence
-                    new_sequence = hyp.sequence.copy()
-                    
-                    # Create copies of timestamp and score arrays
-                    new_timestamps = hyp.timestamps.copy() if hyp.timestamps is not None else []
-                    new_scores = hyp.all_scores.copy() if hyp.all_scores is not None else []
-                    
-                    # Token is non-blank - update the sequence
-                    new_sequence.append(token_id)
-                    new_timestamps.append(frame_idx)
-                    new_scores.append(token_log_prob)
-                                    
-                    # Get decoder output for new sequence
-                    try:
-                        context = new_sequence[-self.context_size:] if len(new_sequence) >= self.context_size else ([-1] * (self.context_size - len(new_sequence)) + new_sequence)
-                        decoder_input = torch.tensor([context], device=device, dtype=torch.int64)
-                        new_decoder_out = self.model.decoder(decoder_input, need_pad=False)
-                        new_decoder_out = self.model.joiner.decoder_proj(new_decoder_out)
-                    except Exception as e:
-                        logging.error(f"Failed to get decoder output: {str(e)}")
-                        # Use old decoder output if we fail
-                        new_decoder_out = decoder_out
-                    
-                    # Create the new hypothesis
-                    new_hyp = Hypothesis(
-                        sequence=new_sequence,
-                        score=hyp.score + token_log_prob,
-                        decoder_out=new_decoder_out,
-                        timestamps=new_timestamps,
-                        all_scores=new_scores
-                    )
-                    new_hyps.append(new_hyp)
-            
-            # If all our candidates were blank tokens, force consider the best non-blank
-            # But skip this for early frames to maintain stability
-            if not seen_non_blank and len(new_hyps) > 0 and frame_idx > 10:
-                # Find the highest scoring non-blank token
-                for i in range(k, min(log_probs.size(-1), k*2)):
-                    token_id = log_probs.argsort(descending=True)[i].item()
-                    if token_id != self.blank_id:
-                        token_log_prob = log_probs[token_id].item()
-                        
-                        # Skip tokens with very low probability
-                        if token_log_prob < -10.0:
-                            continue
-                        
-                        # Create new hypothesis with this token
-                        new_sequence = hyp.sequence.copy()
-                        new_timestamps = hyp.timestamps.copy() if hyp.timestamps is not None else []
-                        new_scores = hyp.all_scores.copy() if hyp.all_scores is not None else []
-                        
-                        new_sequence.append(token_id)
-                        new_timestamps.append(frame_idx)
-                        new_scores.append(token_log_prob)
-                        
-                        # Update frame token counter
-                        self.tokens_per_frame[frame_idx] += 1
-                        
-                        try:
-                            context = new_sequence[-self.context_size:] if len(new_sequence) >= self.context_size else ([-1] * (self.context_size - len(new_sequence)) + new_sequence)
-                            decoder_input = torch.tensor([context], device=device, dtype=torch.int64)
-                            new_decoder_out = self.model.decoder(decoder_input, need_pad=False)
-                            new_decoder_out = self.model.joiner.decoder_proj(new_decoder_out)
-                        except Exception as e:
-                            new_decoder_out = decoder_out
-                        
-                        forced_hyp = Hypothesis(
-                            sequence=new_sequence,
-                            score=hyp.score + token_log_prob,
-                            decoder_out=new_decoder_out,
-                            timestamps=new_timestamps,
-                            all_scores=new_scores
-                        )
-                        new_hyps.append(forced_hyp)
-                        logging.debug(f"Forcing consideration of non-blank token {token_id}")
-                        break
-            
-            return new_hyps
-            
-        except Exception as e:
-            logging.error(f"Error in _extend_hypothesis: {str(e)}")
-            logging.error("Exception details:", exc_info=True)
-            return [hyp]  # Return current hypothesis if extension failed
-            
-    def _fallback_greedy_search(
-        self,
-        encoder_out: torch.Tensor,
-        encoder_out_lens: torch.Tensor,
-        device: torch.device
-    ) -> List[List[int]]:
-        """Fallback to simple greedy search if beam search fails."""
-        logging.warning("Falling back to simple greedy search due to beam search issues")
-        
-        batch_size = encoder_out.size(0)
-        results = []
-        
-        for b in range(batch_size):
-            # Get single sequence
-            seq_len = encoder_out_lens[b].item()
-            current_encoder_out = encoder_out[b, :seq_len]
-            
-            # Initialize with blank
-            hyp = self._create_initial_hypothesis(device)
-            
-            # Process frames
-            for t in range(seq_len):
-                # Get frame
-                current_frame = current_encoder_out[t:t+1]
-                
-                # Extend with greedy search (just take best token)
-                try:
-                    # Normalize dimensions
-                    if current_frame.ndim == 1:
-                        current_frame = current_frame.unsqueeze(0).unsqueeze(0)
-                        
-                    # Get decoder output
-                    decoder_out = hyp.decoder_out
-                    if decoder_out.ndim == 2:
-                        decoder_out = decoder_out.unsqueeze(1)
-                    
-                    # Get logits
-                    logits = self.model.joiner(
-                        current_frame,
-                        decoder_out,
-                        project_input=False
-                    ).squeeze(0).squeeze(0)
-                    
-                    # Apply blank bias to favor blanks in early training
-                    logits[self.blank_id] += 3.0
-                    
-                    # Get best token
-                    token_id = logits.argmax().item()
-                    
-                    # If non-blank, add to hypothesis
-                    if token_id != self.blank_id:
-                        # Add token to sequence
-                        hyp.sequence.append(token_id)
-                        
-                        # Update decoder output for next step
-                        context = hyp.sequence[-self.context_size:] if len(hyp.sequence) >= self.context_size else ([-1] * (self.context_size - len(hyp.sequence)) + hyp.sequence)
-                        decoder_input = torch.tensor([context], device=device, dtype=torch.int64)
-                        hyp.decoder_out = self.model.joiner.decoder_proj(
-                            self.model.decoder(decoder_input, need_pad=False)
-                        )
-                        
-                    # Early stopping if sequence is too long
-                    non_blanks = [t for t in hyp.sequence if t not in (-1, self.blank_id)]
-                    if len(non_blanks) > self.max_output_length:
-                        break
-                except Exception as e:
-                    logging.error(f"Error in greedy fallback: {str(e)}")
-                    break
-            
-            # Post-process result
-            seq = [token for token in hyp.sequence if token not in (-1, self.blank_id)]
-            results.append(seq)
-        
-        return results
-    
-    def _post_process_hyps(self, hyps: List[Hypothesis]) -> List[List[int]]:
-        """Post-process hypotheses to return final token sequences."""
-        results = []
-        for hyp in hyps:
-            # Strip initial context padding and blank tokens
-            seq = []
-            for token in hyp.sequence:
-                if token not in (-1, self.blank_id):
-                    seq.append(token)
-            
-            # Limit sequence length
-            if len(seq) > 100:
-                seq = seq[:100]
-                
-            results.append(seq)
-        return results
-
-    def _post_process_with_timestamps(self, hyps: List[Hypothesis]) -> DecodingResults:
-        """Post-process hypotheses with timestamps."""
-        hyp_tokens = []
-        timestamps = []
-        
-        for hyp in hyps:
-            # Strip initial context padding and blank tokens
-            non_blank_indices = [i for i, token in enumerate(hyp.sequence) 
-                               if token not in (-1, self.blank_id)]
-            
-            # Get tokens and corresponding timestamps
-            seq = [hyp.sequence[i] for i in non_blank_indices]
-            ts = [hyp.timestamps[i] for i in range(len(hyp.timestamps)) 
-                 if i < len(non_blank_indices)]
-            
-            # Limit sequence length
-            if len(seq) > 100:
-                seq = seq[:100]
-                ts = ts[:100] if ts else []
-                
-            hyp_tokens.append(seq)
-            timestamps.append(ts)
-        
-        return DecodingResults(
-            hyps=hyp_tokens,
-            timestamps=timestamps,
-        )
-    
-    def search_batch(
-        self,
-        encoder_out: torch.Tensor,
-        encoder_out_lens: torch.Tensor,
-    ) -> Union[List[List[int]], DecodingResults]:
-        """Perform beam search decoding on a batch of encoder outputs."""
         device = encoder_out.device
+        batch_size = encoder_out.size(0)
         
-        # Validate input dimensions
-        if encoder_out.ndim not in (2, 3, 4):
-            logging.error(f"Unsupported encoder_out dimension: {encoder_out.ndim}")
-            # Try to reshape to supported dimension
-            if encoder_out.ndim == 1:
-                encoder_out = encoder_out.unsqueeze(0).unsqueeze(0)  # Add batch and time dims
-            else:
-                # For higher dims, try to get to (batch, time, features)
-                shape = encoder_out.shape
-                encoder_out = encoder_out.reshape(1, -1, shape[-1])
-            logging.warning(f"Reshaped encoder_out to {encoder_out.shape}")
-            
-        # Convert to the right shape - we need (batch, time, features)
+        # Ensure encoder_out is 3D (batch, time, feature_dim)
         if encoder_out.ndim == 2:
-            # Handle (batch, features) by adding time dimension
+            # Single feature vector, add time dimension
             if encoder_out.size(0) == 1:
-                encoder_out = encoder_out.unsqueeze(1)  # (1, 1, features)
+                encoder_out = encoder_out.unsqueeze(1)  # (1, 1, feature_dim)
             else:
-                # Multiple items but no time dim - unclear how to interpret
-                # Assume it's (time, features) for a single item
-                encoder_out = encoder_out.unsqueeze(0)  # (1, time, features)
+                # Assume (time, feature_dim) for single item
+                encoder_out = encoder_out.unsqueeze(0)  # (1, time, feature_dim)
         elif encoder_out.ndim == 4:
-            # Handle (batch, time, s_range, features) by reshaping
+            # Handle (batch, time, s_range, feature_dim) from pruned RNN-T loss
             b, t, s, f = encoder_out.size()
             encoder_out = encoder_out.reshape(b, t * s, f)
-        
-        # Get batch size after reshaping
-        batch_size = encoder_out.size(0)
-        
+            
+        assert encoder_out.ndim == 3, f"Expected 3D encoder output, got shape {encoder_out.shape}"
+            
         # Ensure encoder_out_lens matches batch size
         if encoder_out_lens.size(0) != batch_size:
-            logging.warning(f"encoder_out_lens batch size ({encoder_out_lens.size(0)}) doesn't match encoder_out ({batch_size})")
-            
-            if encoder_out_lens.size(0) > batch_size:
-                # Too many lengths, truncate
-                encoder_out_lens = encoder_out_lens[:batch_size]
-            else:
-                # Not enough lengths, pad with max length
-                max_len = encoder_out.size(1)
-                padding = torch.full(
-                    (batch_size - encoder_out_lens.size(0),), 
-                    max_len, 
-                    device=device, 
-                    dtype=encoder_out_lens.dtype
-                )
-                encoder_out_lens = torch.cat([encoder_out_lens, padding])
+            self.logger.warning(
+                f"encoder_out_lens batch size {encoder_out_lens.size(0)} doesn't match encoder_out {batch_size}"
+            )
+            encoder_out_lens = encoder_out_lens[:batch_size] if encoder_out_lens.size(0) > batch_size else \
+                               torch.cat([encoder_out_lens, 
+                                         torch.full((batch_size - encoder_out_lens.size(0),), 
+                                                   encoder_out.size(1), 
+                                                   device=device,
+                                                   dtype=encoder_out_lens.dtype)])
+                                         
+        # Clamp lengths to actual encoder output size
+        encoder_out_lens = torch.clamp(encoder_out_lens, min=1, max=encoder_out.size(1))
         
-        # Cap lengths to actual encoder output size
-        max_seq_len = encoder_out.size(1)
-        encoder_out_lens = torch.minimum(encoder_out_lens, torch.tensor(max_seq_len, device=device))
+        all_results = []
         
-        # Ensure no zero-length sequences
-        encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
-        
-        # Initialize initial hypotheses for each batch item
-        beam_list = []
+        # Process each item in batch separately
         for b in range(batch_size):
-            beam_list.append(self._create_initial_hypothesis(device))
-        
-        # Initialize result container
-        hypotheses = []
-        
-        # Process each batch item separately
-        for b in range(batch_size):
-            # Reset tokens per frame for this sequence
-            self.tokens_per_frame = {}
+            length = encoder_out_lens[b].item()
+            enc_out = encoder_out[b, :length]  # (time, feature_dim)
             
-            logging.debug(f"Processing batch item {b+1}/{batch_size}")
-            current_len = encoder_out_lens[b].item()
-            current_encoder_out = encoder_out[b, :current_len]
+            # Initialize beam with single empty hypothesis
+            initial_tokens = self._get_initial_tokens(device)
+            initial_decoder_out = self._get_decoder_output(initial_tokens, device)
             
-            # Skip empty or invalid sequences
-            if current_len <= 0:
-                hypotheses.append(beam_list[b])
-                continue
+            beam = [Hypothesis(
+                tokens=initial_tokens,
+                score=0.0,
+                decoder_out=initial_decoder_out,
+                timestamps=[] if return_timestamps else None
+            )]
+            
+            # Keep track of finished hypotheses
+            finished_beam = []
+            max_symbol_per_frame = self.max_sym_per_step
+            
+            # Process each encoder frame
+            for t in range(length):
+                # Limit symbols per frame to prevent explosion
+                symbols_added_current_frame = 0
                 
-            # Initialize beam with single hypothesis
-            current_beam = [beam_list[b]]
-            
-            # Set maximum consecutive non-token frames to prevent infinite loops
-            consecutive_blanks = 0
-            max_consecutive_blanks = min(current_len // 6, 8)  # More restrictive
-            
-            # Force early stopping if we see repeated patterns
-            pattern_repetitions = 0
-            had_repetition = False
-            
-            # Process each frame
-            failed = False
-            for t in range(current_len):
-                # Get current encoder frame
-                current_frame = current_encoder_out[t:t+1]  # (1, encoder_dim)
+                # Get current encoder frame (1, feature_dim)
+                frame = enc_out[t:t+1]
                 
-                # Extend each hypothesis in the beam
+                # Create new beam for extending hypotheses
                 new_beam = []
-                non_blank_extensions = False
                 
-                for hyp in current_beam:
-                    # Detect and skip stuck hypotheses
-                    if len(hyp.sequence) > 10:
-                        # Count blanks at end of sequence
-                        trailing_blanks = 0
-                        for i in range(len(hyp.sequence) - 1, -1, -1):
-                            if hyp.sequence[i] == self.blank_id:
-                                trailing_blanks += 1
-                            else:
-                                break
-                                
-                        # Skip hypotheses with too many trailing blanks
-                        if trailing_blanks > 5 and t > 10:
+                # Process each hypothesis in the beam
+                for hyp in beam:
+                    # Get decoder output - already projected for joiner
+                    if hyp.decoder_out is None:
+                        hyp.decoder_out = self._get_decoder_output(hyp.tokens, device)
+                        # Skip if we still can't get decoder output
+                        if hyp.decoder_out is None:
                             continue
                     
-                    # Check for repetitions
-                    if self._check_for_repetitions(hyp.sequence):
-                        had_repetition = True
-                        pattern_repetitions += 1
-                        if pattern_repetitions >= self.max_pattern_repetitions:
-                            # Switch to greedy search for this hypothesis
-                            logging.warning(f"Excessive repetitions detected at frame {t}, breaking beam search")
-                            failed = True
-                            break
-                        continue
+                    decoder_out = hyp.decoder_out  # (1, decoder_dim)
                     
-                    # Extend the hypothesis
-                    extended_hyps = self._extend_hypothesis(hyp, current_frame, t, device)
+                    # Ensure correct dimensions for joiner
+                    # Encoder frame: (1, feature_dim) -> (1, 1, feature_dim)
+                    # Decoder out: (1, decoder_dim) -> (1, 1, decoder_dim)
+                    frame_for_joiner = frame.unsqueeze(0)  # (1, 1, feature_dim)
+                    decoder_out_for_joiner = decoder_out.unsqueeze(1)  # (1, 1, decoder_dim)
                     
-                    # Check if we got any non-blank extensions
-                    for extended_hyp in extended_hyps:
-                        if len(extended_hyp.sequence) > len(hyp.sequence):
-                            non_blank_extensions = True
-                            consecutive_blanks = 0
-                            break
+                    # Compute joint output and log probabilities
+                    try:
+                        # joint.forward combines encoder and decoder outputs to predict next token
+                        logits = self.model.joiner(
+                            frame_for_joiner, decoder_out_for_joiner, project_input=False
+                        ).squeeze(0).squeeze(0)  # (vocab_size,)
+                        
+                        # Apply blank bias if specified
+                        if self.blank_bias != 0:
+                            logits[self.blank_id] += self.blank_bias
+                            
+                        log_probs = torch.log_softmax(logits, dim=-1)
+                        
+                    except Exception as e:
+                        self.logger.warning(f"Error computing joint: {e}")
+                        continue  # Skip this hypothesis
                     
-                    # Add all extensions to the new beam
-                    new_beam.extend(extended_hyps)
+                    # Get topk tokens and their probabilities
+                    k = min(self.beam_size, log_probs.size(0))
+                    topk_logp, topk_indices = log_probs.topk(k)
+                    
+                    # Process each token
+                    for i in range(k):
+                        token = topk_indices[i].item()
+                        token_logp = topk_logp[i].item()
+                        
+                        # For blank token: advance time step without new token
+                        if token == self.blank_id:
+                            # Create new hypothesis with same tokens but updated score
+                            new_hyp = Hypothesis(
+                                tokens=hyp.tokens.copy(),
+                                score=hyp.score + token_logp,
+                                decoder_out=hyp.decoder_out,  # Decoder state unchanged for blank
+                                timestamps=hyp.timestamps.copy() if return_timestamps else None
+                            )
+                            new_beam.append(new_hyp)
+                        
+                        # For non-blank token: emit a new token if we haven't hit the limit
+                        elif symbols_added_current_frame < max_symbol_per_frame:
+                            # Create new list of tokens with the new token added
+                            new_tokens = hyp.tokens.copy()
+                            new_tokens.append(token)
+                            
+                            # Update timestamps if needed
+                            new_timestamps = None
+                            if return_timestamps:
+                                new_timestamps = hyp.timestamps.copy()
+                                new_timestamps.append(t)
+                            
+                            # Get decoder output for next step
+                            new_decoder_out = self._get_decoder_output(new_tokens, device)
+                            
+                            # Create new hypothesis
+                            new_hyp = Hypothesis(
+                                tokens=new_tokens,
+                                score=hyp.score + token_logp,
+                                decoder_out=new_decoder_out,
+                                timestamps=new_timestamps
+                            )
+                            new_beam.append(new_hyp)
+                            
+                            # Track symbol addition limit
+                            symbols_added_current_frame += 1
                 
-                # Break if we failed
-                if failed:
-                    break
-                    
-                # If we didn't get any new hypotheses, try the next frame
-                if not new_beam:
-                    consecutive_blanks += 1
-                    new_beam = [current_beam[0]] if current_beam else [beam_list[b]]
-                # If we didn't get any non-blank extensions, increment counter
-                elif not non_blank_extensions:
-                    consecutive_blanks += 1
-                    
-                # Break early if stuck in a loop of blanks
-                if consecutive_blanks >= max_consecutive_blanks:
-                    logging.warning(f"Breaking out of blank token loop at frame {t}/{current_len}")
-                    break
-                
-                # Keep only top beam_size hypotheses
+                # Keep top beam_size hypotheses for next step
                 if len(new_beam) > self.beam_size:
-                    # Only use length-normalized score - more stable
-                    sorted_beam = sorted(
+                    # Use length-normalized scores for better beam diversity
+                    # Add 1 to avoid divide-by-zero for empty hypotheses
+                    beam = sorted(
                         new_beam,
-                        key=lambda hyp: hyp.score / max(1, sum(1 for t in hyp.sequence if t not in (-1, self.blank_id))),
+                        key=lambda x: x.score / (len([t for t in x.tokens if t != self.blank_id]) + 1),
                         reverse=True
-                    )
-                    
-                    # Take top beam_size
-                    current_beam = sorted_beam[:self.beam_size]
+                    )[:self.beam_size]
                 else:
-                    current_beam = new_beam
+                    beam = new_beam
                 
-                # Log occasionally
-                if t % max(1, current_len // 5) == 0:
-                    if current_beam:
-                        top_hyp = current_beam[0]
-                        num_tokens = sum(1 for t in top_hyp.sequence if t not in (-1, self.blank_id))
-                        logging.debug(f"Frame {t+1}/{current_len}, tokens: {num_tokens}")
+                # Control beam states memory
+                if len(beam) > self.max_states:
+                    beam = beam[:self.max_states]
+                
+                # Early stopping check: if all hypotheses end with blank, consider stopping
+                if early_stopping and all(h.tokens[-1] == self.blank_id for h in beam):
+                    break
             
-            # Fallback to greedy search if beam search failed
-            if failed or had_repetition and pattern_repetitions >= self.max_pattern_repetitions:
-                result = self._fallback_greedy_search(
-                    encoder_out[b:b+1], 
-                    encoder_out_lens[b:b+1],
-                    device
-                )
-                hypotheses.append(Hypothesis(
-                    sequence=[-1] * (self.context_size - 1) + [self.blank_id] + result[0],
-                    score=0.0,
-                    decoder_out=None,
-                    timestamps=[],
-                    all_scores=[]
-                ))
-                continue
+            # Finished processing encoder sequence
+            # Add all remaining hypotheses to finished_beam
+            finished_beam.extend(beam)
             
-            # Choose the best hypothesis for this batch item
-            if current_beam:
-                # Use length-normalized score for final selection
+            # Get best hypothesis
+            if finished_beam:
+                # Use length-normalized scores for final selection
                 best_hyp = max(
-                    current_beam,
-                    key=lambda hyp: hyp.score / max(1, sum(1 for t in hyp.sequence if t not in (-1, self.blank_id)))
+                    finished_beam,
+                    key=lambda x: x.score / max(1, len([t for t in x.tokens if t not in (-1, self.blank_id)]))
                 )
-                hypotheses.append(best_hyp)
+                
+                # Extract tokens (removing initial context and blanks)
+                result_tokens = []
+                for token in best_hyp.tokens:
+                    if token not in (-1, self.blank_id):
+                        result_tokens.append(token)
+                
+                if return_timestamps:
+                    all_results.append((result_tokens, best_hyp.timestamps))
+                else:
+                    all_results.append(result_tokens)
             else:
-                # Fallback to initial hypothesis
-                hypotheses.append(beam_list[b])
+                # No hypotheses found - return empty result
+                if return_timestamps:
+                    all_results.append(([], []))
+                else:
+                    all_results.append([])
         
-        # Return appropriate format based on return_timestamps flag
-        if self.return_timestamps:
-            return self._post_process_with_timestamps(hypotheses)
+        # Format results based on return_timestamps flag
+        if return_timestamps:
+            token_seqs = [tokens for tokens, _ in all_results]
+            timestamp_seqs = [timestamps for _, timestamps in all_results]
+            return DecodingResults(hyps=token_seqs, timestamps=timestamp_seqs)
         else:
-            return self._post_process_hyps(hypotheses)
+            return all_results
 
 
 def beam_search_batch(
@@ -798,18 +331,17 @@ def beam_search_batch(
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
     beam_size: int = 4,  # Paper's recommended beam width
-    blank_penalty: float = 10.0,  # Higher blank penalty for stability
+    blank_penalty: float = 0.0,  # Penalty for blank token (negative = penalty, positive = bias)
     return_timestamps: bool = False,
 ) -> Union[List[List[int]], DecodingResults]:
-    """Beam search in batch mode as described in the XLSR-Transducer paper.
+    """Perform beam search decoding on a batch of encoder outputs.
     
     Args:
       model: The transducer model.
-      encoder_out: Output from the encoder. Its shape is (N, T, C), where N >= 1.
-      encoder_out_lens: A 1-D tensor of shape (N,), containing number of valid frames in
-        encoder_out before padding.
-      beam_size: Beam width for search (paper recommends 4)
-      blank_penalty: Penalty applied to blank token
+      encoder_out: Output from the encoder, shape (batch, time, feature_dim).
+      encoder_out_lens: Length of each sequence, shape (batch).
+      beam_size: Beam width for search (paper recommends 4).
+      blank_penalty: Penalty for blank token (negative = penalty, positive = bias).
       return_timestamps: Whether to return timestamps.
       
     Returns:
@@ -817,12 +349,24 @@ def beam_search_batch(
       Else, return a DecodingResults object containing
       decoded result and corresponding timestamps.
     """
-    searcher = XLSRBeamSearch(
+    # Determine if we're early in training and adjust accordingly
+    training_phase = getattr(model, "training_phase", "late")
+    epoch = getattr(model, "cur_epoch", 100)
+    
+    # For very early training, use small blank bias to help convergence
+    early_blank_bias = 1.0 if epoch <= 3 else 0.0
+    
+    # Initialize beam search
+    search = XLSRTransducerBeamSearch(
         model=model,
         beam_size=beam_size,
-        blank_penalty=blank_penalty,
-        return_timestamps=return_timestamps,
-        max_output_length=50,  # More aggressive length limit for early training
+        blank_bias=early_blank_bias - blank_penalty,  # Combine early training bias with user penalty
+        max_sym_per_step=1,  # Standard transducer allows 1 symbol per step
     )
     
-    return searcher.search_batch(encoder_out, encoder_out_lens) 
+    # Perform beam search
+    return search.beam_search(
+        encoder_out=encoder_out,
+        encoder_out_lens=encoder_out_lens,
+        return_timestamps=return_timestamps,
+    ) 

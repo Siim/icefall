@@ -1466,6 +1466,21 @@ def train_one_epoch(
                                     params.batch_idx_train
                                 )
                     
+            # Run validation every 500 batches
+            if batch_idx > 0 and batch_idx % 500 == 0 and not params.print_diagnostics:
+                logging.info("Computing validation loss and WER")
+                valid_info = compute_validation_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    valid_dl=valid_dl,
+                    world_size=world_size,
+                    tb_writer=tb_writer,
+                )
+                model.train()  # Switch back to training mode
+                logging.info(f"Epoch {params.cur_epoch}, batch {batch_idx}, validation: {valid_info}")
+                logging.info(f"Maximum memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024}MB")
+                                    
         except RuntimeError as e:
             if "out of memory" in str(e):
                 # Reduce batch size if OOM

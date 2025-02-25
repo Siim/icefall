@@ -2077,6 +2077,36 @@ def compute_loss(
     return loss, info
 
 
+def process_streaming_chunks(model, feature, chunk_size, attention_sink_size, left_context_chunks):
+    """Process input in streaming chunks following paper's approach"""
+    # ... existing code ...
+    
+    # Process in chunks with proper frame handling
+    encoder_out_chunks = []
+    pos = 0
+    states = None
+    
+    while pos < feature.size(1):
+        end_pos = min(pos + chunk_size, feature.size(1))
+        chunk = feature[:, pos:end_pos]
+        
+        # Process chunk with streaming forward
+        encoder_out, _, states = model.encoder.streaming_forward(
+            chunk, 
+            torch.tensor([chunk.size(1)], device=feature.device),
+            states=[states] if states is not None else None
+        )
+        
+        # Add to output chunks (encoder_out now has overlap properly handled)
+        encoder_out_chunks.append(encoder_out)
+        
+        # Move position forward with overlap
+        pos = end_pos - int(chunk_size * 0.4)  # Use 40% overlap per paper
+    
+    # Concatenate chunks for final output
+    return torch.cat(encoder_out_chunks, dim=1)
+
+
 def main():
     parser = get_parser()
     LibriSpeechAsrDataModule.add_arguments(parser)

@@ -399,6 +399,11 @@ def greedy_search_batch(
                     logging.warning(f"Too many errors ({error_count}/{batch_size}), trying fallback")
                     raise RuntimeError(f"XLSR greedy search failed on too many items: {error_count}/{batch_size}")
         
+        # Add deduplication for streaming mode
+        if model.is_streaming:
+            for i in range(batch_size):
+                all_hyps[i] = deduplicate_streaming_tokens(all_hyps[i], sp)
+        
         # Format and return results
         if not return_timestamps:
             return all_hyps

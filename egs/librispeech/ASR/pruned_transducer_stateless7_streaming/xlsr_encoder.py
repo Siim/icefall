@@ -107,6 +107,19 @@ class EncoderInterface(nn.Module):
             # Save states for this batch item
             new_states.append([new_left_context, new_attention_sink])
             
+            # CRITICAL FIX: When processing chunks, we need to properly handle overlap regions
+            # to avoid frame duplication. The paper carefully removes overlapping regions.
+            
+            # If we have previous states with left context frames, need to handle overlaps
+            if states is not None and b < len(states) and states[b] is not None and states[b][0] is not None:
+                # Adjust the attention mask to account for overlap with previous chunk
+                overlap_frames = self.chunk_overlap // self.downsample_factor
+                
+                # Only use the non-overlapping portion of the output
+                # This is crucial to prevent output frame duplication
+                if hidden_states.size(1) > overlap_frames:
+                    hidden_states = hidden_states[:, overlap_frames:]
+            
             # Add to outputs
             all_outputs.append(hidden_states)
         
@@ -126,6 +139,17 @@ class EncoderInterface(nn.Module):
         
         encoder_out = torch.cat(padded_outputs, dim=0)
         encoder_out_lens = torch.tensor([min(out.size(1), max_len) for out in all_outputs], device=device)
+        
+        # After processing all batch items, before returning:
+        # Verify frame counts match expected lengths
+        expected_total = sum(expected_frames.tolist())
+        actual_total = sum(encoder_out_lens.tolist())
+
+        if actual_total > expected_total * 1.1:  # >10% more frames than expected
+            self.logger.warning(
+                f"Output frame count mismatch: expected ~{expected_total}, got {actual_total}. "
+                f"This may cause transcript duplication. Check overlap handling."
+            )
         
         return encoder_out, encoder_out_lens, new_states
 
@@ -399,11 +423,11 @@ class EncoderInterface(nn.Module):
                 return_dict=True
             )
             hidden_states = outputs.last_hidden_state
-        
-        # Calculate output lengths
-        encoder_out_lens = ((x_lens.float() / self.downsample_factor).floor()).to(torch.int64)
-        encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
-        
+            
+            # Calculate output lengths
+            encoder_out_lens = ((x_lens.float() / self.downsample_factor).floor()).to(torch.int64)
+            encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
+            
         return hidden_states, encoder_out_lens
 
     def set_chunk_size(self, chunk_size: int):
@@ -419,13 +443,14 @@ class EncoderInterface(nn.Module):
             )
         
         self.decode_chunk_size = chunk_size
-        self.chunk_overlap = min(chunk_size // 2, 2560)  # 50% overlap up to a maximum
+        self.chunk_overlap = int(chunk_size * 0.4)  # 40% overlap as per paper
         
         # Update frames per chunk based on new chunk size
         self.frames_per_chunk = chunk_size // self.samples_per_frame
         
         self.logger.info(f"Set chunk size to {chunk_size} samples ({chunk_size/16000*1000:.1f} ms), "
-                         f"{self.frames_per_chunk} frames per chunk")
+                         f"{self.frames_per_chunk} frames per chunk, "
+                         f"overlap: {self.chunk_overlap} samples ({self.chunk_overlap/16000*1000:.1f} ms)")
 
     def apply_attention_sink_mask(self, x, attention_mask=None):
         """Apply attention sink masking as described in the paper
@@ -570,7 +595,8 @@ class XLSREncoder(EncoderInterface):
         
         # Streaming parameters
         self.decode_chunk_size = decode_chunk_size
-        self.chunk_overlap = chunk_overlap if chunk_overlap is not None else decode_chunk_size // 2
+        self.chunk_overlap = chunk_overlap if chunk_overlap is not None else int(decode_chunk_size * 0.4)
+        self.logger.info(f"Using chunk overlap of {self.chunk_overlap} samples ({self.chunk_overlap/16000*1000:.1f}ms)")
         self.min_chunk_size = min_chunk_size
         self.max_chunk_size = max_chunk_size
         self.left_context_chunks = left_context_chunks

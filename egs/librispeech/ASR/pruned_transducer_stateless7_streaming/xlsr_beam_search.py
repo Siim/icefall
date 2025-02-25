@@ -19,6 +19,7 @@ import torch.nn as nn
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
 import logging
+import sentencepiece as spm
 
 from icefall.utils import DecodingResults
 
@@ -49,6 +50,9 @@ class XLSRTransducerBeamSearch:
         blank_bias: float = 0.0,  # Bias for blank token (positive = favor blank)
         max_sym_per_step: int = 1,  # Max symbols per step from the paper
         max_states: int = 32,  # Maximum number of states to maintain
+        repetition_penalty: float = 1.5,  # Penalize token repetition
+        length_normalization: bool = True,  # Normalize by sequence length
+        token_min_logp: float = -5.0,  # Minimum log probability to consider
     ):
         """Initialize beam search.
         
@@ -59,6 +63,9 @@ class XLSRTransducerBeamSearch:
             blank_bias: Bias added to blank token logits (positive favors blanks)
             max_sym_per_step: Maximum symbols emitted per step
             max_states: Maximum number of states to maintain before pruning (memory control)
+            repetition_penalty: Penalize token repetition
+            length_normalization: Normalize by sequence length
+            token_min_logp: Minimum log probability to consider
         """
         self.model = model
         self.beam_size = beam_size
@@ -70,6 +77,10 @@ class XLSRTransducerBeamSearch:
         
         # Set up logger for diagnostics
         self.logger = logging.getLogger("XLSRTransducerBeamSearch")
+        
+        self.repetition_penalty = repetition_penalty
+        self.length_normalization = length_normalization
+        self.token_min_logp = token_min_logp
         
     def _get_initial_tokens(self, device) -> List[int]:
         """Get initial token sequence for decoder."""
@@ -390,7 +401,7 @@ def beam_search_batch(
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
     beam_size: int = 4,  # Paper's recommended beam width
-    blank_penalty: float = 0.0,  # Penalty for blank token (negative = penalty, positive = bias)
+    blank_penalty: float = 0.0,
     return_timestamps: bool = False,
 ) -> Union[List[List[int]], DecodingResults]:
     """Perform beam search decoding on a batch of encoder outputs.
@@ -421,6 +432,9 @@ def beam_search_batch(
         beam_size=beam_size,
         blank_bias=early_blank_bias - blank_penalty,  # Combine early training bias with user penalty
         max_sym_per_step=1,  # Standard transducer allows 1 symbol per step
+        repetition_penalty=1.5,  # Penalize token repetition
+        length_normalization=True,  # Normalize by sequence length
+        token_min_logp=-5.0,  # Minimum log probability to consider
     )
     
     # Perform beam search
@@ -429,3 +443,90 @@ def beam_search_batch(
         encoder_out_lens=encoder_out_lens,
         return_timestamps=return_timestamps,
     ) 
+
+def deduplicate_streaming_tokens(tokens: List[int], sp: spm.SentencePieceProcessor) -> List[int]:
+    """Deduplicate repeated tokens from streaming inference
+    
+    Args:
+        tokens: List of token IDs
+        sp: SentencePiece processor for decoding
+        
+    Returns:
+        Deduplicated token list
+    """
+    if not tokens:
+        return tokens
+        
+    # First pass: remove direct repeats
+    deduped = [tokens[0]]
+    for i in range(1, len(tokens)):
+        if tokens[i] != tokens[i-1]:
+            deduped.append(tokens[i])
+    
+    # Second pass: find and merge prefix/suffix fragments
+    # Convert to text to check substrings
+    result = []
+    i = 0
+    while i < len(deduped):
+        # Get current token
+        current = deduped[i]
+        
+        # Skip forward if we're at the end
+        if i == len(deduped) - 1:
+            result.append(current)
+            break
+            
+        # Get text for current and next token
+        current_text = sp.IdToPiece(current)
+        next_text = sp.IdToPiece(deduped[i+1])
+        
+        # Check for prefix/suffix relationship
+        if current_text in next_text and len(current_text) > 1:
+            # Current is prefix of next, skip current
+            i += 1
+        elif next_text in current_text and len(next_text) > 1:
+            # Next is suffix of current, skip next
+            result.append(current)
+            i += 2
+        else:
+            # No relationship, keep current
+            result.append(current)
+            i += 1
+    
+    return result 
+
+class StreamingTokenAligner:
+    """Aligns streaming tokens using language model scores and heuristics"""
+    def __init__(self, lm_path=None, vocab_size=None):
+        self.vocab_size = vocab_size
+        
+        # Load n-gram LM if available
+        if lm_path:
+            import kenlm
+            self.lm = kenlm.Model(lm_path)
+        else:
+            self.lm = None
+            
+        # Token co-occurrence statistics
+        self.token_ngrams = {}
+    
+    def score_sequence(self, tokens, sp):
+        """Score token sequence coherence"""
+        if not tokens:
+            return 0.0
+            
+        # Convert to text
+        text = sp.decode(tokens)
+        
+        # Language model score if available
+        if self.lm:
+            return self.lm.score(text)
+            
+        # Simple bigram scoring as fallback
+        score = 0.0
+        for i in range(1, len(tokens)):
+            bigram = (tokens[i-1], tokens[i])
+            if bigram in self.token_ngrams:
+                score += self.token_ngrams[bigram]
+        
+        return score 

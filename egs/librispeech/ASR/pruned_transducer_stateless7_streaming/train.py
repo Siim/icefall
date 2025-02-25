@@ -1473,7 +1473,7 @@ def scan_pessimistic_batches_for_oom(
     for criterion, cuts in batches.items():
         batch = train_dl.dataset[cuts]
         try:
-            with torch.cuda.amp.autocast(enabled=params.use_fp16):
+            with torch.amp.autocast(enabled=params.use_fp16):
                 loss, _ = compute_loss(
                     params=params,
                     model=model,
@@ -1662,7 +1662,7 @@ def evaluate_streaming(
                             current_chunk = torch.cat([attention_sink, current_chunk], dim=1)
                         
                         # Process chunk
-                        with torch.cuda.amp.autocast(enabled=params.use_fp16):
+                        with torch.amp.autocast(enabled=params.use_fp16):
                             # Get encoder output for this chunk
                             chunk_out, chunk_lens, states = model.encoder.streaming_forward(
                                 current_chunk,
@@ -1802,7 +1802,7 @@ def compute_loss_with_amp(
     Returns:
         Same as compute_loss
     """
-    with torch.cuda.amp.autocast(enabled=params.use_fp16):
+    with torch.amp.autocast('cuda', enabled=params.use_fp16):
         loss, info = compute_loss(
             params=params,
             model=model,
@@ -1814,6 +1814,112 @@ def compute_loss_with_amp(
         )
     
     # Return the unscaled loss - scaler.scale will be applied in training loop if needed
+    return loss, info
+
+
+def compute_loss(
+    params: AttributeDict,
+    model: nn.Module,
+    sp: spm.SentencePieceProcessor,
+    batch: dict,
+    is_training: bool,
+    is_pre_training: bool = True,
+    chunk_size: Optional[int] = None,
+) -> Tuple[torch.Tensor, MetricsTracker]:
+    """Compute loss following paper's approach with progressive chunk sizes.
+    
+    Args:
+        params: Model parameters
+        model: The model to train
+        sp: Sentence piece processor
+        batch: A batch of data
+        is_training: Whether this is a training batch
+        is_pre_training: Whether this is pre-training phase
+        chunk_size: Optional override for chunk size
+    
+    Returns:
+        (loss, MetricsTracker) containing loss and statistics
+    """
+    device = next(model.parameters()).device
+    feature = batch["inputs"].to(device)
+    feature_lens = batch["supervisions"]["num_frames"].to(device)
+    
+    # Get supervisions
+    supervisions = batch["supervisions"]
+    texts = supervisions["text"]
+    y = sp.encode(texts, out_type=int)
+    y = k2.RaggedTensor(y).to(device)
+    
+    if is_pre_training:
+        # Pre-training phase: full sequence processing without chunking
+        encoder_out, encoder_out_lens = model.encoder(
+            x=feature,
+            x_lens=feature_lens,
+            is_pre_training=True
+        )
+    else:
+        # Determine chunk size based on training phase
+        if chunk_size is None:
+            if params.cur_epoch <= params.pretrain_epochs + 5:  # 5 epochs transition
+                # Progressive chunk size selection
+                progress = (params.cur_epoch - params.pretrain_epochs) / 5
+                curr_chunk_size = int(
+                    params.chunk_sizes["2560ms"] * (1 - progress) + 
+                    params.chunk_sizes["320ms"] * progress
+                )
+            else:
+                # Use optimal chunk size from paper
+                curr_chunk_size = params.chunk_sizes["320ms"]
+        else:
+            curr_chunk_size = chunk_size
+            
+        # Process in chunks with attention sink
+        encoder_out = process_streaming_chunks(
+            model=model,
+            feature=feature,
+            chunk_size=curr_chunk_size,
+            attention_sink_size=params.attention_sink_size,
+            left_context_chunks=params.left_context_chunks
+        )
+        # Calculate encoder output lengths based on chunk processing
+        encoder_out_lens = ((feature_lens.float() / model.encoder.downsample_factor).floor()).to(torch.int64)
+        encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
+    
+    # Project encoder output if using XLSR
+    if hasattr(model, 'encoder_proj'):
+        encoder_out = model.encoder_proj(encoder_out)
+    
+    # Compute transducer loss
+    # Important: We provide the encoder output directly to the model
+    # instead of the raw audio, as XLSR encoder has already processed it
+    simple_loss, pruned_loss = model(
+        x=encoder_out,  # Using encoder output instead of raw audio
+        x_lens=encoder_out_lens,
+        y=y,
+        prune_range=params.prune_range,
+        am_scale=params.am_scale,
+        lm_scale=params.lm_scale,
+    )
+    
+    # Combine losses according to paper
+    if is_pre_training:
+        # During pre-training, use only simple loss for better convergence
+        loss = simple_loss
+    else:
+        # During streaming, combine both losses with scaling
+        loss = params.simple_loss_scale * simple_loss + (1 - params.simple_loss_scale) * pruned_loss
+    
+    assert loss.requires_grad == is_training
+    
+    info = MetricsTracker()
+    info["frames"] = feature.size(0)
+    info["loss"] = loss.detach().cpu().item()
+    if not is_pre_training:
+        info["simple_loss"] = simple_loss.detach().cpu().item()
+        info["pruned_loss"] = pruned_loss.detach().cpu().item()
+        if is_training and hasattr(params, "cur_epoch"):
+            info["chunk_size"] = curr_chunk_size if not is_pre_training else 0
+    
     return loss, info
 
 

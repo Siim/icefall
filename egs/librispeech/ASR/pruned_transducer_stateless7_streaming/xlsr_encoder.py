@@ -9,6 +9,7 @@ import numpy as np
 from typing import Optional, List, Tuple
 from icefall.utils import make_pad_mask
 import math
+from transformers import Wav2Vec2Model, Wav2Vec2Config
 
 class EncoderInterface(nn.Module):
     """Interface for encoders used in transducer models"""
@@ -582,14 +583,11 @@ class XLSREncoder(EncoderInterface):
         super().__init__()
         self.logger = logging.getLogger(self.__class__.__name__)
         
-        # Load model with masking disabled for inference
-        from transformers import Wav2Vec2Model, Wav2Vec2Config
-        
+        # Use the XLSR-53 model instead of 300M
+        model_name = "anton-l/wav2vec2-large-xlsr-53-estonian"
         config = Wav2Vec2Config.from_pretrained(model_name)
+        # Set masking to zero for inference
         config.mask_time_prob = 0.0
-        config.mask_time_length = 1
-        config.mask_feature_prob = 0.0
-        config.mask_feature_length = 1
         self.model = Wav2Vec2Model.from_pretrained(model_name, config=config)
         
         # The downsample factor for wav2vec2/XLSR models

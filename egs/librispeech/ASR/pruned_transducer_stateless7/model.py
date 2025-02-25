@@ -78,6 +78,8 @@ class Transducer(nn.Module):
         )
         self.simple_lm_proj = nn.Linear(decoder_dim, vocab_size)
 
+        self.is_streaming = False  # Flag for token deduplication during inference
+
     def forward(
         self,
         x: torch.Tensor,

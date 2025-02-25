@@ -2074,6 +2074,10 @@ def compute_loss(
         if is_training and hasattr(params, "cur_epoch"):
             info["chunk_size"] = curr_chunk_size if not is_pre_training else 0
     
+    # After computing encoder outputs
+    if not is_pre_training and hasattr(model, "is_streaming"):
+        model.is_streaming = True  # Flag for deduplication
+    
     return loss, info
 
 

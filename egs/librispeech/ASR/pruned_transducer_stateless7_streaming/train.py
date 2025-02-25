@@ -54,6 +54,7 @@ from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, Optional, Tuple, Union, List
 import random
+import os
 
 import k2
 import optim
@@ -2100,6 +2101,14 @@ def compute_loss(
         expected_frames = ((feature_lens.float() / model.encoder.downsample_factor).ceil()).to(torch.int64)
         max_expected_len = expected_frames.max().item()
         
+        # Add detailed frame statistics
+        actual_frames = encoder_out.size(1)
+        avg_expected = expected_frames.float().mean().item()
+        
+        logging.info(f"Frame statistics: actual={actual_frames}, "
+                     f"max_expected={max_expected_len}, avg_expected={avg_expected:.1f}, "
+                     f"ratio={actual_frames/avg_expected:.2f}")
+        
         # Strictly limit encoder output frames
         if encoder_out.size(1) > max_expected_len:
             logging.warning(f"Limiting encoder output: {encoder_out.size(1)} -> {max_expected_len} frames")
@@ -2248,6 +2257,36 @@ def process_streaming_chunks_memory_constrained(model, feature, chunk_size, atte
                 feature[:, :100],
                 torch.tensor([100], device=device)
             )[0]
+
+
+def plot_frame_statistics(expected_frames, actual_frames, epoch, iteration, output_dir):
+    """Save a plot showing expected vs actual frame counts"""
+    try:
+        import matplotlib.pyplot as plt
+        
+        plt.figure(figsize=(10, 6))
+        plt.scatter(expected_frames.cpu().numpy(), 
+                   [actual_frames] * len(expected_frames), 
+                   alpha=0.5)
+        
+        # Add diagonal line for perfect correlation
+        max_val = max(expected_frames.max().item(), actual_frames)
+        plt.plot([0, max_val], [0, max_val], 'r--', label='Expected=Actual')
+        
+        plt.xlabel("Expected Frames")
+        plt.ylabel("Actual Frames")
+        plt.title(f"Frame Count Comparison - Epoch {epoch}, Iter {iteration}")
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Save plot
+        plot_path = os.path.join(output_dir, f"frame_stats_e{epoch}_i{iteration}.png")
+        plt.savefig(plot_path)
+        plt.close()
+        
+        logging.info(f"Frame statistics plot saved to {plot_path}")
+    except Exception as e:
+        logging.warning(f"Failed to create frame statistics plot: {str(e)}")
 
 
 def main():

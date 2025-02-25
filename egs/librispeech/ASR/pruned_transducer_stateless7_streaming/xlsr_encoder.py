@@ -143,6 +143,18 @@ class EncoderInterface(nn.Module):
                 
                 all_outputs.append(hidden_states)
         
+        # Add logging for frame count comparison
+        for b in range(batch_size):
+            actual_frames = all_outputs[b].size(1)
+            expected = expected_frames[b].item()
+            ratio = actual_frames / expected if expected > 0 else float('inf')
+            
+            if ratio > 1.5 or ratio < 0.5:  # Log significant discrepancies
+                self.logger.warning(
+                    f"Frame count mismatch in batch {b}: expected={expected}, "
+                    f"actual={actual_frames}, ratio={ratio:.2f}"
+                )
+        
         # Combine all outputs - pad to max length
         max_len = max(output.size(1) for output in all_outputs)
         padded_outputs = []

@@ -578,7 +578,7 @@ def get_params() -> AttributeDict:
             "batch_idx_train": 0,
             "log_interval": 50,
             "reset_interval": 200,
-            "valid_interval": 3000,
+            "valid_interval": 500,
             
             # Paper's training configuration
             "pretrain_epochs": 5,  # Pre-training phase
@@ -1549,8 +1549,9 @@ def run(rank, world_size, args):
     """
     params = get_params()
     params.update(vars(args))
-    if params.full_libri is False:
-        params.valid_interval = 1600
+    # We want to keep our validation interval at 500 regardless of dataset
+    # if params.full_libri is False:
+    #     params.valid_interval = 1600
 
     fix_random_seed(params.seed)
     if world_size > 1:

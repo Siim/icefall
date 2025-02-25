@@ -89,8 +89,9 @@ from icefall.env import get_env_info
 from icefall.err import raise_grad_scale_is_too_small_error
 from icefall.hooks import register_inf_check_hooks
 from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
-from beam_search import greedy_search_batch  # Only import what we use for validation
+from beam_search import greedy_search_batch  # Original greedy search
 from xlsr_beam_search import beam_search_batch  # Import our new beam search implementation
+from xlsr_greedy_search import greedy_search_batch as xlsr_greedy_search_batch  # Import our enhanced greedy search
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -912,16 +913,18 @@ def validate_one_sample(
         
         # Always use greedy search for validation during early training
         if params.cur_epoch <= 2 or params.batch_idx_train < 500:
-            # Use greedy search for early training
-            logging.info("Using greedy search for early validation")
+            # Use enhanced XLSR-specific greedy search for early training
+            logging.info("Using enhanced XLSR greedy search for early validation")
             try:
-                prediction_tokens = greedy_search_batch(
+                prediction_tokens = xlsr_greedy_search_batch(
                     model=model,
                     encoder_out=encoder_out,
-                    encoder_out_lens=encoder_out_lens
+                    encoder_out_lens=encoder_out_lens,
+                    blank_penalty=2.0,  # Stronger blank penalty for early training
+                    repetition_penalty=2.0  # Repetition penalty to prevent loops
                 )[0]  # Take first (only) result
             except Exception as e:
-                logging.error(f"Error during greedy validation: {str(e)}")
+                logging.error(f"Error during enhanced greedy validation: {str(e)}")
                 return reference, "GREEDY_DECODE_ERROR", 100.0
         else:
             # Use beam search with adjusted parameters for better stability
@@ -935,11 +938,12 @@ def validate_one_sample(
                     blank_penalty=5.0,  # High penalty to prevent blank token dominance
                 )[0]  # Take first (only) result
             except Exception as e:
-                logging.error(f"Beam search failed, falling back to greedy: {str(e)}")
-                prediction_tokens = greedy_search_batch(
+                logging.error(f"Beam search failed, falling back to enhanced greedy: {str(e)}")
+                prediction_tokens = xlsr_greedy_search_batch(
                     model=model,
                     encoder_out=encoder_out,
-                    encoder_out_lens=encoder_out_lens
+                    encoder_out_lens=encoder_out_lens,
+                    blank_penalty=2.0
                 )[0]
             
         # Convert tokens to text
@@ -1684,7 +1688,7 @@ def evaluate_streaming(
     chunk_size: int,
     sp: spm.SentencePieceProcessor,
 ) -> Dict[str, float]:
-    """Evaluate model with proper streaming inference using the paper's approach.
+    """Evaluate model with streaming inference using the paper's approach.
     
     Args:
         params: Model parameters
@@ -1803,30 +1807,14 @@ def evaluate_streaming(
                     else:
                         encoder_out = model.encoder_proj(encoder_out)
                     
-                    # Use beam search for decoding as specified in the paper
-                    if batch_idx < 3:  # Only use beam search for first few batches to save time
-                        try:
-                            # Beam search with width=4 as per paper
-                            hyp_tokens = beam_search_batch(
-                                model=model,
-                                encoder_out=encoder_out,
-                                encoder_out_lens=encoder_out_lens,
-                                beam_size=4
-                            )[0]  # Take first (only) hypothesis
-                        except Exception as e:
-                            logging.warning(f"Beam search failed, falling back to greedy: {str(e)}")
-                            hyp_tokens = greedy_search_batch(
-                                model=model,
-                                encoder_out=encoder_out,
-                                encoder_out_lens=encoder_out_lens
-                            )[0]
-                    else:
-                        # Use greedy search for the rest to speed up evaluation
-                        hyp_tokens = greedy_search_batch(
-                            model=model,
-                            encoder_out=encoder_out,
-                            encoder_out_lens=encoder_out_lens
-                        )[0]
+                    # Use XLSR-specific greedy search for decoding as it's more robust
+                    hyp_tokens = xlsr_greedy_search_batch(
+                        model=model,
+                        encoder_out=encoder_out,
+                        encoder_out_lens=encoder_out_lens,
+                        blank_penalty=2.0,  # Stronger blank penalty to prevent blank token dominance
+                        repetition_penalty=1.5  # Moderate repetition penalty
+                    )[0]
                     
                     # Convert to text
                     if isinstance(hyp_tokens, torch.Tensor):
@@ -1884,6 +1872,7 @@ def evaluate_streaming(
         "total_words": total_words,
         "total_errors": total_errors,
         "chunk_size_ms": chunk_size / 16,  # Convert samples to ms
+        "latency": chunk_size / 16000.0  # Estimated latency in seconds
     }
     
     return metrics

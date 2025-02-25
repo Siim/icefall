@@ -97,7 +97,7 @@ class XLSRTransducerBeamSearch:
         # Get decoder output
         try:
             decoder_out = self.model.decoder(decoder_input, need_pad=False)
-            decoder_out = self.model.joiner.decoder_proj(decoder_out)
+            # We don't apply decoder_proj here anymore - we'll do it in the beam search
             return decoder_out
         except Exception as e:
             self.logger.warning(f"Error computing decoder output: {e}")
@@ -204,11 +204,17 @@ class XLSRTransducerBeamSearch:
                     frame_for_joiner = frame.unsqueeze(0)  # (1, 1, feature_dim)
                     decoder_out_for_joiner = decoder_out.unsqueeze(1)  # (1, 1, decoder_dim)
                     
+                    # Apply projections before joining - THIS IS THE KEY FIX
+                    # Project encoder output
+                    projected_encoder = self.model.joiner.encoder_proj(frame_for_joiner)
+                    # Project decoder output
+                    projected_decoder = self.model.joiner.decoder_proj(decoder_out_for_joiner)
+                    
                     # Compute joint output and log probabilities
                     try:
-                        # joint.forward combines encoder and decoder outputs to predict next token
+                        # Now use the projected outputs with project_input=False
                         logits = self.model.joiner(
-                            frame_for_joiner, decoder_out_for_joiner, project_input=False
+                            projected_encoder, projected_decoder, project_input=False
                         ).squeeze(0).squeeze(0)  # (vocab_size,)
                         
                         # Apply blank bias if specified

@@ -583,4 +583,81 @@ class EncoderInterface(nn.Module):
         self.frames_per_chunk = int(chunk_size / samples_per_frame)
         
         logging.info(f"Set chunk size to {chunk_size} samples ({chunk_size/16000*1000:.1f} ms), "
-                     f"{self.frames_per_chunk} frames per chunk") 
+                     f"{self.frames_per_chunk} frames per chunk")
+
+class XLSREncoder(EncoderInterface):
+    def __init__(
+        self, 
+        model_name: str = "TalTechNLP/xls-r-300m-et",
+        decode_chunk_size: int = 5120,  # 320ms at 16kHz (paper's best performing)
+        chunk_overlap: int = None,  # Will be set to decode_chunk_size // 2
+        use_attention_sink: bool = True,
+        attention_sink_size: int = 16,  # Paper's optimal setting
+        frame_duration: float = 0.025,  # 25ms per frame (from paper)
+        frame_stride: float = 0.020,  # 20ms stride (from paper)
+        min_chunk_size: int = 2560,  # 160ms at 16kHz (16 frames)
+        max_chunk_size: int = 20480,  # 1280ms at 16kHz (128 frames)
+        left_context_chunks: int = 1,  # Paper's optimal setting
+    ) -> None:
+        super().__init__()
+        self.logger = logging.getLogger(self.__class__.__name__)
+        
+        from transformers import Wav2Vec2Model, Wav2Vec2Config
+        
+        # Load model with masking disabled for inference
+        config = Wav2Vec2Config.from_pretrained(model_name)
+        config.mask_time_prob = 0.0
+        config.mask_time_length = 1
+        config.mask_feature_prob = 0.0
+        config.mask_feature_length = 1
+        self.model = Wav2Vec2Model.from_pretrained(model_name, config=config)
+        
+        # The downsample factor is 320 for wav2vec2/XLSR models
+        self.downsample_factor = 320
+        
+        # Frame parameters (from paper)
+        self.frame_duration = frame_duration
+        self.frame_stride = frame_stride
+        
+        # Calculate frames per chunk based on paper specifications
+        sampling_rate = 16000  # XLSR models use 16kHz audio
+        # How many frames per second (considering frame_stride)
+        frames_per_second = 1.0 / self.frame_stride
+        # How many audio samples per frame
+        samples_per_frame = int(sampling_rate * self.frame_stride)
+        # Frames per chunk
+        self.frames_per_chunk = int(decode_chunk_size / samples_per_frame)
+        self.logger.info(f"Using {self.frames_per_chunk} frames per chunk")
+        
+        # Streaming parameters
+        self.decode_chunk_size = decode_chunk_size
+        self.chunk_overlap = chunk_overlap if chunk_overlap is not None else int(decode_chunk_size * 0.4)
+        self.logger.info(f"Using chunk overlap of {self.chunk_overlap} samples")
+        self.min_chunk_size = min_chunk_size
+        self.max_chunk_size = max_chunk_size
+        self.left_context_chunks = left_context_chunks
+        
+        # Attention sink parameters (from paper)
+        self.use_attention_sink = use_attention_sink
+        self.attention_sink_size = attention_sink_size
+        
+        # Initialize streaming state
+        self.reset_streaming_state()
+        
+        # Ensure output_dim matches joiner input
+        self.output_dim = 1024  # For XLS-R 300M
+        
+        # Define standard chunk sizes from paper
+        self.chunk_sizes = {
+            "320ms": 5120,   # 16 frames
+            "640ms": 10240,  # 32 frames
+            "1280ms": 20480, # 64 frames
+            "2560ms": 40960  # 128 frames
+        }
+        
+        # Validate chunk size is one of paper's configurations
+        if decode_chunk_size not in self.chunk_sizes.values():
+            self.logger.warning(
+                f"Chunk size {decode_chunk_size} not in paper's configurations: "
+                f"{list(self.chunk_sizes.values())}. Using anyway, but consider changing."
+            ) 

@@ -1471,7 +1471,7 @@ def train_one_epoch(
                                 )
                     
             # Run validation every 500 batches
-            if batch_idx > 0 and batch_idx % 500 == 0 and not params.print_diagnostics:
+            if batch_idx > 0 and batch_idx % 50 == 0 and not params.print_diagnostics:
                 logging.info("Computing validation loss and WER")
                 valid_info = compute_validation_loss(
                     params=params,

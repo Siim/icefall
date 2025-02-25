@@ -891,6 +891,25 @@ def validate_one_sample(
         else:
             encoder_out = model.encoder_proj(encoder_out)
         
+        # Try CTC decoding first for comparison
+        try:
+            from xlsr_ctc_decoder import XLSRCTCDecoder
+            
+            logging.info("Trying CTC decoding for comparison")
+            ctc_decoder = XLSRCTCDecoder(
+                encoder_dim=1024,  # XLSR output dimension 
+                vocab_size=params.vocab_size,
+                blank_id=params.blank_id
+            ).to(device)
+            
+            ctc_tokens, _ = ctc_decoder.decode(encoder_out, encoder_out_lens)
+            ctc_prediction = sp.decode(ctc_tokens[0])  # First (only) result
+            
+            logging.info(f"CTC PREDICTION: {ctc_prediction}")
+        except Exception as e:
+            logging.error(f"Error during CTC decoding: {str(e)}")
+            ctc_prediction = "CTC_DECODE_ERROR"
+        
         # Always use greedy search for validation during early training
         if params.cur_epoch <= 2 or params.batch_idx_train < 500:
             # Use greedy search for early training
@@ -945,6 +964,13 @@ def validate_one_sample(
         pred_words = prediction.split()
         errors = editdistance.eval(ref_words, pred_words)
         wer = 100.0 * errors / max(1, len(ref_words))
+        
+        # Also calculate WER for CTC prediction for comparison
+        if ctc_prediction != "CTC_DECODE_ERROR":
+            ctc_pred_words = ctc_prediction.split()
+            ctc_errors = editdistance.eval(ref_words, ctc_pred_words)
+            ctc_wer = 100.0 * ctc_errors / max(1, len(ref_words))
+            logging.info(f"CTC WER: {ctc_wer:.2f}%")
         
         # Log more detailed token information
         logging.info(f"Number of tokens in prediction: {len(prediction_tokens)}")

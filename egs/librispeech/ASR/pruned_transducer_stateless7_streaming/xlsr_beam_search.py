@@ -120,19 +120,15 @@ class XLSRBeamSearch:
         Returns:
             List of extended hypotheses
         """
-        # Add debug logging
-        logging.debug(f"Extending hypothesis at frame {frame_idx}")
-        
-        # Validate inputs to help with debugging
+        # Input validation for better debugging
         if encoder_frame is None:
             logging.error("encoder_frame is None in _extend_hypothesis")
-            # Return current hypothesis if we can't extend it
-            return [hyp]
-        
+            return [hyp]  # Return current hypothesis without extension
+            
         if not isinstance(hyp.decoder_out, torch.Tensor):
             logging.error(f"Invalid decoder_out type: {type(hyp.decoder_out)}")
-            # Try to recover by creating a new decoder output
             try:
+                # Attempt to recreate decoder output
                 decoder_input = torch.tensor(
                     [hyp.sequence[-self.context_size:] if len(hyp.sequence) >= self.context_size 
                      else ([-1] * (self.context_size - len(hyp.sequence)) + hyp.sequence)],
@@ -140,161 +136,168 @@ class XLSRBeamSearch:
                     dtype=torch.int64,
                 )
                 decoder_out = self.model.decoder(decoder_input, need_pad=False)
-                decoder_out = self.model.joiner.decoder_proj(decoder_out)
-                hyp.decoder_out = decoder_out
+                hyp.decoder_out = self.model.joiner.decoder_proj(decoder_out)
             except Exception as e:
                 logging.error(f"Failed to recover decoder_out: {str(e)}")
-                # Return empty list if we can't recover
-                return []
+                return [hyp]  # Return current hypothesis without extension
         
-        # Get the decoder output
-        decoder_out = hyp.decoder_out
-        
-        # Reshape encoder frame to appropriate dimensions
-        # We need to ensure it has shape compatible with the joiner
         try:
-            # Normalize encoder frame dimensions
-            if encoder_frame.ndim == 1:  # (features,)
-                encoder_proj = encoder_frame.unsqueeze(0).unsqueeze(0)  # (1, 1, features)
-            elif encoder_frame.ndim == 2:  # (1, features) or (time, features)
+            # Normalize encoder_frame dimensions based on its shape
+            if encoder_frame.ndim == 1:  # (D,)
+                encoder_frame = encoder_frame.unsqueeze(0).unsqueeze(0)  # (1, 1, D)
+            elif encoder_frame.ndim == 2:  # (1, D) or (T, D)
                 if encoder_frame.size(0) == 1:
-                    encoder_proj = encoder_frame.unsqueeze(0)  # (1, 1, features)
+                    encoder_frame = encoder_frame.unsqueeze(0)  # (1, 1, D)
                 else:
-                    # Take just the first time frame
-                    encoder_proj = encoder_frame[0:1].unsqueeze(0)  # (1, 1, features)
-            elif encoder_frame.ndim == 3:  # (1, 1, features) or (batch, time, features)
-                if encoder_frame.size(0) == 1 and encoder_frame.size(1) == 1:
-                    encoder_proj = encoder_frame  # Already (1, 1, features)
-                else:
-                    # Take just the first batch and time frame
-                    encoder_proj = encoder_frame[0:1, 0:1]  # (1, 1, features)
-            elif encoder_frame.ndim == 4:  # (1, 1, 1, features)
-                encoder_proj = encoder_frame.squeeze(2)  # (1, 1, features)
-            else:
-                # Unexpected dimension - try to reshape to (1, 1, -1)
-                logging.warning(f"Unexpected encoder_frame dimension: {encoder_frame.shape}")
-                encoder_proj = encoder_frame.reshape(1, 1, -1)
+                    encoder_frame = encoder_frame[0:1].unsqueeze(0)  # (1, 1, D)
+            elif encoder_frame.ndim == 3:  # (B, T, D) or (1, 1, D)
+                if encoder_frame.size(0) > 1 or encoder_frame.size(1) > 1:
+                    encoder_frame = encoder_frame[0:1, 0:1]  # Take just first batch and time
             
-            # Ensure decoder has right dimensions - we need (1, 1, features)
-            if decoder_out.ndim == 2:  # (1, features)
-                decoder_proj = decoder_out.unsqueeze(1)  # (1, 1, features)
-            elif decoder_out.ndim == 3:  # Already (1, 1, features)
-                decoder_proj = decoder_out
-            else:
-                # Unexpected dimension - try to reshape
-                logging.warning(f"Unexpected decoder_out dimension: {decoder_out.shape}")
-                decoder_proj = decoder_out.reshape(1, 1, -1)
-            
-            # Debug shapes before joiner
-            logging.debug(f"Encoder shape: {encoder_proj.shape}, Decoder shape: {decoder_proj.shape}")
+            # Ensure decoder_out has the right dimensions (1, 1, D)
+            decoder_out = hyp.decoder_out
+            if decoder_out.ndim == 2:  # (1, D)
+                decoder_out = decoder_out.unsqueeze(1)  # (1, 1, D)
             
             # Compute joiner output (logits)
             logits = self.model.joiner(
-                encoder_proj,
-                decoder_proj,
+                encoder_frame,
+                decoder_out,
                 project_input=False
             )
             
             # After joiner, get to (1, vocab_size)
-            if logits.ndim == 3:  # (1, 1, vocab_size)
-                logits = logits.squeeze(1)
-            elif logits.ndim == 4:  # (1, 1, 1, vocab_size)
-                logits = logits.squeeze(1).squeeze(1)
+            logits = logits.squeeze(0).squeeze(0)  # (vocab_size,)
             
-            # Debug logits stats
-            logging.debug(f"Logits shape: {logits.shape}, min: {logits.min().item()}, max: {logits.max().item()}")
-            
-            # Apply blank penalty if needed
+            # Apply blank penalty and temperature adjustments
             if self.blank_penalty != 0:
-                logits[0, self.blank_id] -= self.blank_penalty
+                logits[self.blank_id] -= self.blank_penalty
+                
+                # Add high penalty for repeated blank tokens
+                if len(hyp.sequence) >= 3 and hyp.sequence[-1] == self.blank_id and hyp.sequence[-2] == self.blank_id:
+                    logits[self.blank_id] -= 10.0
             
-            # Apply temperature to logits
             if self.temperature != 1.0:
                 logits = logits / self.temperature
+                
+            # Penalize repetitive patterns
+            if len(hyp.sequence) >= 6:
+                # Check for simple repetition (same token repeated)
+                last_token = hyp.sequence[-1]
+                if last_token != self.blank_id and last_token == hyp.sequence[-3] and last_token == hyp.sequence[-5]:
+                    # Penalize this token heavily to break the loop
+                    logits[last_token] -= 15.0
+                
+                # Check for alternating pattern (A B A B A B...)
+                if (hyp.sequence[-1] == hyp.sequence[-3] and 
+                    hyp.sequence[-2] == hyp.sequence[-4] and
+                    hyp.sequence[-3] == hyp.sequence[-5]):
+                    # Penalize both tokens
+                    token1 = hyp.sequence[-1]
+                    token2 = hyp.sequence[-2]
+                    if token1 != self.blank_id:
+                        logits[token1] -= 15.0
+                    if token2 != self.blank_id:
+                        logits[token2] -= 15.0
             
-            # Convert to log probabilities
+            # Apply softmax to convert to probabilities
             log_probs = torch.log_softmax(logits, dim=-1)
             
-            # Get top-k tokens and their log probs
-            top_k_log_probs, top_k_indices = log_probs.topk(self.beam_size)
-            
-            # Debug top tokens
-            token_info = []
-            for i in range(min(self.beam_size, 5)):  # Show up to 5 top tokens
-                token_id = top_k_indices[0, i].item()
-                token_log_prob = top_k_log_probs[0, i].item()
-                token_info.append(f"Token {token_id} (score: {token_log_prob:.2f})")
-            logging.debug(f"Top tokens: {', '.join(token_info)}")
-            
-            # Add significant blank penalty to discourage repetitive loops
-            blank_penalty_factor = 0.5  # Penalty for repeated blanks
+            # Top-k tokens from log probabilities
+            k = min(self.beam_size, log_probs.size(-1))
+            top_k_log_probs, top_k_indices = log_probs.topk(k)
             
             # Create new hypotheses
             new_hyps = []
             
-            for i in range(self.beam_size):
-                token_id = top_k_indices[0, i].item()
-                token_log_prob = top_k_log_probs[0, i].item()
+            # Track if we've seen a non-blank token
+            seen_non_blank = False
+            
+            for i in range(k):
+                token_id = top_k_indices[i].item()
+                token_log_prob = top_k_log_probs[i].item()
                 
-                # Penalize repeated tokens to break loops
-                if len(hyp.sequence) > 5:  # Only check if we have some history
-                    # Check for repeating pattern of 1-3 tokens
-                    recent_tokens = hyp.sequence[-6:]  # Get last 6 tokens
-                    if token_id == recent_tokens[-1] and token_id == recent_tokens[-3] and token_id == recent_tokens[-5]:
-                        # Three of the same token in alternating positions - penalize
-                        token_log_prob -= 2.0
-                        logging.debug(f"Penalizing repeated token pattern: {token_id}")
-                
-                # Create a copy of the current hypothesis sequence
+                # Create a copy of the current sequence
                 new_sequence = hyp.sequence.copy()
+                
+                # Create copies of timestamp and score arrays
                 new_timestamps = hyp.timestamps.copy() if hyp.timestamps is not None else []
                 new_scores = hyp.all_scores.copy() if hyp.all_scores is not None else []
                 
-                # Only add non-blank tokens to the sequence
-                if token_id not in (self.blank_id, self.unk_id):
+                # Handle blank tokens specially
+                if token_id == self.blank_id:
+                    # Keep the same decoder output for blank tokens
+                    new_decoder_out = decoder_out
+                else:
+                    # Token is non-blank - update the sequence
                     new_sequence.append(token_id)
                     new_timestamps.append(frame_idx)
                     new_scores.append(token_log_prob)
+                    seen_non_blank = True
                     
                     # Get decoder output for new sequence
                     try:
-                        decoder_input = torch.tensor(
-                            [new_sequence[-self.context_size:] if len(new_sequence) >= self.context_size 
-                             else ([-1] * (self.context_size - len(new_sequence)) + new_sequence)],
-                            device=device,
-                            dtype=torch.int64,
-                        )
+                        context = new_sequence[-self.context_size:] if len(new_sequence) >= self.context_size else ([-1] * (self.context_size - len(new_sequence)) + new_sequence)
+                        decoder_input = torch.tensor([context], device=device, dtype=torch.int64)
                         new_decoder_out = self.model.decoder(decoder_input, need_pad=False)
                         new_decoder_out = self.model.joiner.decoder_proj(new_decoder_out)
                     except Exception as e:
                         logging.error(f"Failed to get decoder output: {str(e)}")
-                        new_decoder_out = decoder_out  # Fall back to current decoder output
-                else:
-                    # For blank token, penalize if we've had too many consecutive blanks
-                    if token_id == self.blank_id and hyp.sequence and hyp.sequence[-1] == self.blank_id:
-                        token_log_prob -= blank_penalty_factor
-                        logging.debug("Penalizing consecutive blank")
+                        # Use old decoder output if we fail
+                        new_decoder_out = decoder_out
                 
-                    # For blank token, keep the same decoder output
-                    new_decoder_out = decoder_out
-                
-                # Create new hypothesis
+                # Create the new hypothesis
                 new_hyp = Hypothesis(
                     sequence=new_sequence,
-                    score=hyp.score + token_log_prob,  # Accumulate log probability
+                    score=hyp.score + token_log_prob,
                     decoder_out=new_decoder_out,
                     timestamps=new_timestamps,
                     all_scores=new_scores
                 )
                 new_hyps.append(new_hyp)
             
+            # If all our candidates were blank tokens, force consider the best non-blank
+            if not seen_non_blank and len(new_hyps) > 0:
+                # Find the highest scoring non-blank token
+                for i in range(k, min(log_probs.size(-1), k*2)):
+                    token_id = log_probs.argsort(descending=True)[i].item()
+                    if token_id != self.blank_id:
+                        token_log_prob = log_probs[token_id].item()
+                        
+                        # Create new hypothesis with this token
+                        new_sequence = hyp.sequence.copy()
+                        new_timestamps = hyp.timestamps.copy() if hyp.timestamps is not None else []
+                        new_scores = hyp.all_scores.copy() if hyp.all_scores is not None else []
+                        
+                        new_sequence.append(token_id)
+                        new_timestamps.append(frame_idx)
+                        new_scores.append(token_log_prob)
+                        
+                        try:
+                            context = new_sequence[-self.context_size:] if len(new_sequence) >= self.context_size else ([-1] * (self.context_size - len(new_sequence)) + new_sequence)
+                            decoder_input = torch.tensor([context], device=device, dtype=torch.int64)
+                            new_decoder_out = self.model.decoder(decoder_input, need_pad=False)
+                            new_decoder_out = self.model.joiner.decoder_proj(new_decoder_out)
+                        except Exception as e:
+                            new_decoder_out = decoder_out
+                        
+                        forced_hyp = Hypothesis(
+                            sequence=new_sequence,
+                            score=hyp.score + token_log_prob,
+                            decoder_out=new_decoder_out,
+                            timestamps=new_timestamps,
+                            all_scores=new_scores
+                        )
+                        new_hyps.append(forced_hyp)
+                        logging.debug(f"Forcing consideration of non-blank token {token_id}")
+                        break
+            
             return new_hyps
             
         except Exception as e:
             logging.error(f"Error in _extend_hypothesis: {str(e)}")
             logging.error("Exception details:", exc_info=True)
-            # Return current hypothesis if extension failed
-            return [hyp]
+            return [hyp]  # Return current hypothesis if extension failed
     
     def _post_process_hyps(self, hyps: List[Hypothesis]) -> List[List[int]]:
         """Post-process hypotheses to return final token sequences."""
@@ -340,31 +343,45 @@ class XLSRBeamSearch:
     ) -> Union[List[List[int]], DecodingResults]:
         """Perform beam search decoding on a batch of encoder outputs."""
         device = encoder_out.device
-        batch_size = encoder_out.size(0)
-        
-        # Reset symbols per frame counter for this search
-        self.symb_per_frame = {}
         
         # Validate input dimensions
         if encoder_out.ndim not in (2, 3, 4):
-            raise ValueError(f"Unsupported encoder_out dimension: {encoder_out.ndim}")
-        
-        # Handle different encoder dimensions - we need (batch, time, features)
+            logging.error(f"Unsupported encoder_out dimension: {encoder_out.ndim}")
+            # Try to reshape to supported dimension
+            if encoder_out.ndim == 1:
+                encoder_out = encoder_out.unsqueeze(0).unsqueeze(0)  # Add batch and time dims
+            else:
+                # For higher dims, try to get to (batch, time, features)
+                shape = encoder_out.shape
+                encoder_out = encoder_out.reshape(1, -1, shape[-1])
+            logging.warning(f"Reshaped encoder_out to {encoder_out.shape}")
+            
+        # Convert to the right shape - we need (batch, time, features)
         if encoder_out.ndim == 2:
             # Handle (batch, features) by adding time dimension
-            encoder_out = encoder_out.unsqueeze(1)
+            if encoder_out.size(0) == 1:
+                encoder_out = encoder_out.unsqueeze(1)  # (1, 1, features)
+            else:
+                # Multiple items but no time dim - unclear how to interpret
+                # Assume it's (time, features) for a single item
+                encoder_out = encoder_out.unsqueeze(0)  # (1, time, features)
         elif encoder_out.ndim == 4:
             # Handle (batch, time, s_range, features) by reshaping
             b, t, s, f = encoder_out.size()
             encoder_out = encoder_out.reshape(b, t * s, f)
         
-        # Ensure encoder_out_lens has correct batch size
+        # Get batch size after reshaping
+        batch_size = encoder_out.size(0)
+        
+        # Ensure encoder_out_lens matches batch size
         if encoder_out_lens.size(0) != batch_size:
             logging.warning(f"encoder_out_lens batch size ({encoder_out_lens.size(0)}) doesn't match encoder_out ({batch_size})")
+            
             if encoder_out_lens.size(0) > batch_size:
+                # Too many lengths, truncate
                 encoder_out_lens = encoder_out_lens[:batch_size]
             else:
-                # If not enough length values, pad with max length
+                # Not enough lengths, pad with max length
                 max_len = encoder_out.size(1)
                 padding = torch.full(
                     (batch_size - encoder_out_lens.size(0),), 
@@ -374,91 +391,109 @@ class XLSRBeamSearch:
                 )
                 encoder_out_lens = torch.cat([encoder_out_lens, padding])
         
-        # Cap sequence lengths to actual encoder output size
-        encoder_out_lens = torch.minimum(encoder_out_lens, torch.tensor(encoder_out.size(1), device=device))
+        # Cap lengths to actual encoder output size
+        max_seq_len = encoder_out.size(1)
+        encoder_out_lens = torch.minimum(encoder_out_lens, torch.tensor(max_seq_len, device=device))
         
-        # For safety, double-check no zero-length sequences
+        # Ensure no zero-length sequences
         encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
         
-        # Initialize beam for each item in batch
-        beam_list = [self._create_initial_hypothesis(device) for _ in range(batch_size)]
-        
-        # Process each batch separately (simpler and more stable than packed approach)
-        hypotheses = []
+        # Initialize initial hypotheses for each batch item
+        beam_list = []
         for b in range(batch_size):
+            beam_list.append(self._create_initial_hypothesis(device))
+        
+        # Initialize result container
+        hypotheses = []
+        
+        # Process each batch item separately
+        for b in range(batch_size):
+            logging.debug(f"Processing batch item {b+1}/{batch_size}")
             current_len = encoder_out_lens[b].item()
             current_encoder_out = encoder_out[b, :current_len]
             
-            # Project encoder output for this batch item
-            with torch.no_grad():
-                current_proj = self.model.joiner.encoder_proj(current_encoder_out)
-            
-            # Initialize beam with first hypothesis
+            # Initialize beam with single hypothesis
             current_beam = [beam_list[b]]
             
-            # Keep track of symbols emitted per frame for this item
-            item_symb_per_frame = {}
-            
-            # Track if we're stuck in a loop
+            # Set maximum consecutive non-token frames to prevent infinite loops
             consecutive_blanks = 0
-            max_consecutive_blanks = 10  # Limit to prevent looping on blanks
+            max_consecutive_blanks = min(current_len // 4, 10)  # Limit based on sequence length
             
             # Process each frame
             for t in range(current_len):
-                # Get encoder output for current frame
-                frame = current_proj[t:t+1]  # Shape: (1, encoder_dim)
+                # Get current encoder frame
+                current_frame = current_encoder_out[t:t+1]  # (1, encoder_dim)
                 
-                # Reset token count for this frame
-                item_symb_per_frame[t] = 0
-                
-                # Create new hypotheses by extending each existing one
+                # Extend each hypothesis in the beam
                 new_beam = []
-                for hyp in current_beam:
-                    # Check if we've exceeded per-frame token limit
-                    if item_symb_per_frame[t] >= self.max_symb_per_frame:
-                        # Force a blank token if we've emitted too many symbols this frame
-                        # This effectively moves to the next frame
-                        new_hyps = [hyp]  # Keep current hypothesis
-                        consecutive_blanks += 1
-                    else:
-                        # Normal hypothesis extension
-                        new_hyps = self._extend_hypothesis(hyp, frame, t, device)
-                        
-                        # Update token counter for this frame
-                        # Only count non-blank tokens
-                        for new_hyp in new_hyps:
-                            if len(new_hyp.sequence) > len(hyp.sequence):
-                                item_symb_per_frame[t] += 1
-                    
-                    new_beam.extend(new_hyps)
+                non_blank_extensions = False
                 
+                for hyp in current_beam:
+                    # Extend the hypothesis
+                    extended_hyps = self._extend_hypothesis(hyp, current_frame, t, device)
+                    
+                    # Check if we got any non-blank extensions
+                    for extended_hyp in extended_hyps:
+                        if len(extended_hyp.sequence) > len(hyp.sequence):
+                            non_blank_extensions = True
+                            consecutive_blanks = 0
+                            break
+                    
+                    # Add all extensions to the new beam
+                    new_beam.extend(extended_hyps)
+                
+                # If we didn't get any non-blank extensions, increment counter
+                if not non_blank_extensions:
+                    consecutive_blanks += 1
+                    
                 # Break early if stuck in a loop of blanks
                 if consecutive_blanks >= max_consecutive_blanks:
-                    logging.warning(f"Breaking out of a blank token loop at frame {t}")
+                    logging.warning(f"Breaking out of blank token loop at frame {t}/{current_len}")
                     break
                 
-                # Reset consecutive blanks if we emitted symbols
-                if item_symb_per_frame[t] > 0:
-                    consecutive_blanks = 0
-                
                 # Keep only top beam_size hypotheses
-                if len(new_beam) > 0:
-                    # Sort by score
-                    scored_beam = [(hyp, hyp.score / max(1, len(hyp.sequence))) for hyp in new_beam]
-                    sorted_beam = sorted(scored_beam, key=lambda x: -x[1])  # Higher score is better
-                    current_beam = [hyp for hyp, _ in sorted_beam[:self.beam_size]]
+                if len(new_beam) > self.beam_size:
+                    # Two scoring methods:
+                    # 1. Raw score (sum of log probs)
+                    # 2. Normalized score (average log prob per token)
+                    
+                    # For early frames (first 25%), use raw score to encourage longer sequences
+                    if t < current_len * 0.25:
+                        sorted_beam = sorted(new_beam, key=lambda hyp: hyp.score, reverse=True)
+                    else:
+                        # For later frames, use length-normalized score
+                        sorted_beam = sorted(
+                            new_beam,
+                            key=lambda hyp: hyp.score / max(1, len([t for t in hyp.sequence if t != -1])),
+                            reverse=True
+                        )
+                    
+                    # Take top beam_size
+                    current_beam = sorted_beam[:self.beam_size]
+                else:
+                    current_beam = new_beam
                 
-                # If all hypotheses are the same, increase diversity by adding noise
-                if len(current_beam) >= 2 and all(hyp.sequence == current_beam[0].sequence for hyp in current_beam[1:]):
-                    logging.info(f"All beam hypotheses identical at frame {t}, adding diversity")
-                    # Add small random perturbation to scores to encourage diversity
-                    for i in range(1, len(current_beam)):
-                        current_beam[i].score += torch.rand(1).item() * 0.1
+                # Occasionally log progress
+                if t % max(1, current_len // 10) == 0:
+                    logging.debug(f"Batch {b+1}, Frame {t+1}/{current_len}, beam size: {len(current_beam)}")
+                    if current_beam:
+                        top_hyp = current_beam[0]
+                        num_tokens = len([t for t in top_hyp.sequence if t not in (-1, self.blank_id)])
+                        logging.debug(f"Top hyp has {num_tokens} non-blank tokens, score: {top_hyp.score:.2f}")
             
-            # Get the best hypothesis for this batch item
-            hypotheses.append(current_beam[0] if current_beam else beam_list[b])
+            # Choose the best hypothesis for this batch item
+            if current_beam:
+                # Use length-normalized score for final selection
+                best_hyp = max(
+                    current_beam,
+                    key=lambda hyp: hyp.score / max(1, len([t for t in hyp.sequence if t != -1]))
+                )
+                hypotheses.append(best_hyp)
+            else:
+                # Fallback to initial hypothesis
+                hypotheses.append(beam_list[b])
         
-        # Return either token sequences or DecodingResults with timestamps
+        # Return appropriate format based on return_timestamps flag
         if self.return_timestamps:
             return self._post_process_with_timestamps(hypotheses)
         else:

@@ -936,39 +936,23 @@ def process_streaming_chunks(
     device = feature.device
     batch_size = feature.size(0)
     
-    # Initialize states
-    states = None
-    chunk_outputs = []
-    
     # Calculate chunk parameters
     chunk_overlap = chunk_size // 2  # Half overlap as per paper
     effective_chunk_size = chunk_size - chunk_overlap
     
-    # Calculate attention sink size in samples
-    sink_size = attention_sink_size * model.encoder.downsample_factor
-    
     # Process each sequence in batch
+    chunk_outputs = []
+    
     for b in range(batch_size):
         seq = feature[b:b+1]  # Keep batch dimension
         pos = 0
         seq_outputs = []
-        left_context = None
+        states = None  # States for streaming inference
         
         while pos < seq.size(1):
             # Get current chunk boundaries
             end_pos = min(pos + chunk_size, seq.size(1))
             chunk = seq[:, pos:end_pos]
-            
-            # Add left context if available
-            if left_context is not None:
-                chunk = torch.cat([left_context, chunk], dim=1)
-            
-            # Add attention sink if enabled
-            if states is not None and attention_sink_size > 0:
-                sink = states[1]  # Attention sink cache from previous chunk
-                if sink is not None:
-                    # Paper's approach: prepend attention sink to current chunk
-                    chunk = torch.cat([sink, chunk], dim=1)
             
             # Process chunk through encoder
             chunk_out, chunk_lens, new_states = model.encoder.streaming_forward(
@@ -977,27 +961,37 @@ def process_streaming_chunks(
                 states
             )
             
-            # Update states with new attention sink
-            if attention_sink_size > 0:
-                # Cache end of current chunk for attention sink (paper's approach)
-                states = [chunk, chunk_out[:, -attention_sink_size:]]
-            else:
-                states = new_states
+            # Update states for next iteration
+            states = new_states
             
-            # Save left context for next chunk
-            if left_context_chunks > 0:
-                left_context = chunk[:, -chunk_overlap:]
-            
-            # Remove overlap from previous chunk's output
+            # Handle overlap with previous chunk output
             if pos > 0:
-                chunk_out = chunk_out[:, chunk_overlap//model.encoder.downsample_factor:]
+                # Calculate overlap in output frames
+                overlap_frames = chunk_overlap // model.encoder.downsample_factor
+                
+                if chunk_out.size(1) > overlap_frames:
+                    # Remove overlap frames from the start
+                    chunk_out = chunk_out[:, overlap_frames:]
+                elif chunk_out.size(1) == 0:
+                    # Skip empty outputs
+                    logging.warning(f"Empty chunk output detected at position {pos}")
+                    continue
             
+            # Add this chunk's output
             seq_outputs.append(chunk_out)
-            pos = end_pos - chunk_overlap
+            
+            # Move position forward by effective chunk size (accounting for overlap)
+            pos = pos + effective_chunk_size
         
         # Concatenate all chunks for this sequence
-        seq_output = torch.cat(seq_outputs, dim=1)
-        chunk_outputs.append(seq_output)
+        if seq_outputs:
+            seq_output = torch.cat(seq_outputs, dim=1)
+            chunk_outputs.append(seq_output)
+        else:
+            # Handle empty sequence case
+            logging.warning(f"Empty sequence outputs for batch item {b}")
+            # Create a small dummy output with correct dimensions
+            chunk_outputs.append(torch.zeros((1, 1, model.encoder.output_dim), device=device))
     
     # Pad sequences to max length
     max_len = max(output.size(1) for output in chunk_outputs)
@@ -1467,7 +1461,7 @@ def train_one_epoch(
                                 )
                     
             # Run validation every 500 batches
-            if batch_idx > 0 and batch_idx % 500 == 0 and not params.print_diagnostics:
+            if batch_idx > 0 and batch_idx % 100 == 0 and not params.print_diagnostics:
                 logging.info("Computing validation loss and WER")
                 valid_info = compute_validation_loss(
                     params=params,

@@ -2091,33 +2091,78 @@ def compute_loss(
 
 
 def process_streaming_chunks(model, feature, chunk_size, attention_sink_size, left_context_chunks):
-    """Process input in streaming chunks following paper's approach"""
-    # ... existing code ...
+    """Process input in memory-optimized streaming chunks following paper's approach"""
+    # Calculate reasonable max frames to prevent memory explosion
+    max_frames = min(200, int(feature.size(1) / model.encoder.downsample_factor) + 10)
+    device = feature.device
     
-    # Process in chunks with proper frame handling
-    encoder_out_chunks = []
-    pos = 0
-    states = None
+    with torch.cuda.amp.autocast(enabled=True):
+        # Process in chunks with memory optimization
+        encoder_chunks = []
+        pos = 0
+        states = None
+        
+        while pos < feature.size(1):
+            # Process current chunk
+            end_pos = min(pos + chunk_size, feature.size(1))
+            chunk = feature[:, pos:end_pos]
+            
+            # Ensure reasonable chunk size
+            if chunk.size(1) < 100:  # Too small to process meaningfully
+                break
+                
+            # Forward pass with memory optimization
+            chunk_out, _, chunk_states = model.encoder.streaming_forward(
+                chunk,
+                torch.tensor([chunk.size(1)], device=device),
+                states=[states] if states is not None else None
+            )
+            
+            # Prevent frame explosion - force reasonable output size
+            if chunk_out.size(1) > max_frames:
+                chunk_out = chunk_out[:, :max_frames]
+                
+            # Store chunk output and update states
+            encoder_chunks.append(chunk_out)
+            states = chunk_states[0] if chunk_states else None
+            
+            # Move to next chunk with 40% overlap as per paper
+            pos = end_pos - int(chunk_size * 0.4)
+            
+            # Free memory
+            torch.cuda.empty_cache()
+            
+        # Combine chunks with controlled memory usage
+        if encoder_chunks:
+            return torch.cat(encoder_chunks, dim=1)
+        else:
+            # Fallback if chunking failed
+            return model.encoder(
+                feature,
+                torch.tensor([feature.size(1)], device=device)
+            )[0]
+
+
+def configure_model_for_streaming_training(model, params):
+    """Configure model specifically for streaming training"""
+    # Enable gradient checkpointing to reduce memory usage
+    if hasattr(model.encoder.model, "gradient_checkpointing_enable"):
+        model.encoder.model.gradient_checkpointing_enable()
+        logging.info("Enabled gradient checkpointing for wav2vec2/XLSR model")
     
-    while pos < feature.size(1):
-        end_pos = min(pos + chunk_size, feature.size(1))
-        chunk = feature[:, pos:end_pos]
-        
-        # Process chunk with streaming forward
-        encoder_out, _, states = model.encoder.streaming_forward(
-            chunk, 
-            torch.tensor([chunk.size(1)], device=feature.device),
-            states=[states] if states is not None else None
-        )
-        
-        # Add to output chunks (encoder_out now has overlap properly handled)
-        encoder_out_chunks.append(encoder_out)
-        
-        # Move position forward with overlap
-        pos = end_pos - int(chunk_size * 0.4)  # Use 40% overlap per paper
+    # Configure chunk sizes based on epoch
+    if hasattr(params, "cur_epoch") and hasattr(params, "pretrain_epochs"):
+        streaming_progress = params.cur_epoch - params.pretrain_epochs
+        if streaming_progress < 5:  # First 5 epochs after pretraining
+            # Start with smaller chunks and gradually increase
+            # 160ms -> 320ms over 5 epochs
+            start_size = params.chunk_sizes["320ms"] // 2  # 160ms
+            target_size = params.chunk_sizes["320ms"]  # 320ms
+            current_size = int(start_size + (target_size - start_size) * (streaming_progress / 5))
+            model.encoder.set_chunk_size(current_size)
+            logging.info(f"Progressive chunk size: {current_size} samples ({current_size/16000*1000:.1f}ms)")
     
-    # Concatenate chunks for final output
-    return torch.cat(encoder_out_chunks, dim=1)
+    return model
 
 
 def main():

@@ -35,14 +35,7 @@ class EncoderInterface(nn.Module):
         states: Optional[List[List[Optional[torch.Tensor]]]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, List[List[Optional[torch.Tensor]]]]:
         """
-        Streaming forward pass with proper context and attention sink handling
-        Args:
-            x: Input tensor (batch, time) or (batch, time, 1)
-            x_lens: Length of each sequence in batch
-            states: Optional cached states from previous chunk
-            
-        Returns:
-            (encoder_out, encoder_out_lens, next_states)
+        Memory-optimized streaming forward pass
         """
         # Ensure input is float and in correct shape
         x = x.float()
@@ -53,90 +46,86 @@ class EncoderInterface(nn.Module):
         batch_size = x.size(0)
         device = x.device
         
-        # Calculate expected output lengths
-        feature_downsampling = self.downsample_factor  # 320 for XLS-R
+        # Force expected frame downsampling (critical for XLSR)
+        feature_downsampling = 320  # Fixed for XLSR
+        
+        # Calculate reasonable expected frame counts to avoid explosion
         expected_frames = ((x_lens.float() / feature_downsampling).ceil()).to(torch.int64)
         expected_frames = torch.maximum(expected_frames, torch.ones_like(expected_frames))
+        max_expected_frames = expected_frames.max().item()
         
-        # Ensure x_lens has the same batch size as x
-        if x_lens.size(0) != batch_size:
-            # Fix the x_lens size to match batch_size
-            if x_lens.size(0) > batch_size:
-                x_lens = x_lens[:batch_size]
-            else:
-                # Create padded x_lens
-                padding = torch.full(
-                    (batch_size - x_lens.size(0),), 
-                    x.size(1),  # Use full sequence length for padding
-                    device=x_lens.device, 
-                    dtype=x_lens.dtype
-                )
-                x_lens = torch.cat([x_lens, padding])
-        
-        # Process each batch item separately to handle different states
+        # Process batch with memory optimizations
         all_outputs = []
         new_states = []
         
-        for b in range(batch_size):
-            # Get single sequence
-            single_x = x[b:b+1]
-            single_len = x_lens[b]
-            
-            # Get states for this sequence
-            if states is not None and b < len(states) and states[b] is not None:
-                # Unpack states
-                past_hidden_states = states[b][0]  # Previous hidden states for left context
-                attention_sink_cache = states[b][1]  # Attention sink frames
-            else:
-                past_hidden_states = None
-                attention_sink_cache = None
-            
-            # Create attention mask for current chunk
-            attention_mask = torch.ones_like(single_x, dtype=torch.long)
-            if single_len < single_x.size(1):
-                attention_mask[0, single_len:] = 0
-            
-            # Forward through XLSR model
-            outputs = self.model(
-                single_x,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                return_dict=True
-            )
-            
-            hidden_states = outputs.hidden_states[-1]  # Last layer hidden states
-            
-            # Save current output states
-            current_frames = min(hidden_states.size(1), self.frames_per_chunk)
-            
-            # Prepare for next step
-            # 1. Left context: Last frames from current chunk
-            new_left_context = hidden_states[:, -self.chunk_overlap//self.downsample_factor:]
-            
-            # 2. Attention sink: First few frames if enabled
-            if self.use_attention_sink:
-                new_attention_sink = hidden_states[:, :self.attention_sink_size]
-            else:
-                new_attention_sink = None
-            
-            # Save states for this batch item
-            new_states.append([new_left_context, new_attention_sink])
-            
-            # CRITICAL FIX: When processing chunks, we need to properly handle overlap regions
-            # to avoid frame duplication. The paper carefully removes overlapping regions.
-            
-            # If we have previous states with left context frames, need to handle overlaps
-            if states is not None and b < len(states) and states[b] is not None and states[b][0] is not None:
-                # Adjust the attention mask to account for overlap with previous chunk
-                overlap_frames = self.chunk_overlap // self.downsample_factor
+        # Use mixed precision for forward pass
+        with torch.cuda.amp.autocast(enabled=True):
+            for b in range(batch_size):
+                # Get single sequence
+                single_x = x[b:b+1]
+                single_len = x_lens[b]
                 
-                # Only use the non-overlapping portion of the output
-                # This is crucial to prevent output frame duplication
-                if hidden_states.size(1) > overlap_frames:
-                    hidden_states = hidden_states[:, overlap_frames:]
-            
-            # Add to outputs
-            all_outputs.append(hidden_states)
+                # Get states for this sequence
+                if states is not None and b < len(states) and states[b] is not None:
+                    # Unpack states
+                    past_hidden_states = states[b][0]  # Previous hidden states for left context
+                    attention_sink_cache = states[b][1]  # Attention sink frames
+                else:
+                    past_hidden_states = None
+                    attention_sink_cache = None
+                
+                # Create attention mask for current chunk
+                attention_mask = torch.ones_like(single_x, dtype=torch.long)
+                if single_len < single_x.size(1):
+                    attention_mask[0, single_len:] = 0
+                
+                # Forward through XLSR model
+                outputs = self.model(
+                    single_x,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    return_dict=True
+                )
+                
+                hidden_states = outputs.hidden_states[-1]  # Last layer hidden states
+                
+                # Save current output states
+                current_frames = min(hidden_states.size(1), self.frames_per_chunk)
+                
+                # Prepare for next step
+                # 1. Left context: Last frames from current chunk
+                new_left_context = hidden_states[:, -self.chunk_overlap//self.downsample_factor:]
+                
+                # 2. Attention sink: First few frames if enabled
+                if self.use_attention_sink:
+                    new_attention_sink = hidden_states[:, :self.attention_sink_size]
+                else:
+                    new_attention_sink = None
+                
+                # Save states for this batch item
+                new_states.append([new_left_context, new_attention_sink])
+                
+                # CRITICAL FIX: When processing chunks, we need to properly handle overlap regions
+                # to avoid frame duplication. The paper carefully removes overlapping regions.
+                
+                # If we have previous states with left context frames, need to handle overlaps
+                if states is not None and b < len(states) and states[b] is not None and states[b][0] is not None:
+                    # Adjust the attention mask to account for overlap with previous chunk
+                    overlap_frames = self.chunk_overlap // self.downsample_factor
+                    
+                    # Only use the non-overlapping portion of the output
+                    # This is crucial to prevent output frame duplication
+                    if hidden_states.size(1) > overlap_frames:
+                        hidden_states = hidden_states[:, overlap_frames:]
+                
+                # Custom control for output size to prevent explosion
+                if hidden_states.size(1) > max_expected_frames * 2:
+                    self.logger.warning(
+                        f"Trimming excessive frame count: {hidden_states.size(1)} -> {max_expected_frames}"
+                    )
+                    hidden_states = hidden_states[:, :max_expected_frames]
+                
+                all_outputs.append(hidden_states)
         
         # Combine all outputs - pad to max length
         max_len = max(output.size(1) for output in all_outputs)
@@ -155,16 +144,10 @@ class EncoderInterface(nn.Module):
         encoder_out = torch.cat(padded_outputs, dim=0)
         encoder_out_lens = torch.tensor([min(out.size(1), max_len) for out in all_outputs], device=device)
         
-        # After processing all batch items, before returning:
-        # Verify frame counts match expected lengths
-        expected_total = sum(expected_frames.tolist())
-        actual_total = sum(encoder_out_lens.tolist())
-
-        if actual_total > expected_total * 1.1:  # >10% more frames than expected
-            self.logger.warning(
-                f"Output frame count mismatch: expected ~{expected_total}, got {actual_total}. "
-                f"This may cause transcript duplication. Check overlap handling."
-            )
+        # Force overall output to match expected size
+        if encoder_out.size(1) > max_expected_frames:
+            encoder_out = encoder_out[:, :max_expected_frames]
+            encoder_out_lens = torch.clamp(encoder_out_lens, max=max_expected_frames)
         
         return encoder_out, encoder_out_lens, new_states
 

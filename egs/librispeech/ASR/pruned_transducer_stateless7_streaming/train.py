@@ -1800,6 +1800,15 @@ def evaluate_streaming(
                         # Add attention sink if available
                         if attention_sink is not None:
                             # Paper's approach: prepend attention sink
+                            if attention_sink.dim() != current_chunk.dim():
+                                if attention_sink.dim() == 3 and current_chunk.dim() == 2:
+                                    # Make current_chunk 3D to match attention_sink
+                                    current_chunk = current_chunk.unsqueeze(0)
+                                elif attention_sink.dim() == 2 and current_chunk.dim() == 3:
+                                    # Make attention_sink 3D to match current_chunk
+                                    attention_sink = attention_sink.unsqueeze(0)
+                            
+                            # Now concatenate with matching dimensions
                             current_chunk = torch.cat([attention_sink, current_chunk], dim=1)
                         
                         # Process chunk with appropriate precision

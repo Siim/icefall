@@ -58,6 +58,21 @@ class EncoderInterface(nn.Module):
         expected_frames = ((x_lens.float() / feature_downsampling).ceil()).to(torch.int64)
         expected_frames = torch.maximum(expected_frames, torch.ones_like(expected_frames))
         
+        # Ensure x_lens has the same batch size as x
+        if x_lens.size(0) != batch_size:
+            # Fix the x_lens size to match batch_size
+            if x_lens.size(0) > batch_size:
+                x_lens = x_lens[:batch_size]
+            else:
+                # Create padded x_lens
+                padding = torch.full(
+                    (batch_size - x_lens.size(0),), 
+                    x.size(1),  # Use full sequence length for padding
+                    device=x_lens.device, 
+                    dtype=x_lens.dtype
+                )
+                x_lens = torch.cat([x_lens, padding])
+        
         # Process each batch item separately to handle different states
         all_outputs = []
         new_states = []

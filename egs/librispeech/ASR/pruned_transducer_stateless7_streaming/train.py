@@ -891,37 +891,65 @@ def validate_one_sample(
         else:
             encoder_out = model.encoder_proj(encoder_out)
         
-        # Decode using greedy search instead of beam search for faster validation
-        try:
-            prediction_tokens = greedy_search_batch(
-                model=model,
-                encoder_out=encoder_out,
-                encoder_out_lens=encoder_out_lens
-            )[0]  # Take first (only) result
+        # Always use greedy search for validation during early training
+        if params.cur_epoch <= 2 or params.batch_idx_train < 500:
+            # Use greedy search for early training
+            logging.info("Using greedy search for early validation")
+            try:
+                prediction_tokens = greedy_search_batch(
+                    model=model,
+                    encoder_out=encoder_out,
+                    encoder_out_lens=encoder_out_lens
+                )[0]  # Take first (only) result
+            except Exception as e:
+                logging.error(f"Error during greedy validation: {str(e)}")
+                return reference, "GREEDY_DECODE_ERROR", 100.0
+        else:
+            # Use beam search with adjusted parameters for better stability
+            try:
+                logging.info("Using beam search for validation")
+                prediction_tokens = beam_search_batch(
+                    model=model,
+                    encoder_out=encoder_out,
+                    encoder_out_lens=encoder_out_lens,
+                    beam_size=4,
+                    blank_penalty=5.0,  # High penalty to prevent blank token dominance
+                )[0]  # Take first (only) result
+            except Exception as e:
+                logging.error(f"Beam search failed, falling back to greedy: {str(e)}")
+                prediction_tokens = greedy_search_batch(
+                    model=model,
+                    encoder_out=encoder_out,
+                    encoder_out_lens=encoder_out_lens
+                )[0]
             
-            # Convert tokens to text
-            if isinstance(prediction_tokens, torch.Tensor):
-                prediction_tokens = prediction_tokens.tolist()
-                
-            # Remove blank tokens from the end
-            while prediction_tokens and prediction_tokens[-1] == params.blank_id:
-                prediction_tokens.pop()
-                
-            # Convert to text
-            prediction = sp.decode(prediction_tokens)
+        # Convert tokens to text
+        if isinstance(prediction_tokens, torch.Tensor):
+            prediction_tokens = prediction_tokens.tolist()
             
-            # Calculate WER
-            ref_words = reference.split()
-            pred_words = prediction.split()
-            errors = editdistance.eval(ref_words, pred_words)
-            wer = 100.0 * errors / max(1, len(ref_words))
+        # Remove blank tokens from the end
+        while prediction_tokens and prediction_tokens[-1] == params.blank_id:
+            prediction_tokens.pop()
             
-            return reference, prediction, wer
+        # Limit prediction length to avoid extremely long outputs
+        max_length = 100
+        if len(prediction_tokens) > max_length:
+            logging.warning(f"Truncating long prediction from {len(prediction_tokens)} to {max_length} tokens")
+            prediction_tokens = prediction_tokens[:max_length]
             
-        except Exception as e:
-            logging.error(f"Error during validation decoding: {str(e)}")
-            logging.error("Exception details:", exc_info=True)
-            return reference, "DECODING_ERROR", 100.0
+        # Convert to text
+        prediction = sp.decode(prediction_tokens)
+        
+        # Calculate WER
+        ref_words = reference.split()
+        pred_words = prediction.split()
+        errors = editdistance.eval(ref_words, pred_words)
+        wer = 100.0 * errors / max(1, len(ref_words))
+        
+        # Log more detailed token information
+        logging.info(f"Number of tokens in prediction: {len(prediction_tokens)}")
+        
+        return reference, prediction, wer
 
 
 def compute_validation_loss(
@@ -1042,10 +1070,62 @@ def train_one_epoch(
         f"Epoch {params.cur_epoch}: {phase} phase, batch_size={curr_batch_size}"
     )
     
+    # Special debugging for the first epoch
+    if params.cur_epoch == 1 and params.batch_idx_train < 5:
+        # Set more verbose logging for first few batches
+        logging.getLogger().setLevel(logging.DEBUG)
+        
+        # Check model parameter norms to detect initialization issues
+        logging.info("Checking model parameter norms:")
+        encoder_norms = []
+        decoder_norms = []
+        joiner_norms = []
+        
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                param_norm = param.norm().item()
+                if 'encoder' in name:
+                    encoder_norms.append((name, param_norm))
+                elif 'decoder' in name:
+                    decoder_norms.append((name, param_norm))
+                elif 'joiner' in name:
+                    joiner_norms.append((name, param_norm))
+                    
+                # Log extreme values
+                if param_norm > 1000 or param_norm < 1e-6:
+                    logging.warning(f"Parameter {name} has extreme norm: {param_norm}")
+        
+        # Log summary stats
+        if encoder_norms:
+            enc_avg = sum(n for _, n in encoder_norms) / len(encoder_norms)
+            logging.info(f"Encoder average param norm: {enc_avg:.6f}")
+        if decoder_norms:
+            dec_avg = sum(n for _, n in decoder_norms) / len(decoder_norms)
+            logging.info(f"Decoder average param norm: {dec_avg:.6f}")
+        if joiner_norms:
+            join_avg = sum(n for _, n in joiner_norms) / len(joiner_norms)
+            logging.info(f"Joiner average param norm: {join_avg:.6f}")
+    
     for batch_idx, batch in enumerate(train_dl):
         try:
             params.batch_idx_train += 1
             optimizer.zero_grad()
+            
+            # Extra debugging for first few batches
+            if params.cur_epoch == 1 and batch_idx < 2:
+                logging.debug(f"Batch {batch_idx} input shape: {batch['inputs'].shape}")
+                text_samples = batch["supervisions"]["text"][:3]  # First 3 examples
+                logging.info(f"Sample texts: {text_samples}")
+                
+                # Check for any suspicious values in inputs
+                inputs = batch["inputs"]
+                if torch.isnan(inputs).any():
+                    logging.error("NaN values detected in batch inputs!")
+                if torch.isinf(inputs).any():
+                    logging.error("Inf values detected in batch inputs!")
+                    
+                # Log input stats
+                logging.debug(f"Input min: {inputs.min().item()}, max: {inputs.max().item()}, mean: {inputs.mean().item()}")
             
             # Use compute_loss_with_amp for proper fp16 handling
             loss, loss_info = compute_loss_with_amp(
@@ -1081,18 +1161,17 @@ def train_one_epoch(
                     f'memory used: {torch.cuda.max_memory_allocated() // 1024 // 1024}MB'
                 )
                 
+                # Reset to info level after early batches
+                if params.cur_epoch == 1 and params.batch_idx_train >= 5:
+                    logging.getLogger().setLevel(logging.INFO)
+                
                 if tb_writer is not None:
                     tb_writer.add_scalar('train/loss', loss, params.batch_idx_train)
+                    tb_writer.add_scalar('train/simple_loss', loss_info["simple_loss"], params.batch_idx_train)
+                    if "pruned_loss" in loss_info:
+                        tb_writer.add_scalar('train/pruned_loss', loss_info["pruned_loss"], params.batch_idx_train)
                     tb_writer.add_scalar('train/lr', current_lr, params.batch_idx_train)
                     tb_writer.add_scalar('train/batch_size', curr_batch_size, params.batch_idx_train)
-                    
-                    # Add streaming specific metrics
-                    if not is_pre_training:
-                        tb_writer.add_scalar(
-                            'train/chunk_size',
-                            loss_info["chunk_size"],
-                            params.batch_idx_train
-                        )
             
             # Run validation less frequently to save memory - validate every 100 batches
             # or only at specific batch indices during early training
@@ -1890,8 +1969,6 @@ def compute_loss(
         encoder_out = model.encoder_proj(encoder_out)
     
     # Compute transducer loss
-    # Important: We provide the encoder output directly to the model
-    # instead of the raw audio, as XLSR encoder has already processed it
     simple_loss, pruned_loss = model(
         x=encoder_out,  # Using encoder output instead of raw audio
         x_lens=encoder_out_lens,
@@ -1901,21 +1978,27 @@ def compute_loss(
         lm_scale=params.lm_scale,
     )
     
-    # Combine losses according to paper
+    # Combine losses according to paper, with adjustments for early training
     if is_pre_training:
-        # During pre-training, use only simple loss for better convergence
-        loss = simple_loss
+        # During early training, focus more on simple loss for better convergence
+        if params.batch_idx_train < 500:
+            # First 500 batches: focus entirely on simple loss
+            loss = simple_loss
+        else:
+            # Gradually transition to the balanced loss
+            loss = simple_loss
     else:
-        # During streaming, combine both losses with scaling
-        loss = params.simple_loss_scale * simple_loss + (1 - params.simple_loss_scale) * pruned_loss
+        # Use more balanced loss scale for streaming phase
+        simple_scale = params.simple_loss_scale
+        loss = simple_scale * simple_loss + (1 - simple_scale) * pruned_loss
     
     assert loss.requires_grad == is_training
     
     info = MetricsTracker()
     info["frames"] = feature.size(0)
     info["loss"] = loss.detach().cpu().item()
+    info["simple_loss"] = simple_loss.detach().cpu().item()
     if not is_pre_training:
-        info["simple_loss"] = simple_loss.detach().cpu().item()
         info["pruned_loss"] = pruned_loss.detach().cpu().item()
         if is_training and hasattr(params, "cur_epoch"):
             info["chunk_size"] = curr_chunk_size if not is_pre_training else 0

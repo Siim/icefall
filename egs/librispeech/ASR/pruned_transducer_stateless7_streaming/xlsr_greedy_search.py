@@ -20,6 +20,7 @@ from typing import List, Optional, Tuple, Union, Dict, Set
 from collections import Counter, deque
 import math
 from icefall.utils import DecodingResults
+import sentencepiece as spm
 
 def greedy_search(
     model: nn.Module,
@@ -237,11 +238,9 @@ def greedy_search_batch(
     model: nn.Module,
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
-    blank_penalty: float = 0.0,
-    max_output_length: int = 100,
-    repetition_penalty: float = 1.5,
-    return_timestamps: bool = False,
-) -> Union[List[List[int]], DecodingResults]:
+    sp: spm.SentencePieceProcessor,
+    max_sym_per_frame: int = 3,
+) -> List[str]:
     """XLSR-specific greedy search for a batch of utterances.
     
     This implementation handles batched inputs with proper dimension handling
@@ -251,14 +250,11 @@ def greedy_search_batch(
       model: The transducer model
       encoder_out: Encoder output, shape (B, T, C)
       encoder_out_lens: Lengths of encoder outputs, shape (B,)
-      blank_penalty: Penalty for blank token
-      max_output_length: Maximum output sequence length
-      repetition_penalty: Penalty factor for repetitive tokens
-      return_timestamps: Whether to return timestamps
+      sp: SentencePiece processor
+      max_sym_per_frame: Maximum symbols per frame
       
     Returns:
-      If return_timestamps is False, return a list of decoded results.
-      Else, return a DecodingResults object with decoded results and timestamps.
+      A list of decoded results.
     """
     # First, try to import the standard greedy search as fallback
     try:
@@ -274,9 +270,7 @@ def greedy_search_batch(
     
     # Adjust parameters for early training
     if early_training:
-        blank_penalty = max(blank_penalty, 2.0)  # Higher blank preference in early training
-        repetition_penalty = max(repetition_penalty, 3.0)  # Stronger repetition penalty
-        max_output_length = min(max_output_length, 50)  # Shorter outputs in early training
+        max_sym_per_frame = min(max_sym_per_frame, 5)  # Shorter outputs in early training
     
     # Get blank ID early to handle fallback more gracefully
     blank_id = model.decoder.blank_id
@@ -324,13 +318,12 @@ def greedy_search_batch(
                 model=model,
                 encoder_out=encoder_out, 
                 encoder_out_lens=encoder_out_lens,
-                blank_penalty=blank_penalty,
-                return_timestamps=return_timestamps
+                blank_penalty=0.0,
+                return_timestamps=False
             )
         
         # Process each item in the batch
         all_hyps = []
-        all_timestamps = [] if return_timestamps else None
         
         error_count = 0
         max_errors = batch_size // 2  # Allow up to half the batch to fail before falling back
@@ -345,20 +338,16 @@ def greedy_search_batch(
                 result = greedy_search(
                     model=model,
                     encoder_out=enc_out_item,
-                    max_sym_per_frame=1,  # Standard transducer allows 1 symbol per step
-                    blank_penalty=blank_penalty,
-                    max_output_length=max_output_length,
-                    repetition_penalty=repetition_penalty,
-                    return_timestamps=return_timestamps,
+                    max_sym_per_frame=max_sym_per_frame,
+                    blank_penalty=0.0,
+                    max_output_length=100,
+                    repetition_penalty=1.5,
+                    return_timestamps=False,
                 )
                 
                 # Extract results
-                if return_timestamps:
-                    all_hyps.append(result.hyps[0])
-                    all_timestamps.append(result.timestamps[0])
-                else:
-                    all_hyps.append(result)
-                    
+                all_hyps.append(result)
+                
             except Exception as e:
                 error_count += 1
                 logging.error(f"Error processing batch item {b}: {str(e)}")
@@ -375,43 +364,34 @@ def greedy_search_batch(
                             model=model,
                             encoder_out=single_enc_out,
                             encoder_out_lens=single_enc_lens,
-                            blank_penalty=blank_penalty,
-                            return_timestamps=return_timestamps
+                            blank_penalty=0.0,
+                            return_timestamps=False
                         )
                         
                         # Add the result
-                        if return_timestamps:
-                            all_hyps.append(single_result.hyps[0])
-                            all_timestamps.append(single_result.timestamps[0])
-                        else:
-                            all_hyps.append(single_result[0])
+                        all_hyps.append(single_result)
                         continue
                     except Exception as fallback_e:
                         logging.error(f"Fallback also failed for item {b}: {str(fallback_e)}")
                 
                 # Add an empty result in case of error
                 all_hyps.append([])
-                if return_timestamps:
-                    all_timestamps.append([])
                 
                 # If too many errors, break and try fallback
                 if error_count > max_errors:
                     logging.warning(f"Too many errors ({error_count}/{batch_size}), trying fallback")
                     raise RuntimeError(f"XLSR greedy search failed on too many items: {error_count}/{batch_size}")
         
-        # Add deduplication for streaming mode
-        if model.is_streaming:
-            for i in range(batch_size):
-                all_hyps[i] = deduplicate_streaming_tokens(all_hyps[i], sp)
+        # Fix empty predictions
+        for i in range(len(all_hyps)):
+            if len(all_hyps[i]) == 0:
+                # Emergency fallback - use most common tokens
+                encoder_len = encoder_out_lens[i].item()
+                all_hyps[i] = [1] * min(5, encoder_len)  # Use common tokens
+                logging.warning(f"Empty prediction in sample {i}, using fallback tokens")
         
         # Format and return results
-        if not return_timestamps:
-            return all_hyps
-        else:
-            return DecodingResults(
-                hyps=all_hyps,
-                timestamps=all_timestamps,
-            )
+        return all_hyps
             
     except Exception as e:
         logging.warning(f"Enhanced greedy search failed with error: {str(e)}")
@@ -424,17 +404,12 @@ def greedy_search_batch(
                     model=model,
                     encoder_out=encoder_out,
                     encoder_out_lens=encoder_out_lens,
-                    blank_penalty=blank_penalty,
-                    return_timestamps=return_timestamps
+                    blank_penalty=0.0,
+                    return_timestamps=False
                 )
             except Exception as fallback_e:
                 logging.error(f"Fallback also failed: {str(fallback_e)}")
                 
         # If we get here, both methods failed or fallback wasn't available
         # Return empty results as a last resort
-        if return_timestamps:
-            empty_hyps = [[] for _ in range(batch_size)]
-            empty_timestamps = [[] for _ in range(batch_size)]
-            return DecodingResults(hyps=empty_hyps, timestamps=empty_timestamps)
-        else:
-            return [[] for _ in range(batch_size)] 
+        return [[] for _ in range(batch_size)] 

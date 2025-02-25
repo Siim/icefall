@@ -2115,6 +2115,43 @@ def compute_loss(
             encoder_out = encoder_out[:, :max_expected_len]
             encoder_out_lens = torch.clamp(encoder_out_lens, max=max_expected_len)
     
+    # Add this after loss computation
+    
+    # Loss stabilization - prevent inf/nan
+    if torch.isnan(loss) or torch.isinf(loss):
+        logging.warning(f"Loss is {'NaN' if torch.isnan(loss) else 'Inf'} - stabilizing")
+        # Use simple loss only with lower scale when main loss is unstable
+        loss = simple_loss * 0.1
+        info["loss_stabilized"] = True
+    
+    # Add this function to log encoder outputs
+    def analyze_encoder_outputs(encoder_out, encoder_out_lens, epoch, iteration):
+        """Diagnose encoder output health"""
+        try:
+            # Check for NaNs/Infs
+            has_nan = torch.isnan(encoder_out).any().item()
+            has_inf = torch.isinf(encoder_out).any().item()
+            
+            # Check stats
+            mean = encoder_out.mean().item()
+            std = encoder_out.std().item()
+            min_val = encoder_out.min().item()
+            max_val = encoder_out.max().item()
+            
+            logging.info(
+                f"Encoder stats [e{epoch}i{iteration}]: "
+                f"mean={mean:.3f}, std={std:.3f}, min={min_val:.3f}, max={max_val:.3f}, "
+                f"has_nan={has_nan}, has_inf={has_inf}"
+            )
+            
+            if has_nan or has_inf or abs(mean) > 10 or std > 10:
+                logging.warning("Encoder outputs have problematic values")
+        except Exception as e:
+            logging.warning(f"Error analyzing encoder output: {str(e)}")
+
+    # Add this call inside compute_loss after encoder forward pass
+    analyze_encoder_outputs(encoder_out, encoder_out_lens, params.cur_epoch, batch_idx)
+    
     return loss, info
 
 

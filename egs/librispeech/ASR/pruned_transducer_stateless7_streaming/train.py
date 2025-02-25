@@ -217,7 +217,7 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--xlsr-model-name",
         type=str,
-        default="TalTechNLP/xls-r-300m-et",
+        default="anton-l/wav2vec2-large-xlsr-53-estonian",
         help="Name of the XLSR model to use from HuggingFace.",
     )
 

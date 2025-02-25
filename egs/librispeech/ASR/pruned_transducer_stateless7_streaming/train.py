@@ -879,6 +879,25 @@ def validate_one_sample(
                 model.module.encoder.reset_streaming_state()
             else:
                 model.encoder.reset_streaming_state()
+        
+        # Try CTC decoding first for comparison using the pretrained model
+        try:
+            from xlsr_ctc_decoder import PretrainedXLSRCTCDecoder
+            
+            logging.info("Trying CTC decoding with pretrained model for comparison")
+            ctc_decoder = PretrainedXLSRCTCDecoder(
+                model_name=params.xlsr_model_name,
+                blank_id=params.blank_id
+            ).to(device)
+            
+            # Decode directly from audio using the pretrained CTC model
+            ctc_predictions = ctc_decoder.decode_from_audio(feature)
+            ctc_prediction = ctc_predictions[0]  # First (only) result
+            
+            logging.info(f"CTC PREDICTION: {ctc_prediction}")
+        except Exception as e:
+            logging.error(f"Error during pretrained CTC decoding: {str(e)}")
+            ctc_prediction = "CTC_DECODE_ERROR"
                 
         # Process with encoder (non-streaming for validation simplicity)
         encoder_out, encoder_out_lens = model.encoder(
@@ -890,25 +909,6 @@ def validate_one_sample(
             encoder_out = model.module.encoder_proj(encoder_out)
         else:
             encoder_out = model.encoder_proj(encoder_out)
-        
-        # Try CTC decoding first for comparison
-        try:
-            from xlsr_ctc_decoder import XLSRCTCDecoder
-            
-            logging.info("Trying CTC decoding for comparison")
-            ctc_decoder = XLSRCTCDecoder(
-                encoder_dim=1024,  # XLSR output dimension 
-                vocab_size=params.vocab_size,
-                blank_id=params.blank_id
-            ).to(device)
-            
-            ctc_tokens, _ = ctc_decoder.decode(encoder_out, encoder_out_lens)
-            ctc_prediction = sp.decode(ctc_tokens[0])  # First (only) result
-            
-            logging.info(f"CTC PREDICTION: {ctc_prediction}")
-        except Exception as e:
-            logging.error(f"Error during CTC decoding: {str(e)}")
-            ctc_prediction = "CTC_DECODE_ERROR"
         
         # Always use greedy search for validation during early training
         if params.cur_epoch <= 2 or params.batch_idx_train < 500:

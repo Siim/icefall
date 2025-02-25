@@ -50,11 +50,11 @@ class XLSRBeamSearch:
         self,
         model: nn.Module,
         beam_size: int = 4,  # Paper's recommended beam width
-        blank_penalty: float = 5.0,  # Increased blank penalty to prevent repetitions
+        blank_penalty: float = 10.0,  # Even higher blank penalty to prevent repetitions
         temperature: float = 1.4,  # Higher temperature for more diversity
         return_timestamps: bool = False,
-        max_symb_per_frame: int = 3,  # Max symbols emitted per frame
-        max_output_length: int = 200,  # Maximum allowed output length
+        max_symb_per_frame: int = 2,  # Reduced to prevent excessive tokens per frame
+        max_output_length: int = 50,  # Shorter maximum output for early training
     ):
         """Initialize beam search.
         
@@ -85,6 +85,12 @@ class XLSRBeamSearch:
         # Set of detected patterns to avoid
         self.pattern_cache = set()
         
+        # Track number of tokens emitted per frame
+        self.tokens_per_frame = {}
+        
+        # Force early termination after specific number of repetitions
+        self.max_pattern_repetitions = 2
+        
     def _create_initial_hypothesis(self, device: torch.device) -> Hypothesis:
         """Create the initial hypothesis with blank token."""
         # Initial context with blank token
@@ -108,6 +114,51 @@ class XLSRBeamSearch:
             all_scores=[]
         )
     
+    def _check_for_repetitions(self, sequence: List[int]) -> bool:
+        """Check for repetitive patterns in sequence.
+        
+        Returns:
+            True if repetitions detected, False otherwise
+        """
+        # Not enough tokens to check for repetitions
+        if len(sequence) < 8:
+            return False
+        
+        # Check for exact token repetitions
+        seq = [t for t in sequence if t not in (-1, self.blank_id)]
+        if len(seq) < 6:
+            return False
+        
+        # Get just the actual tokens (no padding or blanks)
+        for n in [1, 2, 3, 4]:
+            # Need at least 3 repetitions to consider it a pattern
+            if len(seq) >= n * 3:
+                # Look for exact token repetitions
+                for i in range(len(seq) - 2*n):
+                    if seq[i:i+n] == seq[i+n:i+2*n] == seq[i+2*n:i+3*n]:
+                        return True
+                    
+                # Check recent 2/3 of sequence for repetitions
+                recent = seq[-int(len(seq)*0.67):]
+                if len(recent) >= n * 3:
+                    for i in range(len(recent) - 2*n):
+                        if recent[i:i+n] == recent[i+n:i+2*n]:
+                            return True
+        
+        # Check for token frequency anomalies
+        if len(seq) >= 10:
+            # Count frequency of each token
+            counter = {}
+            for token in seq:
+                counter[token] = counter.get(token, 0) + 1
+            
+            # If any token appears more than 40% of the time, it's suspicious
+            for token, count in counter.items():
+                if count > 0.4 * len(seq) and len(seq) > 10:
+                    return True
+        
+        return False
+    
     def _extend_hypothesis(
         self,
         hyp: Hypothesis,
@@ -126,31 +177,45 @@ class XLSRBeamSearch:
         Returns:
             List of extended hypotheses
         """
-        # Input validation for better debugging
+        # Initialize frame token counter if needed
+        if frame_idx not in self.tokens_per_frame:
+            self.tokens_per_frame[frame_idx] = 0
+            
+        # Check for token limit per frame
+        if self.tokens_per_frame[frame_idx] >= self.max_symb_per_frame:
+            # Return only a blank extension
+            try:
+                # Create blank hypothesis 
+                new_hyp = Hypothesis(
+                    sequence=hyp.sequence.copy(),
+                    score=hyp.score,
+                    decoder_out=hyp.decoder_out,
+                    timestamps=hyp.timestamps.copy() if hyp.timestamps is not None else [],
+                    all_scores=hyp.all_scores.copy() if hyp.all_scores is not None else []
+                )
+                return [new_hyp]
+            except Exception:
+                return [hyp]
+                
+        # Input validation 
         if encoder_frame is None:
             logging.error("encoder_frame is None in _extend_hypothesis")
             return [hyp]  # Return current hypothesis without extension
         
-        # Check for extremely long sequences - emergency stop to prevent runaway generation
+        # Check for very early in training - use only blank tokens for stability
         non_blank_tokens = [t for t in hyp.sequence if t not in (-1, self.blank_id)]
+        very_early_training = frame_idx < 5 and not non_blank_tokens
+        
+        # Early termination for extremely long sequences
         if len(non_blank_tokens) > self.max_output_length:
             logging.warning(f"Hypothesis exceeded max length ({self.max_output_length}), stopping generation")
             return [hyp]  # Return current hypothesis without extension
             
-        # Check for repetitive patterns in the sequence
-        if len(hyp.sequence) >= 12:  # Need enough context to detect patterns
-            # Look for repeating 2, 3, 4, or 6-grams
-            for n in [2, 3, 4, 6]:
-                if len(hyp.sequence) >= n * 3:  # Need at least 3 repetitions to detect
-                    # Get the last n tokens
-                    last_ngram = tuple(hyp.sequence[-n:])
-                    # Check if we have a repeating pattern
-                    if (hyp.sequence[-2*n:-n] == hyp.sequence[-n:] and 
-                        hyp.sequence[-3*n:-2*n] == hyp.sequence[-n:]):
-                        logging.warning(f"Detected {n}-gram repetition: {last_ngram}")
-                        # Emergency stop - severe repetition detected
-                        return [hyp]
-            
+        # Early termination for repetitive patterns
+        if self._check_for_repetitions(hyp.sequence):
+            logging.warning(f"Detected repetition pattern at frame {frame_idx}, stopping generation")
+            return [hyp]
+        
         if not isinstance(hyp.decoder_out, torch.Tensor):
             logging.error(f"Invalid decoder_out type: {type(hyp.decoder_out)}")
             try:
@@ -197,42 +262,43 @@ class XLSRBeamSearch:
             
             # Apply blank penalty and temperature adjustments
             if self.blank_penalty != 0:
-                logits[self.blank_id] -= self.blank_penalty
+                # No blank penalty for very early in training
+                if not very_early_training:
+                    logits[self.blank_id] -= self.blank_penalty
                 
-                # Add high penalty for repeated blank tokens
+                # Add extreme penalty for repeated blank tokens
                 if len(hyp.sequence) >= 3 and hyp.sequence[-1] == self.blank_id and hyp.sequence[-2] == self.blank_id:
-                    logits[self.blank_id] -= 20.0  # Higher penalty for repeated blanks
+                    logits[self.blank_id] -= 50.0  # Much higher penalty
             
             if self.temperature != 1.0:
                 logits = logits / self.temperature
                 
-            # Stronger penalties for repetitive patterns
+            # Even stronger penalties for repetitive patterns
             if len(hyp.sequence) >= 6:
                 # Check for simple repetition (same token repeated)
                 last_token = hyp.sequence[-1]
                 if last_token != self.blank_id and last_token == hyp.sequence[-3] and last_token == hyp.sequence[-5]:
-                    # Penalize this token heavily to break the loop
-                    logits[last_token] -= 30.0  # Increased penalty
+                    # Extreme penalty - effectively remove this token
+                    logits[last_token] = float('-inf')
                 
                 # Check for alternating pattern (A B A B A B...)
                 if (hyp.sequence[-1] == hyp.sequence[-3] and 
-                    hyp.sequence[-2] == hyp.sequence[-4] and
-                    hyp.sequence[-3] == hyp.sequence[-5]):
-                    # Penalize both tokens heavily
+                    hyp.sequence[-2] == hyp.sequence[-4]):
+                    # Extreme penalty for both tokens
                     token1 = hyp.sequence[-1]
                     token2 = hyp.sequence[-2]
                     if token1 != self.blank_id:
-                        logits[token1] -= 30.0  # Increased penalty
+                        logits[token1] = float('-inf')
                     if token2 != self.blank_id:
-                        logits[token2] -= 30.0  # Increased penalty
+                        logits[token2] = float('-inf')
                 
-                # Penalize 3-grams that repeat
+                # Check for 3-grams that repeat
                 if len(hyp.sequence) >= 9:
                     if (hyp.sequence[-3:] == hyp.sequence[-6:-3]):
-                        # Get the 3-gram tokens and penalize them
+                        # Block all tokens in the 3-gram
                         for token in set(hyp.sequence[-3:]):
                             if token != self.blank_id and token != -1:
-                                logits[token] -= 25.0
+                                logits[token] = float('-inf')
             
             # Apply softmax to convert to probabilities
             log_probs = torch.log_softmax(logits, dim=-1)
@@ -251,10 +317,28 @@ class XLSRBeamSearch:
             non_blank_count = 0
             max_non_blank = self.max_symb_per_frame
             
+            # For very early training, only allow blank tokens
+            if very_early_training:
+                # Only consider blank tokens
+                blank_log_prob = log_probs[self.blank_id].item()
+                new_hyp = Hypothesis(
+                    sequence=hyp.sequence.copy(),
+                    score=hyp.score + blank_log_prob,
+                    decoder_out=decoder_out,
+                    timestamps=hyp.timestamps.copy() if hyp.timestamps is not None else [],
+                    all_scores=hyp.all_scores.copy() if hyp.all_scores is not None else []
+                )
+                return [new_hyp]
+            
+            # For normal processing, consider all tokens
             for i in range(k):
                 token_id = top_k_indices[i].item()
                 token_log_prob = top_k_log_probs[i].item()
                 
+                # Skip tokens with very low probability 
+                if token_log_prob < -15.0 and token_id != self.blank_id:
+                    continue
+                    
                 # For blank tokens, always add to beam
                 if token_id == self.blank_id:
                     # Create a copy of the current sequence (should not change for blank)
@@ -284,6 +368,9 @@ class XLSRBeamSearch:
                     # Update counter
                     non_blank_count += 1
                     seen_non_blank = True
+                    
+                    # Update frame token counter
+                    self.tokens_per_frame[frame_idx] += 1
                     
                     # Create a copy of the current sequence
                     new_sequence = hyp.sequence.copy()
@@ -319,12 +406,17 @@ class XLSRBeamSearch:
                     new_hyps.append(new_hyp)
             
             # If all our candidates were blank tokens, force consider the best non-blank
-            if not seen_non_blank and len(new_hyps) > 0:
+            # But skip this for early frames to maintain stability
+            if not seen_non_blank and len(new_hyps) > 0 and frame_idx > 10:
                 # Find the highest scoring non-blank token
                 for i in range(k, min(log_probs.size(-1), k*2)):
                     token_id = log_probs.argsort(descending=True)[i].item()
                     if token_id != self.blank_id:
                         token_log_prob = log_probs[token_id].item()
+                        
+                        # Skip tokens with very low probability
+                        if token_log_prob < -10.0:
+                            continue
                         
                         # Create new hypothesis with this token
                         new_sequence = hyp.sequence.copy()
@@ -334,6 +426,9 @@ class XLSRBeamSearch:
                         new_sequence.append(token_id)
                         new_timestamps.append(frame_idx)
                         new_scores.append(token_log_prob)
+                        
+                        # Update frame token counter
+                        self.tokens_per_frame[frame_idx] += 1
                         
                         try:
                             context = new_sequence[-self.context_size:] if len(new_sequence) >= self.context_size else ([-1] * (self.context_size - len(new_sequence)) + new_sequence)
@@ -360,6 +455,81 @@ class XLSRBeamSearch:
             logging.error(f"Error in _extend_hypothesis: {str(e)}")
             logging.error("Exception details:", exc_info=True)
             return [hyp]  # Return current hypothesis if extension failed
+            
+    def _fallback_greedy_search(
+        self,
+        encoder_out: torch.Tensor,
+        encoder_out_lens: torch.Tensor,
+        device: torch.device
+    ) -> List[List[int]]:
+        """Fallback to simple greedy search if beam search fails."""
+        logging.warning("Falling back to simple greedy search due to beam search issues")
+        
+        batch_size = encoder_out.size(0)
+        results = []
+        
+        for b in range(batch_size):
+            # Get single sequence
+            seq_len = encoder_out_lens[b].item()
+            current_encoder_out = encoder_out[b, :seq_len]
+            
+            # Initialize with blank
+            hyp = self._create_initial_hypothesis(device)
+            
+            # Process frames
+            for t in range(seq_len):
+                # Get frame
+                current_frame = current_encoder_out[t:t+1]
+                
+                # Extend with greedy search (just take best token)
+                try:
+                    # Normalize dimensions
+                    if current_frame.ndim == 1:
+                        current_frame = current_frame.unsqueeze(0).unsqueeze(0)
+                        
+                    # Get decoder output
+                    decoder_out = hyp.decoder_out
+                    if decoder_out.ndim == 2:
+                        decoder_out = decoder_out.unsqueeze(1)
+                    
+                    # Get logits
+                    logits = self.model.joiner(
+                        current_frame,
+                        decoder_out,
+                        project_input=False
+                    ).squeeze(0).squeeze(0)
+                    
+                    # Apply blank bias to favor blanks in early training
+                    logits[self.blank_id] += 3.0
+                    
+                    # Get best token
+                    token_id = logits.argmax().item()
+                    
+                    # If non-blank, add to hypothesis
+                    if token_id != self.blank_id:
+                        # Add token to sequence
+                        hyp.sequence.append(token_id)
+                        
+                        # Update decoder output for next step
+                        context = hyp.sequence[-self.context_size:] if len(hyp.sequence) >= self.context_size else ([-1] * (self.context_size - len(hyp.sequence)) + hyp.sequence)
+                        decoder_input = torch.tensor([context], device=device, dtype=torch.int64)
+                        hyp.decoder_out = self.model.joiner.decoder_proj(
+                            self.model.decoder(decoder_input, need_pad=False)
+                        )
+                        
+                    # Early stopping if sequence is too long
+                    non_blanks = [t for t in hyp.sequence if t not in (-1, self.blank_id)]
+                    if len(non_blanks) > self.max_output_length:
+                        break
+                except Exception as e:
+                    logging.error(f"Error in greedy fallback: {str(e)}")
+                    break
+            
+            # Post-process result
+            seq = [token for token in hyp.sequence if token not in (-1, self.blank_id)]
+            results.append(seq)
+        
+        return results
     
     def _post_process_hyps(self, hyps: List[Hypothesis]) -> List[List[int]]:
         """Post-process hypotheses to return final token sequences."""
@@ -385,11 +555,19 @@ class XLSRBeamSearch:
         
         for hyp in hyps:
             # Strip initial context padding and blank tokens
-            seq = [token for token in hyp.sequence if token not in (-1, self.blank_id)]
+            non_blank_indices = [i for i, token in enumerate(hyp.sequence) 
+                               if token not in (-1, self.blank_id)]
             
-            # Get corresponding timestamps
-            ts = hyp.timestamps
+            # Get tokens and corresponding timestamps
+            seq = [hyp.sequence[i] for i in non_blank_indices]
+            ts = [hyp.timestamps[i] for i in range(len(hyp.timestamps)) 
+                 if i < len(non_blank_indices)]
             
+            # Limit sequence length
+            if len(seq) > 100:
+                seq = seq[:100]
+                ts = ts[:100] if ts else []
+                
             hyp_tokens.append(seq)
             timestamps.append(ts)
         
@@ -470,18 +648,31 @@ class XLSRBeamSearch:
         
         # Process each batch item separately
         for b in range(batch_size):
+            # Reset tokens per frame for this sequence
+            self.tokens_per_frame = {}
+            
             logging.debug(f"Processing batch item {b+1}/{batch_size}")
             current_len = encoder_out_lens[b].item()
             current_encoder_out = encoder_out[b, :current_len]
             
+            # Skip empty or invalid sequences
+            if current_len <= 0:
+                hypotheses.append(beam_list[b])
+                continue
+                
             # Initialize beam with single hypothesis
             current_beam = [beam_list[b]]
             
             # Set maximum consecutive non-token frames to prevent infinite loops
             consecutive_blanks = 0
-            max_consecutive_blanks = min(current_len // 4, 10)  # Limit based on sequence length
+            max_consecutive_blanks = min(current_len // 6, 8)  # More restrictive
+            
+            # Force early stopping if we see repeated patterns
+            pattern_repetitions = 0
+            had_repetition = False
             
             # Process each frame
+            failed = False
             for t in range(current_len):
                 # Get current encoder frame
                 current_frame = current_encoder_out[t:t+1]  # (1, encoder_dim)
@@ -491,6 +682,31 @@ class XLSRBeamSearch:
                 non_blank_extensions = False
                 
                 for hyp in current_beam:
+                    # Detect and skip stuck hypotheses
+                    if len(hyp.sequence) > 10:
+                        # Count blanks at end of sequence
+                        trailing_blanks = 0
+                        for i in range(len(hyp.sequence) - 1, -1, -1):
+                            if hyp.sequence[i] == self.blank_id:
+                                trailing_blanks += 1
+                            else:
+                                break
+                                
+                        # Skip hypotheses with too many trailing blanks
+                        if trailing_blanks > 5 and t > 10:
+                            continue
+                    
+                    # Check for repetitions
+                    if self._check_for_repetitions(hyp.sequence):
+                        had_repetition = True
+                        pattern_repetitions += 1
+                        if pattern_repetitions >= self.max_pattern_repetitions:
+                            # Switch to greedy search for this hypothesis
+                            logging.warning(f"Excessive repetitions detected at frame {t}, breaking beam search")
+                            failed = True
+                            break
+                        continue
+                    
                     # Extend the hypothesis
                     extended_hyps = self._extend_hypothesis(hyp, current_frame, t, device)
                     
@@ -504,8 +720,16 @@ class XLSRBeamSearch:
                     # Add all extensions to the new beam
                     new_beam.extend(extended_hyps)
                 
+                # Break if we failed
+                if failed:
+                    break
+                    
+                # If we didn't get any new hypotheses, try the next frame
+                if not new_beam:
+                    consecutive_blanks += 1
+                    new_beam = [current_beam[0]] if current_beam else [beam_list[b]]
                 # If we didn't get any non-blank extensions, increment counter
-                if not non_blank_extensions:
+                elif not non_blank_extensions:
                     consecutive_blanks += 1
                     
                 # Break early if stuck in a loop of blanks
@@ -515,40 +739,47 @@ class XLSRBeamSearch:
                 
                 # Keep only top beam_size hypotheses
                 if len(new_beam) > self.beam_size:
-                    # Two scoring methods:
-                    # 1. Raw score (sum of log probs)
-                    # 2. Normalized score (average log prob per token)
-                    
-                    # For early frames (first 25%), use raw score to encourage longer sequences
-                    if t < current_len * 0.25:
-                        sorted_beam = sorted(new_beam, key=lambda hyp: hyp.score, reverse=True)
-                    else:
-                        # For later frames, use length-normalized score
-                        sorted_beam = sorted(
-                            new_beam,
-                            key=lambda hyp: hyp.score / max(1, len([t for t in hyp.sequence if t != -1])),
-                            reverse=True
-                        )
+                    # Only use length-normalized score - more stable
+                    sorted_beam = sorted(
+                        new_beam,
+                        key=lambda hyp: hyp.score / max(1, sum(1 for t in hyp.sequence if t not in (-1, self.blank_id))),
+                        reverse=True
+                    )
                     
                     # Take top beam_size
                     current_beam = sorted_beam[:self.beam_size]
                 else:
                     current_beam = new_beam
                 
-                # Occasionally log progress
-                if t % max(1, current_len // 10) == 0:
-                    logging.debug(f"Batch {b+1}, Frame {t+1}/{current_len}, beam size: {len(current_beam)}")
+                # Log occasionally
+                if t % max(1, current_len // 5) == 0:
                     if current_beam:
                         top_hyp = current_beam[0]
-                        num_tokens = len([t for t in top_hyp.sequence if t not in (-1, self.blank_id)])
-                        logging.debug(f"Top hyp has {num_tokens} non-blank tokens, score: {top_hyp.score:.2f}")
+                        num_tokens = sum(1 for t in top_hyp.sequence if t not in (-1, self.blank_id))
+                        logging.debug(f"Frame {t+1}/{current_len}, tokens: {num_tokens}")
+            
+            # Fallback to greedy search if beam search failed
+            if failed or had_repetition and pattern_repetitions >= self.max_pattern_repetitions:
+                result = self._fallback_greedy_search(
+                    encoder_out[b:b+1], 
+                    encoder_out_lens[b:b+1],
+                    device
+                )
+                hypotheses.append(Hypothesis(
+                    sequence=[-1] * (self.context_size - 1) + [self.blank_id] + result[0],
+                    score=0.0,
+                    decoder_out=None,
+                    timestamps=[],
+                    all_scores=[]
+                ))
+                continue
             
             # Choose the best hypothesis for this batch item
             if current_beam:
                 # Use length-normalized score for final selection
                 best_hyp = max(
                     current_beam,
-                    key=lambda hyp: hyp.score / max(1, len([t for t in hyp.sequence if t != -1]))
+                    key=lambda hyp: hyp.score / max(1, sum(1 for t in hyp.sequence if t not in (-1, self.blank_id)))
                 )
                 hypotheses.append(best_hyp)
             else:
@@ -567,7 +798,7 @@ def beam_search_batch(
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
     beam_size: int = 4,  # Paper's recommended beam width
-    blank_penalty: float = 5.0,  # Increased blank penalty
+    blank_penalty: float = 10.0,  # Higher blank penalty for stability
     return_timestamps: bool = False,
 ) -> Union[List[List[int]], DecodingResults]:
     """Beam search in batch mode as described in the XLSR-Transducer paper.
@@ -591,7 +822,7 @@ def beam_search_batch(
         beam_size=beam_size,
         blank_penalty=blank_penalty,
         return_timestamps=return_timestamps,
-        max_output_length=100,  # Limit output length as a safety measure
+        max_output_length=50,  # More aggressive length limit for early training
     )
     
     return searcher.search_batch(encoder_out, encoder_out_lens) 

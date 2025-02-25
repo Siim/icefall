@@ -382,65 +382,56 @@ class EncoderInterface(nn.Module):
         # Return combined output
         return torch.cat(padded_outputs, dim=0)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        x_lens: torch.Tensor,
-        is_pre_training: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Non-streaming forward pass with option for pre-training mode
-        
-        Args:
-            x: Input tensor (batch, time) or (batch, time, 1)
-            x_lens: Length of each sequence in batch
-            is_pre_training: Whether we're in pre-training mode (no streaming/chunks)
-            
-        Returns:
-            (encoder_out, encoder_out_lens)
-        """
-        # Ensure input is float and in correct shape
+    def forward(self, x: torch.Tensor, x_lens: torch.Tensor, is_pre_training: bool = False):
+        """Memory-efficient forward pass for XLSR encoder"""
+        # Standard processing
         x = x.float()
         if x.ndim == 3:
             x = x.squeeze(-1)
         
-        batch_size = x.size(0)
+        # Calculate expected output length precisely
+        expected_frames = ((x_lens.float() / 320).ceil()).to(torch.int64)
+        max_expected_len = expected_frames.max().item()
         
-        # Create attention mask for padding
+        # Create attention mask
         attention_mask = torch.ones_like(x, dtype=torch.long)
-        for i in range(batch_size):
+        for i in range(x.size(0)):
             if i < x_lens.size(0) and x_lens[i] < x.size(1):
                 attention_mask[i, x_lens[i]:] = 0
         
-        # Calculate output lengths right away to ensure they're always defined
-        encoder_out_lens = ((x_lens.float() / self.downsample_factor).floor()).to(torch.int64)
-        encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
+        # Run XLSR with gradient checkpointing to save memory
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
+            # Enable gradient checkpointing during forward pass
+            self.model.gradient_checkpointing_enable()
+            
+            # Run model with appropriate mask
+            if is_pre_training:
+                outputs = self.model(
+                    x,
+                    attention_mask=attention_mask,
+                    output_hidden_states=False,
+                    return_dict=True
+                )
+            else:
+                streaming_mask = self.create_streaming_mask(
+                    x, attention_mask, self.decode_chunk_size, self.left_context_chunks
+                )
+                outputs = self.model(
+                    x,
+                    attention_mask=streaming_mask,
+                    output_hidden_states=False,
+                    return_dict=True
+                )
+                
+            # Get output and force specific length
+            hidden_states = outputs.last_hidden_state
+            
+            # Strictly enforce expected frame count to prevent memory explosion
+            if hidden_states.size(1) > max_expected_len:
+                hidden_states = hidden_states[:, :max_expected_len]
         
-        if is_pre_training:
-            # During pre-training, use full attention without chunking
-            outputs = self.model(
-                x,
-                attention_mask=attention_mask,
-                output_hidden_states=False,
-                return_dict=True
-            )
-            hidden_states = outputs.last_hidden_state
-        else:
-            # Use chunked attention with masks for streaming simulation during training
-            # This is crucial for streaming performance
-            
-            # Apply chunked attention mask
-            streaming_mask = self.create_streaming_mask(
-                x, attention_mask, self.decode_chunk_size, self.left_context_chunks
-            )
-            
-            # Forward with streaming mask
-            outputs = self.model(
-                x,
-                attention_mask=streaming_mask,
-                output_hidden_states=False,
-                return_dict=True
-            )
-            hidden_states = outputs.last_hidden_state
+        # Calculate exact output lengths
+        encoder_out_lens = torch.clamp(expected_frames, max=max_expected_len)
         
         return hidden_states, encoder_out_lens
 

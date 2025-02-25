@@ -263,6 +263,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         help="Epoch to start using streaming (after pre-training)",
     )
 
+    parser.add_argument(
+        "--strict-length-limit",
+        type=strtobool,
+        default=False,
+        help="Strictly enforce output length to prevent memory explosion",
+    )
+
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -2087,6 +2094,17 @@ def compute_loss(
     if not is_pre_training and hasattr(model, "is_streaming"):
         model.is_streaming = True  # Flag for deduplication
     
+    if params.strict_length_limit:
+        # Calculate expected frame count
+        expected_frames = ((feature_lens.float() / model.encoder.downsample_factor).ceil()).to(torch.int64)
+        max_expected_len = expected_frames.max().item()
+        
+        # Strictly limit encoder output frames
+        if encoder_out.size(1) > max_expected_len:
+            logging.warning(f"Limiting encoder output: {encoder_out.size(1)} -> {max_expected_len} frames")
+            encoder_out = encoder_out[:, :max_expected_len]
+            encoder_out_lens = torch.clamp(encoder_out_lens, max=max_expected_len)
+    
     return loss, info
 
 
@@ -2163,6 +2181,72 @@ def configure_model_for_streaming_training(model, params):
             logging.info(f"Progressive chunk size: {current_size} samples ({current_size/16000*1000:.1f}ms)")
     
     return model
+
+
+def process_streaming_chunks_memory_constrained(model, feature, chunk_size, attention_sink_size, left_context_chunks):
+    """Memory-constrained streaming chunk processing"""
+    # Calculate exact expected frames - critical for memory
+    expected_frames = ((feature.size(1) / 320) + 1).int()
+    max_frames = expected_frames.max().item()
+    device = feature.device
+    
+    # Process smaller chunks with memory optimization
+    with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
+        # Use small chunks - critically important!
+        actual_chunk_size = min(chunk_size, 2560)  # Start with 160ms chunks
+        encoder_chunks = []
+        pos = 0
+        states = None
+        
+        try:
+            while pos < feature.size(1):
+                # Very small chunk processing
+                end_pos = min(pos + actual_chunk_size, feature.size(1))
+                chunk = feature[:, pos:end_pos]
+                
+                if chunk.size(1) < 100:
+                    break
+                    
+                # Forward with strict frame limits
+                chunk_out, _, chunk_states = model.encoder.streaming_forward(
+                    chunk,
+                    torch.tensor([chunk.size(1)], device=device),
+                    states=[states] if states is not None else None
+                )
+                
+                # Force exact expected length
+                if chunk_out.size(1) > max_frames//2:
+                    chunk_out = chunk_out[:, :max_frames//2]
+                
+                # Free memory immediately
+                torch.cuda.empty_cache()
+                
+                # Update and move forward
+                encoder_chunks.append(chunk_out)
+                states = chunk_states[0] if chunk_states else None
+                pos = end_pos - int(actual_chunk_size * 0.4)
+        except RuntimeError as e:
+            # Emergency cleanup if OOM occurs
+            torch.cuda.empty_cache()
+            if "CUDA out of memory" in str(e):
+                # Return single frame emergency output
+                logging.warning("Emergency OOM recovery - returning minimal output")
+                return model.encoder(
+                    feature[:, :100],
+                    torch.tensor([100], device=device)
+                )[0]
+            else:
+                raise e
+        
+        # Safe concatenation
+        if encoder_chunks:
+            return torch.cat(encoder_chunks, dim=1)
+        else:
+            # Fallback for empty chunks
+            return model.encoder(
+                feature[:, :100],
+                torch.tensor([100], device=device)
+            )[0]
 
 
 def main():

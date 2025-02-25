@@ -368,7 +368,14 @@ class XLSREncoder(EncoderInterface):
         # Create attention mask
         attention_mask = torch.ones_like(x, dtype=torch.long)
         for i in range(batch_size):
-            attention_mask[i, x_lens[i]:] = 0
+            if i < x_lens.size(0):  # Make sure we don't go out of bounds
+                attention_mask[i, x_lens[i]:] = 0
+            else:
+                # Handle case where x_lens size doesn't match batch size
+                logging.warning(f"Mismatch between batch_size ({batch_size}) and x_lens.size(0) ({x_lens.size(0)})")
+                # Use the first length if we can't access the correct one
+                if x_lens.size(0) > 0:
+                    attention_mask[i, x_lens[0]:] = 0
         
         if is_pre_training:
             # During pre-training, use full sequence without chunking

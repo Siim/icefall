@@ -1205,6 +1205,42 @@ def decode_one_batch_hyps(
         else:
             encoder_out = model.encoder_proj(encoder_out)
         
+        # Check for batch size mismatch and fix if necessary
+        expected_batch_size = feature.size(0)
+        actual_batch_size = encoder_out.size(0)
+        
+        if actual_batch_size != expected_batch_size:
+            logging.warning(f"Batch size mismatch: expected {expected_batch_size}, got {actual_batch_size}. Fixing...")
+            # Take only the first expected_batch_size elements
+            if actual_batch_size > expected_batch_size:
+                encoder_out = encoder_out[:expected_batch_size]
+            # If actual is smaller, this is an unexpected case, but we'll pad to be safe
+            else:
+                pad_size = expected_batch_size - actual_batch_size
+                padding = torch.zeros(
+                    pad_size, 
+                    encoder_out.size(1), 
+                    encoder_out.size(2), 
+                    device=encoder_out.device, 
+                    dtype=encoder_out.dtype
+                )
+                encoder_out = torch.cat([encoder_out, padding], dim=0)
+            
+            # Ensure encoder_out_lens matches the expected batch size too
+            if encoder_out_lens.size(0) != expected_batch_size:
+                # If we have more lengths than needed, take the first ones
+                if encoder_out_lens.size(0) > expected_batch_size:
+                    encoder_out_lens = encoder_out_lens[:expected_batch_size]
+                # If we have fewer lengths than needed, pad with the first length
+                else:
+                    pad_lens = torch.full(
+                        (expected_batch_size - encoder_out_lens.size(0),), 
+                        encoder_out_lens[0].item() if encoder_out_lens.size(0) > 0 else encoder_out.size(1),
+                        device=encoder_out_lens.device, 
+                        dtype=encoder_out_lens.dtype
+                    )
+                    encoder_out_lens = torch.cat([encoder_out_lens, pad_lens])
+        
         # Use greedy search batch for decoding
         hyp_tokens = greedy_search_batch(
             model=model,

@@ -459,6 +459,13 @@ def get_parser():
     )
 
     parser.add_argument(
+        "--use-bf16",
+        type=str2bool,
+        default=False,
+        help="Whether to use bfloat16 precision training (requires GPU with BF16 support).",
+    )
+
+    parser.add_argument(
         "--dataset",
         type=str,
         default="librispeech",
@@ -628,6 +635,9 @@ def get_params() -> AttributeDict:
             "subsampling_factor": 4,
             "warm_step": 2000,
             "env_info": get_env_info(),
+            
+            # Add BF16 related params
+            "use_bf16": False,  # Default to False, will be updated from args
         }
     )
 
@@ -1157,7 +1167,7 @@ def train_one_epoch(
                 # Log input stats
                 logging.debug(f"Input min: {inputs.min().item()}, max: {inputs.max().item()}, mean: {inputs.mean().item()}")
             
-            # Use compute_loss_with_amp for proper fp16 handling
+            # Use compute_loss_with_amp for proper precision handling
             loss, loss_info = compute_loss_with_amp(
                 params=params,
                 model=model,
@@ -1168,13 +1178,18 @@ def train_one_epoch(
                 scaler=scaler
             )
             
-            # Handle FP16 training with scaler
+            # Handle mixed precision training
             if params.use_fp16 and scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 clip_grad_norm_(model.parameters(), 5.0, 2.0)
                 scaler.step(optimizer)
                 scaler.update()
+            elif params.use_bf16:
+                # BF16 doesn't need a scaler, just use autocast context
+                loss.backward()
+                clip_grad_norm_(model.parameters(), 5.0, 2.0)
+                optimizer.step()
             else:
                 loss.backward()
                 clip_grad_norm_(model.parameters(), 5.0, 2.0)
@@ -1480,9 +1495,18 @@ def run(rank, world_size, args):
             params=params,
         )
 
-    # Update to use new GradScaler API
-    scaler = torch.amp.GradScaler('cuda', enabled=params.use_fp16, init_scale=1.0) if params.use_fp16 else None
-    if checkpoints and "grad_scaler" in checkpoints:
+    # Update to use new GradScaler API with proper precision type
+    precision_type = 'bf16' if params.use_bf16 else ('fp16' if params.use_fp16 else None)
+    if precision_type == 'fp16':
+        scaler = torch.amp.GradScaler(
+            'cuda',
+            enabled=True,
+            init_scale=1.0
+        )
+    else:
+        scaler = None
+        
+    if checkpoints and "grad_scaler" in checkpoints and scaler is not None:
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
 
@@ -1582,15 +1606,30 @@ def scan_pessimistic_batches_for_oom(
     for criterion, cuts in batches.items():
         batch = train_dl.dataset[cuts]
         try:
-            with torch.amp.autocast(enabled=params.use_fp16):
-                loss, _ = compute_loss(
-                    params=params,
-                    model=model,
-                    sp=sp,
-                    batch=batch,
-                    is_training=True,
-                    is_pre_training=False
-                )
+            # Set up mixed precision context
+            precision_type = 'bf16' if params.use_bf16 else ('fp16' if params.use_fp16 else None)
+            if precision_type == 'bf16':
+                # BF16 autocast
+                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
+                    loss, _ = compute_loss(
+                        params=params,
+                        model=model,
+                        sp=sp,
+                        batch=batch,
+                        is_training=True,
+                        is_pre_training=False
+                    )
+            else:
+                # FP16 or no autocast
+                with torch.amp.autocast(device_type='cuda', enabled=params.use_fp16):
+                    loss, _ = compute_loss(
+                        params=params,
+                        model=model,
+                        sp=sp,
+                        batch=batch,
+                        is_training=True,
+                        is_pre_training=False
+                    )
             loss.backward()
             optimizer.zero_grad()
         except Exception as e:
@@ -1688,26 +1727,8 @@ def evaluate_streaming(
     chunk_size: int,
     sp: spm.SentencePieceProcessor,
 ) -> Dict[str, float]:
-    """Evaluate model with streaming inference using the paper's approach.
-    
-    Args:
-        params: Model parameters
-        model: The transducer model
-        valid_dl: Validation dataloader
-        chunk_size: Chunk size for streaming in samples (e.g., 5120 for 320ms at 16kHz)
-        sp: SentencePieceProcessor 
-        
-    Returns:
-        Dictionary of evaluation metrics
-    """
+    """Evaluate model with streaming inference using the paper's approach."""
     model.eval()
-    
-    # Make sure model is in eval mode
-    if isinstance(model, DDP):
-        model.module.eval()
-    else:
-        model.eval()
-    
     total_words = 0
     total_errors = 0
     total_samples = 0
@@ -1758,7 +1779,6 @@ def evaluate_streaming(
                     
                     # Initialize variables for attention sink
                     attention_sink = None
-                    device = feature.device
                     
                     # Process audio in chunks
                     while pos < feature.size(1):
@@ -1770,18 +1790,27 @@ def evaluate_streaming(
                             # Paper's approach: prepend attention sink
                             current_chunk = torch.cat([attention_sink, current_chunk], dim=1)
                         
-                        # Process chunk
-                        with torch.amp.autocast(enabled=params.use_fp16):
-                            # Get encoder output for this chunk
-                            chunk_out, chunk_lens, states = model.encoder.streaming_forward(
-                                current_chunk,
-                                torch.tensor([current_chunk.size(1)], device=device),
-                                states
-                            )
-                            
-                            # Update attention sink from end of current output
-                            if attention_sink_size > 0:
-                                attention_sink = chunk_out[:, -attention_sink_size:]
+                        # Process chunk with appropriate precision
+                        if params.use_bf16:
+                            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
+                                # Get encoder output for this chunk
+                                chunk_out, chunk_lens, states = model.encoder.streaming_forward(
+                                    current_chunk,
+                                    torch.tensor([current_chunk.size(1)], device=device),
+                                    states
+                                )
+                        else:
+                            with torch.amp.autocast(device_type='cuda', enabled=params.use_fp16):
+                                # Get encoder output for this chunk
+                                chunk_out, chunk_lens, states = model.encoder.streaming_forward(
+                                    current_chunk,
+                                    torch.tensor([current_chunk.size(1)], device=device),
+                                    states
+                                )
+                        
+                        # Update attention sink from end of current output
+                        if attention_sink_size > 0:
+                            attention_sink = chunk_out[:, -attention_sink_size:]
                         
                         # Store output
                         if pos > 0:
@@ -1896,128 +1925,33 @@ def compute_loss_with_amp(
     Returns:
         Same as compute_loss
     """
-    with torch.amp.autocast('cuda', enabled=params.use_fp16):
-        loss, info = compute_loss(
-            params=params,
-            model=model,
-            sp=sp,
-            batch=batch,
-            is_training=is_training,
-            is_pre_training=is_pre_training,
-            chunk_size=chunk_size
-        )
+    # Use appropriate precision based on parameters
+    if params.use_bf16:
+        # Use BF16 precision
+        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
+            loss, info = compute_loss(
+                params=params,
+                model=model,
+                sp=sp,
+                batch=batch,
+                is_training=is_training,
+                is_pre_training=is_pre_training,
+                chunk_size=chunk_size
+            )
+    else:
+        # Use FP16 or full precision
+        with torch.amp.autocast(device_type='cuda', enabled=params.use_fp16):
+            loss, info = compute_loss(
+                params=params,
+                model=model,
+                sp=sp,
+                batch=batch,
+                is_training=is_training,
+                is_pre_training=is_pre_training,
+                chunk_size=chunk_size
+            )
     
     # Return the unscaled loss - scaler.scale will be applied in training loop if needed
-    return loss, info
-
-
-def compute_loss(
-    params: AttributeDict,
-    model: nn.Module,
-    sp: spm.SentencePieceProcessor,
-    batch: dict,
-    is_training: bool,
-    is_pre_training: bool = True,
-    chunk_size: Optional[int] = None,
-) -> Tuple[torch.Tensor, MetricsTracker]:
-    """Compute loss following paper's approach with progressive chunk sizes.
-    
-    Args:
-        params: Model parameters
-        model: The model to train
-        sp: Sentence piece processor
-        batch: A batch of data
-        is_training: Whether this is a training batch
-        is_pre_training: Whether this is pre-training phase
-        chunk_size: Optional override for chunk size
-    
-    Returns:
-        (loss, MetricsTracker) containing loss and statistics
-    """
-    device = next(model.parameters()).device
-    feature = batch["inputs"].to(device)
-    feature_lens = batch["supervisions"]["num_frames"].to(device)
-    
-    # Get supervisions
-    supervisions = batch["supervisions"]
-    texts = supervisions["text"]
-    y = sp.encode(texts, out_type=int)
-    y = k2.RaggedTensor(y).to(device)
-    
-    if is_pre_training:
-        # Pre-training phase: full sequence processing without chunking
-        encoder_out, encoder_out_lens = model.encoder(
-            x=feature,
-            x_lens=feature_lens,
-            is_pre_training=True
-        )
-    else:
-        # Determine chunk size based on training phase
-        if chunk_size is None:
-            if params.cur_epoch <= params.pretrain_epochs + 5:  # 5 epochs transition
-                # Progressive chunk size selection
-                progress = (params.cur_epoch - params.pretrain_epochs) / 5
-                curr_chunk_size = int(
-                    params.chunk_sizes["2560ms"] * (1 - progress) + 
-                    params.chunk_sizes["320ms"] * progress
-                )
-            else:
-                # Use optimal chunk size from paper
-                curr_chunk_size = params.chunk_sizes["320ms"]
-        else:
-            curr_chunk_size = chunk_size
-            
-        # Process in chunks with attention sink
-        encoder_out = process_streaming_chunks(
-            model=model,
-            feature=feature,
-            chunk_size=curr_chunk_size,
-            attention_sink_size=params.attention_sink_size,
-            left_context_chunks=params.left_context_chunks
-        )
-        # Calculate encoder output lengths based on chunk processing
-        encoder_out_lens = ((feature_lens.float() / model.encoder.downsample_factor).floor()).to(torch.int64)
-        encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
-    
-    # Project encoder output if using XLSR
-    if hasattr(model, 'encoder_proj'):
-        encoder_out = model.encoder_proj(encoder_out)
-    
-    # Compute transducer loss
-    simple_loss, pruned_loss = model(
-        x=encoder_out,  # Using encoder output instead of raw audio
-        x_lens=encoder_out_lens,
-        y=y,
-        prune_range=params.prune_range,
-        am_scale=params.am_scale,
-        lm_scale=params.lm_scale,
-    )
-    
-    # Combine losses according to paper, with adjustments for early training
-    if is_pre_training:
-        # During early training, focus more on simple loss for better convergence
-        if params.batch_idx_train < 500:
-            # First 500 batches: focus entirely on simple loss
-            loss = simple_loss
-        else:
-            # Gradually transition to the balanced loss
-            loss = simple_loss
-    else:
-        # Use more balanced loss scale for streaming phase
-        simple_scale = params.simple_loss_scale
-        loss = simple_scale * simple_loss + (1 - simple_scale) * pruned_loss
-    
-    assert loss.requires_grad == is_training
-    
-    info = MetricsTracker()
-    info["frames"] = feature.size(0)
-    info["loss"] = loss.detach().cpu().item()
-    info["simple_loss"] = simple_loss.detach().cpu().item()
-    if not is_pre_training:
-        info["pruned_loss"] = pruned_loss.detach().cpu().item()
-        if is_training and hasattr(params, "cur_epoch"):
-            info["chunk_size"] = curr_chunk_size if not is_pre_training else 0
-    
     return loss, info
 
 

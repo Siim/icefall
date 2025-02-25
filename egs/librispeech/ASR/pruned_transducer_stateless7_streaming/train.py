@@ -92,6 +92,7 @@ from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
 from beam_search import greedy_search_batch  # Original greedy search
 from xlsr_beam_search import beam_search_batch  # Import our new beam search implementation
 from xlsr_greedy_search import greedy_search_batch as xlsr_greedy_search_batch  # Import our enhanced greedy search
+from distutils.util import strtobool  # Add this import
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -265,7 +266,7 @@ def add_model_arguments(parser: argparse.ArgumentParser):
 
     parser.add_argument(
         "--strict-length-limit",
-        type=strtobool,
+        type=str2bool,  # Change from strtobool to str2bool
         default=False,
         help="Strictly enforce output length to prevent memory explosion",
     )

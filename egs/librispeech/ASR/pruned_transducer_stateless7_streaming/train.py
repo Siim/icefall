@@ -1784,6 +1784,39 @@ def evaluate_streaming(
     return metrics
 
 
+def compute_loss_with_amp(
+    params: AttributeDict,
+    model: nn.Module,
+    sp: spm.SentencePieceProcessor,
+    batch: dict,
+    is_training: bool,
+    is_pre_training: bool = True,
+    scaler: Optional[torch.amp.GradScaler] = None,
+    chunk_size: Optional[int] = None,
+) -> Tuple[torch.Tensor, MetricsTracker]:
+    """Compute loss with automatic mixed precision.
+    
+    Args:
+        Same as compute_loss with additional scaler parameter
+        
+    Returns:
+        Same as compute_loss
+    """
+    with torch.cuda.amp.autocast(enabled=params.use_fp16):
+        loss, info = compute_loss(
+            params=params,
+            model=model,
+            sp=sp,
+            batch=batch,
+            is_training=is_training,
+            is_pre_training=is_pre_training,
+            chunk_size=chunk_size
+        )
+    
+    # Return the unscaled loss - scaler.scale will be applied in training loop if needed
+    return loss, info
+
+
 def main():
     parser = get_parser()
     LibriSpeechAsrDataModule.add_arguments(parser)

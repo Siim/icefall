@@ -46,6 +46,22 @@ class EncoderInterface(nn.Module):
         batch_size = x.size(0)
         device = x.device
         
+        # CRITICAL FIX: Ensure x_lens has correct batch dimension
+        if x_lens.size(0) != batch_size:
+            # Fix x_lens to match batch size by padding or truncating
+            if x_lens.size(0) > batch_size:
+                # Truncate
+                x_lens = x_lens[:batch_size]
+            else:
+                # Pad with full lengths
+                padding = torch.full(
+                    (batch_size - x_lens.size(0),),
+                    x.size(1),  # Use the full sequence length
+                    device=device,
+                    dtype=x_lens.dtype
+                )
+                x_lens = torch.cat([x_lens, padding])
+        
         # Force expected frame downsampling (critical for XLSR)
         feature_downsampling = 320  # Fixed for XLSR
         

@@ -272,6 +272,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         help="Strictly enforce output length to prevent memory explosion",
     )
 
+    parser.add_argument(
+        "--freeze-encoder-layers",
+        type=int,
+        default=0,
+        help="Number of encoder layers to freeze (0 = no freezing)",
+    )
+
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -1531,6 +1538,14 @@ def run(rank, world_size, args):
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
 
+    if params.freeze_encoder_layers > 0 and params.use_xlsr:
+        logging.info(f"Freezing first {params.freeze_encoder_layers} XLSR encoder layers")
+        for i, layer in enumerate(model.encoder.model.encoder.layers):
+            if i < params.freeze_encoder_layers:
+                for param in layer.parameters():
+                    param.requires_grad = False
+        logging.info("Encoder layers frozen successfully")
+
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         scheduler.step_epoch(epoch - 1)
         fix_random_seed(params.seed + epoch - 1)
@@ -1867,23 +1882,28 @@ def evaluate_streaming(
                         encoder_out = model.encoder_proj(encoder_out)
                     
                     # Use XLSR-specific greedy search for decoding as it's more robust
-                    hyp_tokens = xlsr_greedy_search_batch(
-                        model=model,
-                        encoder_out=encoder_out,
-                        encoder_out_lens=encoder_out_lens,
-                        blank_penalty=2.0,  # Stronger blank penalty to prevent blank token dominance
-                        repetition_penalty=1.5  # Moderate repetition penalty
-                    )[0]
+                    try:
+                        # Update greedy search call to match API
+                        hyps = xlsr_greedy_search_batch(
+                            model=model,
+                            encoder_out=encoder_out,
+                            encoder_out_lens=encoder_out_lens,
+                            sp=sp,
+                            max_sym_per_frame=3,  # Remove blank_penalty parameter
+                        )
+                    except Exception as e:
+                        logging.error(f"Error during enhanced greedy validation: {str(e)}")
+                        hyps = ["GREEDY_DECODE_ERROR"]
                     
                     # Convert to text
-                    if isinstance(hyp_tokens, torch.Tensor):
-                        hyp_tokens = hyp_tokens.tolist()
+                    if isinstance(hyps, torch.Tensor):
+                        hyps = hyps.tolist()
                     
                     # Remove blank tokens
-                    while hyp_tokens and hyp_tokens[-1] == params.blank_id:
-                        hyp_tokens.pop()
+                    while hyps and hyps[-1] == params.blank_id:
+                        hyps.pop()
                     
-                    prediction = sp.decode(hyp_tokens)
+                    prediction = sp.decode(hyps)
                     
                     # Calculate WER
                     ref_words = reference.split()

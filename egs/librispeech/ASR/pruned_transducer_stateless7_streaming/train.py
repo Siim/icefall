@@ -839,366 +839,51 @@ def save_checkpoint(
         copyfile(src=filename, dst=best_valid_filename)
 
 
-def evaluate_streaming(
-    params: AttributeDict,
-    model: nn.Module,
-    valid_dl: torch.utils.data.DataLoader,
-    chunk_size: int,
-    sp: spm.SentencePieceProcessor,
-) -> Dict[str, float]:
-    """Evaluate model with streaming inference using greedy search.
-    Note: We use greedy search for quick validation during training.
-    For actual model evaluation, use beam search with width=4 as per paper.
-    """
-    model.eval()
-    total_words = 0
-    total_errors = 0
-    total_latency = 0.0
-    
-    for batch_idx, batch in enumerate(valid_dl):
-        try:
-            with torch.no_grad():
-                feature = batch["inputs"].to(next(model.parameters()).device)
-                feature_lens = batch["supervisions"]["num_frames"].to(feature.device)
-                texts = batch["supervisions"]["text"]
-                
-                # Process in chunks
-                encoder_out = process_streaming_chunks(
-                    model=model,
-                    feature=feature,
-                    chunk_size=chunk_size,
-                    attention_sink_size=params.attention_sink_size,
-                    left_context_chunks=params.left_context_chunks
-                )
-                
-                # Quick validation with greedy search
-                hyp_tokens = greedy_search_batch(
-                    model=model,
-                    encoder_out=encoder_out,
-                    encoder_out_lens=feature_lens
-                )
-                
-                # Convert predictions to text
-                hyps = []
-                for tokens in hyp_tokens:
-                    if isinstance(tokens, torch.Tensor):
-                        tokens = tokens.tolist()
-                    hyps.append(sp.decode(tokens))
-                
-                # Calculate WER
-                for hyp, ref in zip(hyps, texts):
-                    hyp_words = hyp.split()
-                    ref_words = ref.split()
-                    total_words += len(ref_words)
-                    total_errors += editdistance.eval(hyp_words, ref_words)
-                
-                # Calculate latency
-                total_latency += feature.size(1) / 16000  # Convert samples to seconds
-                
-        except Exception as e:
-            logging.error(f"Error processing batch {batch_idx}: {str(e)}")
-            continue
-            
-        if batch_idx % 10 == 0:
-            wer = 100.0 * total_errors / max(1, total_words)
-            logging.info(f"Batch {batch_idx}, current WER: {wer:.2f}%")
-    
-    # Calculate final metrics
-    wer = 100.0 * total_errors / max(1, total_words)
-    avg_latency = total_latency / len(valid_dl)
-    
-    metrics = {
-        "wer": wer,
-        "latency": avg_latency,
-        "chunk_size_ms": chunk_size / 16,  # Convert samples to ms
-    }
-    
-    return metrics
-
-
-def process_streaming_chunks(
-    model: nn.Module,
-    feature: torch.Tensor,
-    chunk_size: int,
-    attention_sink_size: int,
-    left_context_chunks: int
-) -> torch.Tensor:
-    """Process input features in streaming mode with chunks following paper's approach.
-    
-    Args:
-        model: The model to use
-        feature: Input features (batch, time)
-        chunk_size: Size of each chunk in samples (e.g., 5120 for 320ms)
-        attention_sink_size: Number of frames for attention sink (16 as per paper)
-        left_context_chunks: Number of left context chunks (1 as per paper)
-    
-    Returns:
-        Encoder output tensor
-    """
-    device = feature.device
-    batch_size = feature.size(0)
-    
-    # Initialize states
-    states = None
-    chunk_outputs = []
-    
-    # Calculate chunk parameters
-    chunk_overlap = chunk_size // 2  # Half overlap as per paper
-    effective_chunk_size = chunk_size - chunk_overlap
-    
-    # Calculate attention sink size in samples
-    sink_size = attention_sink_size * model.encoder.downsample_factor
-    
-    # Process each sequence in batch
-    for b in range(batch_size):
-        seq = feature[b:b+1]  # Keep batch dimension
-        pos = 0
-        seq_outputs = []
-        left_context = None
-        
-        while pos < seq.size(1):
-            # Get current chunk boundaries
-            end_pos = min(pos + chunk_size, seq.size(1))
-            chunk = seq[:, pos:end_pos]
-            
-            # Add left context if available
-            if left_context is not None:
-                chunk = torch.cat([left_context, chunk], dim=1)
-            
-            # Add attention sink if enabled
-            if states is not None and attention_sink_size > 0:
-                sink = states[1]  # Attention sink cache from previous chunk
-                if sink is not None:
-                    # Handle dimension mismatch between sink and chunk
-                    if sink.ndim == 3 and chunk.ndim == 2:
-                        # Extract a single feature dimension to match chunk dimensions
-                        sink = sink[:, :, 0]
-                    # Paper's approach: prepend attention sink to current chunk
-                    chunk = torch.cat([sink, chunk], dim=1)
-            
-            # Process chunk through encoder
-            chunk_out, chunk_lens, new_states = model.encoder.streaming_forward(
-                chunk,
-                torch.tensor([chunk.size(1)], device=device),
-                states
-            )
-            
-            # Update states with new attention sink
-            if attention_sink_size > 0:
-                # Cache end of current chunk for attention sink (paper's approach)
-                states = [chunk, chunk_out[:, -attention_sink_size:]]
-            else:
-                states = new_states
-            
-            # Save left context for next chunk
-            if left_context_chunks > 0:
-                left_context = chunk[:, -chunk_overlap:]
-            
-            # Remove overlap from previous chunk's output
-            if pos > 0:
-                chunk_out = chunk_out[:, chunk_overlap//model.encoder.downsample_factor:]
-            
-            seq_outputs.append(chunk_out)
-            pos = end_pos - chunk_overlap
-        
-        # Concatenate all chunks for this sequence
-        seq_output = torch.cat(seq_outputs, dim=1)
-        chunk_outputs.append(seq_output)
-    
-    # Pad sequences to max length
-    max_len = max(output.size(1) for output in chunk_outputs)
-    padded_outputs = []
-    
-    for output in chunk_outputs:
-        if output.size(1) < max_len:
-            padding = torch.zeros(
-                1, max_len - output.size(1), output.size(2),
-                device=device, dtype=output.dtype
-            )
-            padded_outputs.append(torch.cat([output, padding], dim=1))
-        else:
-            padded_outputs.append(output)
-    
-    return torch.cat(padded_outputs, dim=0)
-
-
-def compute_loss(
-    params: AttributeDict,
-    model: nn.Module,
-    sp: spm.SentencePieceProcessor,
-    batch: dict,
-    is_training: bool,
-    is_pre_training: bool = True,
-    chunk_size: Optional[int] = None,
-) -> Tuple[torch.Tensor, MetricsTracker]:
-    """Compute loss following paper's approach with progressive chunk sizes.
-    
-    Args:
-        params: Model parameters
-        model: The model to train
-        sp: Sentence piece processor
-        batch: A batch of data
-        is_training: Whether this is a training batch
-        is_pre_training: Whether this is pre-training phase
-        chunk_size: Optional override for chunk size
-    
-    Returns:
-        (loss, MetricsTracker) containing loss and statistics
-    """
-    device = next(model.parameters()).device
-    feature = batch["inputs"].to(device)
-    feature_lens = batch["supervisions"]["num_frames"].to(device)
-    
-    # Get supervisions
-    supervisions = batch["supervisions"]
-    texts = supervisions["text"]
-    y = sp.encode(texts, out_type=int)
-    y = k2.RaggedTensor(y).to(device)
-    
-    if is_pre_training:
-        # Pre-training phase: full sequence processing without chunking
-        encoder_out, encoder_out_lens = model.encoder(
-            x=feature,
-            x_lens=feature_lens,
-            is_pre_training=True
-        )
-    else:
-        # Determine chunk size based on training phase
-        if chunk_size is None:
-            if params.cur_epoch <= params.pretrain_epochs + 5:  # 5 epochs transition
-                # Progressive chunk size selection
-                progress = (params.cur_epoch - params.pretrain_epochs) / 5
-                curr_chunk_size = int(
-                    params.chunk_sizes["2560ms"] * (1 - progress) + 
-                    params.chunk_sizes["320ms"] * progress
-                )
-            else:
-                # Use optimal chunk size from paper
-                curr_chunk_size = params.chunk_sizes["320ms"]
-        else:
-            curr_chunk_size = chunk_size
-            
-        # Process in chunks with attention sink
-        encoder_out = process_streaming_chunks(
-            model=model,
-            feature=feature,
-            chunk_size=curr_chunk_size,
-            attention_sink_size=params.attention_sink_size,
-            left_context_chunks=params.left_context_chunks
-        )
-        # Calculate encoder output lengths based on chunk processing
-        encoder_out_lens = ((feature_lens.float() / model.encoder.downsample_factor).floor()).to(torch.int64)
-        encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
-    
-    # Project encoder output if using XLSR
-    if hasattr(model, 'encoder_proj'):
-        encoder_out = model.encoder_proj(encoder_out)
-    
-    # Compute transducer loss
-    # Important: We provide the encoder output directly to the model
-    # instead of the raw audio, as XLSR encoder has already processed it
-    simple_loss, pruned_loss = model(
-        x=encoder_out,  # Using encoder output instead of raw audio
-        x_lens=encoder_out_lens,
-        y=y,
-        prune_range=params.prune_range,
-        am_scale=params.am_scale,
-        lm_scale=params.lm_scale,
-    )
-    
-    # Combine losses according to paper
-    if is_pre_training:
-        # During pre-training, use only simple loss for better convergence
-        loss = simple_loss
-    else:
-        # During streaming, combine both losses with scaling
-        loss = params.simple_loss_scale * simple_loss + (1 - params.simple_loss_scale) * pruned_loss
-    
-    assert loss.requires_grad == is_training
-    
-    info = MetricsTracker()
-    info["frames"] = feature.size(0)
-    info["loss"] = loss.detach().cpu().item()
-    if not is_pre_training:
-        info["simple_loss"] = simple_loss.detach().cpu().item()
-        info["pruned_loss"] = pruned_loss.detach().cpu().item()
-        if is_training and hasattr(params, "cur_epoch"):
-            info["chunk_size"] = curr_chunk_size if not is_pre_training else 0
-    
-    return loss, info
-
-
-def compute_loss_with_amp(
-    params: AttributeDict,
-    model: nn.Module,
-    sp: spm.SentencePieceProcessor,
-    batch: dict,
-    is_training: bool,
-    scaler: Optional[torch.amp.GradScaler],
-    is_pre_training: bool = True,
-    chunk_size: Optional[int] = None,
-) -> Tuple[torch.Tensor, MetricsTracker]:
-    """Compute loss with automatic mixed precision.
-    
-    Args:
-        Same as compute_loss with additional scaler
-        
-    Returns:
-        Same as compute_loss
-    """
-    with torch.cuda.amp.autocast(enabled=params.use_fp16):
-        loss, info = compute_loss(
-            params=params,
-            model=model,
-            sp=sp,
-            batch=batch,
-            is_training=is_training,
-            is_pre_training=is_pre_training,
-            chunk_size=chunk_size
-        )
-    
-    # Scale loss for mixed precision training
-    if is_training and params.use_fp16 and scaler is not None:
-        return loss, info  # Return unscaled loss - scaler.scale will be applied in training loop
-    
-    return loss, info
-
-
-def decode_one_batch_hyps(
+def validate_one_sample(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
     sp: spm.SentencePieceProcessor,
-    batch: dict,
-) -> Tuple[List[str], List[str]]:
-    """Get hypotheses and predictions for one batch.
+    sample: dict,
+) -> Tuple[str, str, float]:
+    """
+    Validate a single sample with proper batch handling.
     
     Args:
         params: Model parameters
-        model: The model to use for decoding
-        sp: SentencePieceProcessor for converting ids to text
-        batch: A batch of data
+        model: The transducer model
+        sp: SentencePieceProcessor
+        sample: A single sample dict with batch dimension 1
         
     Returns:
-        (hyps, preds): Lists of ground truth and predicted texts
+        (reference, prediction, wer): The ground truth, prediction, and WER
     """
-    device = next(model.parameters()).device
-    feature = batch["inputs"].to(device)
-    supervisions = batch["supervisions"]
-    feature_lens = supervisions["num_frames"].to(device)
+    model.eval()
     
-    # Get encoder output with streaming settings
+    device = next(model.parameters()).device
+    
     with torch.no_grad():
-        # Add right context padding for streaming
-        right_context = params.decode_chunk_len // 2
-        feature_lens_pad = feature_lens + right_context
-        feature_pad = torch.nn.functional.pad(
-            feature,
-            pad=(0, 0, 0, right_context),
-            value=LOG_EPS,
-        )
+        # Process inputs - ensure batch size is exactly 1
+        feature = sample["inputs"].to(device)
+        feature_lens = sample["supervisions"]["num_frames"].to(device)
         
-        # Get encoder output
-        encoder_out, encoder_out_lens = model.encoder(feature_pad, feature_lens_pad)
+        # Verify dimensions
+        assert feature.size(0) == 1, f"Expected batch size 1, got {feature.size(0)}"
+        assert feature_lens.size(0) == 1, f"Expected lens size 1, got {feature_lens.size(0)}"
+        
+        # Get reference text
+        reference = sample["supervisions"]["text"][0]
+        
+        # Reset XLSR encoder states to ensure clean inference
+        if hasattr(model, 'encoder') and hasattr(model.encoder, 'reset_streaming_state'):
+            if isinstance(model, DDP):
+                model.module.encoder.reset_streaming_state()
+            else:
+                model.encoder.reset_streaming_state()
+                
+        # Process with encoder (non-streaming for validation simplicity)
+        encoder_out, encoder_out_lens = model.encoder(
+            feature, feature_lens, is_pre_training=True
+        )
         
         # Project encoder output
         if isinstance(model, DDP):
@@ -1206,97 +891,37 @@ def decode_one_batch_hyps(
         else:
             encoder_out = model.encoder_proj(encoder_out)
         
-        # Check for batch size mismatch and fix if necessary
-        expected_batch_size = feature.size(0)
-        actual_batch_size = encoder_out.size(0)
-        
-        if actual_batch_size != expected_batch_size:
-            logging.warning(f"Batch size mismatch: expected {expected_batch_size}, got {actual_batch_size}. Fixing...")
-            # Take only the first expected_batch_size elements
-            if actual_batch_size > expected_batch_size:
-                encoder_out = encoder_out[:expected_batch_size]
-            # If actual is smaller, this is an unexpected case, but we'll pad to be safe
-            else:
-                pad_size = expected_batch_size - actual_batch_size
-                padding = torch.zeros(
-                    pad_size, 
-                    encoder_out.size(1), 
-                    encoder_out.size(2), 
-                    device=encoder_out.device, 
-                    dtype=encoder_out.dtype
-                )
-                encoder_out = torch.cat([encoder_out, padding], dim=0)
-            
-            # Ensure encoder_out_lens matches the expected batch size too
-            if encoder_out_lens.size(0) != expected_batch_size:
-                # If we have more lengths than needed, take the first ones
-                if encoder_out_lens.size(0) > expected_batch_size:
-                    encoder_out_lens = encoder_out_lens[:expected_batch_size]
-                # If we have fewer lengths than needed, pad with the first length
-                else:
-                    pad_lens = torch.full(
-                        (expected_batch_size - encoder_out_lens.size(0),), 
-                        encoder_out_lens[0].item() if encoder_out_lens.size(0) > 0 else encoder_out.size(1),
-                        device=encoder_out_lens.device, 
-                        dtype=encoder_out_lens.dtype
-                    )
-                    encoder_out_lens = torch.cat([encoder_out_lens, pad_lens])
-        
-        # Debug logs to help trace the issue
-        logging.debug(f"Encoder output shape before beam search: {encoder_out.shape}")
-        logging.debug(f"Encoder output lengths shape: {encoder_out_lens.shape}")
-        
+        # Decode using greedy search instead of beam search for faster validation
         try:
-            # Use beam search batch for decoding as specified in the paper (beam width = 4)
-            hyp_tokens = beam_search_batch(
-                model=model,
-                encoder_out=encoder_out,
-                encoder_out_lens=encoder_out_lens,
-                beam_size=4,  # Paper's recommended beam width
-            )
-        except Exception as e:
-            logging.error(f"Error during beam search: {str(e)}")
-            logging.error("Exception details:", exc_info=True)
-            # Fallback to greedy search if beam search fails
-            logging.warning("Falling back to greedy search")
-            hyp_tokens = greedy_search_batch(
+            prediction_tokens = greedy_search_batch(
                 model=model,
                 encoder_out=encoder_out,
                 encoder_out_lens=encoder_out_lens
-            )
-    
-    # Convert token IDs to text
-    hyps = []
-    preds = []
-    
-    # Get ground truth
-    texts = supervisions["text"]
-    
-    # Process each item in the batch
-    for i in range(len(texts)):
-        # Ground truth
-        hyps.append(texts[i])
-        
-        # Prediction - handle both tensor and list outputs
-        if i < len(hyp_tokens):  # Make sure we don't access out of bounds
-            pred_tokens = hyp_tokens[i]
-            if isinstance(pred_tokens, torch.Tensor):
-                pred_tokens = pred_tokens.tolist()
-            elif not isinstance(pred_tokens, list):
-                pred_tokens = list(pred_tokens)
+            )[0]  # Take first (only) result
+            
+            # Convert tokens to text
+            if isinstance(prediction_tokens, torch.Tensor):
+                prediction_tokens = prediction_tokens.tolist()
                 
-            # Remove any padding or special tokens
-            while pred_tokens and pred_tokens[-1] == params.blank_id:
-                pred_tokens.pop()
+            # Remove blank tokens from the end
+            while prediction_tokens and prediction_tokens[-1] == params.blank_id:
+                prediction_tokens.pop()
                 
             # Convert to text
-            pred = sp.decode(pred_tokens)
-            preds.append(pred)
-        else:
-            # If we don't have a prediction for this sample, use an empty string
-            preds.append("")
-    
-    return hyps, preds
+            prediction = sp.decode(prediction_tokens)
+            
+            # Calculate WER
+            ref_words = reference.split()
+            pred_words = prediction.split()
+            errors = editdistance.eval(ref_words, pred_words)
+            wer = 100.0 * errors / max(1, len(ref_words))
+            
+            return reference, prediction, wer
+            
+        except Exception as e:
+            logging.error(f"Error during validation decoding: {str(e)}")
+            logging.error("Exception details:", exc_info=True)
+            return reference, "DECODING_ERROR", 100.0
 
 
 def compute_validation_loss(
@@ -1307,7 +932,7 @@ def compute_validation_loss(
     world_size: int = 1,
     tb_writer: Optional[SummaryWriter] = None,
 ) -> MetricsTracker:
-    """Run minimal validation by randomly sampling a single example."""
+    """Run minimal validation with proper batch handling."""
     model.eval()
     
     # Create a placeholder metrics tracker
@@ -1318,81 +943,60 @@ def compute_validation_loss(
     # Clear GPU memory before validation
     torch.cuda.empty_cache()
     
-    # Pick a random batch from validation set
+    # Load and process a random sample
     try:
-        # Convert dataloader to list of batches first to enable random selection
-        # But limit to first 10 batches to save memory
-        val_batches = []
-        for i, batch in enumerate(valid_dl):
-            if i >= 10:  # Only consider first 10 batches
-                break
-            val_batches.append(batch)
-            
-        if not val_batches:
-            logging.warning("No validation batches available, skipping validation")
+        # Get a single random sample directly from dataset
+        val_dataset = valid_dl.dataset
+        if len(val_dataset) == 0:
+            logging.warning("Empty validation dataset, skipping validation")
             return tot_loss
-            
-        # Randomly select a batch
-        random_batch = random.choice(val_batches)
-        batch_size = random_batch["inputs"].size(0)
         
-        # For safer validation, use a batch size of 1
-        # Handle case where batch size might be 1
-        random_idx = 0 if batch_size == 1 else random.randint(0, batch_size - 1)
+        # Get a random sample
+        rand_idx = random.randint(0, len(val_dataset) - 1)
+        single_sample = val_dataset[rand_idx]
         
-        logging.info(f"Validating with sample from batch with size {batch_size}, using index {random_idx}")
+        # Make sure it has batch dimension
+        if 'inputs' in single_sample and single_sample['inputs'].ndim == 1:
+            single_sample['inputs'] = single_sample['inputs'].unsqueeze(0)
         
-        # Extract just the single sample
-        single_sample = {
-            "inputs": random_batch["inputs"][random_idx:random_idx+1].clone(),  # Clone to avoid memory issues
-            "supervisions": {
-                "num_frames": random_batch["supervisions"]["num_frames"][random_idx:random_idx+1].clone(),
-                "text": [random_batch["supervisions"]["text"][random_idx]],
-            }
-        }
+        if 'supervisions' in single_sample and 'num_frames' in single_sample['supervisions']:
+            if isinstance(single_sample['supervisions']['num_frames'], int):
+                single_sample['supervisions']['num_frames'] = torch.tensor([single_sample['supervisions']['num_frames']])
+            elif isinstance(single_sample['supervisions']['num_frames'], torch.Tensor) and single_sample['supervisions']['num_frames'].ndim == 0:
+                single_sample['supervisions']['num_frames'] = single_sample['supervisions']['num_frames'].unsqueeze(0)
         
-        with torch.no_grad():
-            try:
-                # Get hypothesis and prediction
-                hyps, preds = decode_one_batch_hyps(params, model, sp, single_sample)
-                
-                # Make sure we have results before accessing them
-                if len(hyps) > 0 and len(preds) > 0:
-                    # Calculate WER for this single sample
-                    hyp = hyps[0]
-                    pred = preds[0]
-                    hyp_words = hyp.split()
-                    pred_words = pred.split()
-                    errors = editdistance.eval(hyp_words, pred_words)
-                    wer = 100.0 * errors / max(1, len(hyp_words))
-                    
-                    # Display the result
-                    logging.info("\nRandom validation sample:")
-                    logging.info("-" * 80)
-                    logging.info(f"REFERENCE: {hyp}")
-                    logging.info(f"PREDICTION: {pred}")
-                    logging.info(f"WER: {wer:.2f}%")
-                    logging.info(f"Word errors: {errors}/{len(hyp_words)}")
-                    logging.info("-" * 80)
-                    
-                    if tb_writer is not None:
-                        tb_writer.add_scalar('valid/wer_sample', wer, params.batch_idx_train)
-                else:
-                    logging.warning("No results returned from decode_one_batch_hyps")
-            except Exception as e:
-                logging.warning(f"Error during prediction: {str(e)}")
-                logging.warning("Exception details:", exc_info=True)
-                
-            # Free memory
-            del single_sample
-            if 'hyps' in locals(): del hyps
-            if 'preds' in locals(): del preds
-            torch.cuda.empty_cache()
+        # Ensure text is in a list
+        if 'supervisions' in single_sample and 'text' in single_sample['supervisions']:
+            if isinstance(single_sample['supervisions']['text'], str):
+                single_sample['supervisions']['text'] = [single_sample['supervisions']['text']]
+        
+        logging.info(f"Validating with sample {rand_idx} from dataset")
+        
+        # Validate sample with our clean validation function
+        reference, prediction, wer = validate_one_sample(
+            params=params,
+            model=model,
+            sp=sp,
+            sample=single_sample
+        )
+        
+        # Display the result
+        logging.info("\nRandom validation sample:")
+        logging.info("-" * 80)
+        logging.info(f"REFERENCE: {reference}")
+        logging.info(f"PREDICTION: {prediction}")
+        logging.info(f"WER: {wer:.2f}%")
+        logging.info("-" * 80)
+        
+        if tb_writer is not None:
+            tb_writer.add_scalar('valid/wer_sample', wer, params.batch_idx_train)
             
     except Exception as e:
         logging.warning(f"Error during minimal validation: {str(e)}")
         logging.warning("Exception details:", exc_info=True)  # Print full stack trace
-        torch.cuda.empty_cache()
+        
+    # Clean up GPU memory
+    torch.cuda.empty_cache()
     
     return tot_loss
 
@@ -1489,40 +1093,7 @@ def train_one_epoch(
                             loss_info["chunk_size"],
                             params.batch_idx_train
                         )
-                        
-                        # Compare streaming vs non-streaming every 10 log intervals
-                        if batch_idx % (params.log_interval * 10) == 0:
-                            device = next(model.parameters()).device
-                            with torch.no_grad():
-                                # Get non-streaming output for comparison
-                                non_streaming_out, _ = model.encoder(
-                                    x=batch["inputs"].to(device),
-                                    x_lens=batch["supervisions"]["num_frames"].to(device),
-                                    is_pre_training=True
-                                )
-                                
-                                # Get streaming output
-                                streaming_out = process_streaming_chunks(
-                                    model=model,
-                                    feature=batch["inputs"].to(device),
-                                    chunk_size=params.chunk_sizes["320ms"],
-                                    attention_sink_size=params.attention_sink_size,
-                                    left_context_chunks=params.left_context_chunks
-                                )
-                                
-                                # Compare outputs
-                                output_diff = (streaming_out - non_streaming_out).abs()
-                                tb_writer.add_scalar(
-                                    'train/streaming_max_diff',
-                                    output_diff.max().item(),
-                                    params.batch_idx_train
-                                )
-                                tb_writer.add_scalar(
-                                    'train/streaming_mean_diff',
-                                    output_diff.mean().item(),
-                                    params.batch_idx_train
-                                )
-                    
+            
             # Run validation less frequently to save memory - validate every 100 batches
             # or only at specific batch indices during early training
             should_validate = (
@@ -1531,7 +1102,7 @@ def train_one_epoch(
                  (params.cur_epoch <= 2 and batch_idx in [10, 30, 50]))  # More validation points in first epochs
             )
             
-            if should_validate and not params.print_diagnostics:
+            if should_validate and not params.print_diagnostics and rank == 0:  # Only rank 0 does validation
                 # Clear memory before validation
                 torch.cuda.empty_cache()
                 
@@ -1557,6 +1128,7 @@ def train_one_epoch(
                         model.train()  # Ensure we're back in training mode
                     else:
                         raise e
+                    
         except RuntimeError as e:
             if "out of memory" in str(e):
                 # Reduce batch size if OOM
@@ -1579,12 +1151,18 @@ def train_one_epoch(
     
     logging.info(f'Mean loss: {tot_loss["loss"] / tot_loss["frames"]:.4f}')
     
-    # After pre-training phase, evaluate with different chunk sizes
-    if params.cur_epoch == params.pretrain_epochs:
+    # After pre-training phase, evaluate with different chunk sizes following the paper's approach
+    if params.cur_epoch == params.pretrain_epochs and rank == 0:
         logging.info("Pre-training complete. Evaluating streaming configurations...")
         model.eval()
         with torch.no_grad():
+            # Evaluate with different chunk sizes (using the paper's settings)
+            # The paper uses chunk sizes of 320ms, 640ms, 1280ms, and 2560ms
+            streaming_results = {}
+            
             for name, size in params.chunk_sizes.items():
+                logging.info(f"Evaluating with chunk size {name} ({size} samples)")
+                
                 metrics = evaluate_streaming(
                     params=params,
                     model=model,
@@ -1592,14 +1170,29 @@ def train_one_epoch(
                     chunk_size=size,
                     sp=sp
                 )
+                
+                streaming_results[name] = metrics
                 logging.info(f"Chunk size {name}: WER = {metrics['wer']:.2f}%")
+                
                 if tb_writer is not None:
                     tb_writer.add_scalar(
                         f'eval/wer_{name}',
                         metrics['wer'],
                         params.batch_idx_train
                     )
+            
+            # Find optimal chunk size based on WER
+            best_chunk_size = None
+            best_wer = float('inf')
+            
+            for name, metrics in streaming_results.items():
+                if metrics['wer'] < best_wer:
+                    best_wer = metrics['wer']
+                    best_chunk_size = name
+            
+            logging.info(f"Best performing chunk size: {best_chunk_size} with WER = {best_wer:.2f}%")
     
+    # Save checkpoint at the end of epoch
     save_checkpoint(
         params=params,
         model=model,
@@ -1977,6 +1570,218 @@ def find_optimal_chunk_size(
     logging.info(f"Optimal chunk size: {optimal[0]} with efficiency {optimal[1]['efficiency']:.3f}")
     
     return optimal[1]["size"]
+
+
+def evaluate_streaming(
+    params: AttributeDict,
+    model: nn.Module,
+    valid_dl: torch.utils.data.DataLoader,
+    chunk_size: int,
+    sp: spm.SentencePieceProcessor,
+) -> Dict[str, float]:
+    """Evaluate model with proper streaming inference using the paper's approach.
+    
+    Args:
+        params: Model parameters
+        model: The transducer model
+        valid_dl: Validation dataloader
+        chunk_size: Chunk size for streaming in samples (e.g., 5120 for 320ms at 16kHz)
+        sp: SentencePieceProcessor 
+        
+    Returns:
+        Dictionary of evaluation metrics
+    """
+    model.eval()
+    
+    # Make sure model is in eval mode
+    if isinstance(model, DDP):
+        model.module.eval()
+    else:
+        model.eval()
+    
+    total_words = 0
+    total_errors = 0
+    total_samples = 0
+    batch_metrics = []
+    
+    # Reset streaming states at the beginning
+    if hasattr(model, 'encoder') and hasattr(model.encoder, 'reset_streaming_state'):
+        if isinstance(model, DDP):
+            model.module.encoder.reset_streaming_state()
+        else:
+            model.encoder.reset_streaming_state()
+    
+    for batch_idx, batch in enumerate(valid_dl):
+        try:
+            # Process one utterance at a time to avoid batch size issues
+            batch_size = batch["inputs"].size(0)
+            for idx in range(batch_size):
+                with torch.no_grad():
+                    # Extract single sample
+                    single_sample = {
+                        "inputs": batch["inputs"][idx:idx+1],
+                        "supervisions": {
+                            "num_frames": batch["supervisions"]["num_frames"][idx:idx+1],
+                            "text": [batch["supervisions"]["text"][idx]],
+                        }
+                    }
+                    
+                    device = next(model.parameters()).device
+                    feature = single_sample["inputs"].to(device)
+                    feature_lens = single_sample["supervisions"]["num_frames"].to(device)
+                    reference = single_sample["supervisions"]["text"][0]
+                    
+                    # Reset states for each utterance
+                    if hasattr(model, 'encoder') and hasattr(model.encoder, 'reset_streaming_state'):
+                        if isinstance(model, DDP):
+                            model.module.encoder.reset_streaming_state()
+                        else:
+                            model.encoder.reset_streaming_state()
+                    
+                    # Process audio in chunks following the paper's approach
+                    encoder_out_chunks = []
+                    pos = 0
+                    
+                    # Get buffer and state setup
+                    chunk_overlap = chunk_size // 2  # Paper used 50% overlap
+                    attention_sink_size = params.attention_sink_size
+                    states = None
+                    
+                    # Initialize variables for attention sink
+                    attention_sink = None
+                    device = feature.device
+                    
+                    # Process audio in chunks
+                    while pos < feature.size(1):
+                        end_pos = min(pos + chunk_size, feature.size(1))
+                        current_chunk = feature[:, pos:end_pos]
+                        
+                        # Add attention sink if available
+                        if attention_sink is not None:
+                            # Paper's approach: prepend attention sink
+                            current_chunk = torch.cat([attention_sink, current_chunk], dim=1)
+                        
+                        # Process chunk
+                        with torch.cuda.amp.autocast(enabled=params.use_fp16):
+                            # Get encoder output for this chunk
+                            chunk_out, chunk_lens, states = model.encoder.streaming_forward(
+                                current_chunk,
+                                torch.tensor([current_chunk.size(1)], device=device),
+                                states
+                            )
+                            
+                            # Update attention sink from end of current output
+                            if attention_sink_size > 0:
+                                attention_sink = chunk_out[:, -attention_sink_size:]
+                        
+                        # Store output
+                        if pos > 0:
+                            # Remove overlap from output for subsequent chunks
+                            overlap_frames = chunk_overlap // model.encoder.downsample_factor
+                            chunk_out = chunk_out[:, overlap_frames:]
+                            
+                        encoder_out_chunks.append(chunk_out)
+                        
+                        # Move position forward with overlap
+                        pos = end_pos - chunk_overlap
+                    
+                    # Concatenate chunks
+                    encoder_out = torch.cat(encoder_out_chunks, dim=1)
+                    
+                    # Calculate output length (after downsampling)
+                    encoder_out_lens = ((feature_lens.float() / model.encoder.downsample_factor).floor()).to(torch.int64)
+                    encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
+                    
+                    # Project encoder output
+                    if isinstance(model, DDP):
+                        encoder_out = model.module.encoder_proj(encoder_out)
+                    else:
+                        encoder_out = model.encoder_proj(encoder_out)
+                    
+                    # Use beam search for decoding as specified in the paper
+                    if batch_idx < 3:  # Only use beam search for first few batches to save time
+                        try:
+                            # Beam search with width=4 as per paper
+                            hyp_tokens = beam_search_batch(
+                                model=model,
+                                encoder_out=encoder_out,
+                                encoder_out_lens=encoder_out_lens,
+                                beam_size=4
+                            )[0]  # Take first (only) hypothesis
+                        except Exception as e:
+                            logging.warning(f"Beam search failed, falling back to greedy: {str(e)}")
+                            hyp_tokens = greedy_search_batch(
+                                model=model,
+                                encoder_out=encoder_out,
+                                encoder_out_lens=encoder_out_lens
+                            )[0]
+                    else:
+                        # Use greedy search for the rest to speed up evaluation
+                        hyp_tokens = greedy_search_batch(
+                            model=model,
+                            encoder_out=encoder_out,
+                            encoder_out_lens=encoder_out_lens
+                        )[0]
+                    
+                    # Convert to text
+                    if isinstance(hyp_tokens, torch.Tensor):
+                        hyp_tokens = hyp_tokens.tolist()
+                    
+                    # Remove blank tokens
+                    while hyp_tokens and hyp_tokens[-1] == params.blank_id:
+                        hyp_tokens.pop()
+                    
+                    prediction = sp.decode(hyp_tokens)
+                    
+                    # Calculate WER
+                    ref_words = reference.split()
+                    pred_words = prediction.split()
+                    errors = editdistance.eval(ref_words, pred_words)
+                    total_errors += errors
+                    total_words += len(ref_words)
+                    total_samples += 1
+                    
+                    # Log sample metrics
+                    sample_wer = 100.0 * errors / max(1, len(ref_words))
+                    batch_metrics.append({
+                        'reference': reference,
+                        'prediction': prediction, 
+                        'wer': sample_wer,
+                        'words': len(ref_words),
+                        'errors': errors
+                    })
+                    
+                    # Log occasionally
+                    if total_samples % 10 == 0:
+                        current_wer = 100.0 * total_errors / max(1, total_words)
+                        logging.info(f"Processed {total_samples} samples, current WER: {current_wer:.2f}%")
+        
+        except Exception as e:
+            logging.error(f"Error processing batch {batch_idx}: {str(e)}")
+            logging.error("Exception details:", exc_info=True)
+            continue
+    
+    # Calculate final metrics
+    wer = 100.0 * total_errors / max(1, total_words)
+    
+    # Display some sample predictions
+    logging.info("\nSample predictions:")
+    for i, metric in enumerate(batch_metrics[:5]):  # Show first 5 samples
+        logging.info(f"Sample {i}:")
+        logging.info(f"  Reference: {metric['reference']}")
+        logging.info(f"  Prediction: {metric['prediction']}")
+        logging.info(f"  WER: {metric['wer']:.2f}%")
+    
+    # Return metrics
+    metrics = {
+        "wer": wer,
+        "total_samples": total_samples,
+        "total_words": total_words,
+        "total_errors": total_errors,
+        "chunk_size_ms": chunk_size / 16,  # Convert samples to ms
+    }
+    
+    return metrics
 
 
 def main():

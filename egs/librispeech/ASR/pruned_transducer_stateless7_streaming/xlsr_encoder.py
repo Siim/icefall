@@ -119,7 +119,7 @@ class XLSREncoder(EncoderInterface):
         return [None]  # Initial state is None since we'll build it from first chunk
 
     def reset_streaming_state(self):
-        """Reset all streaming state variables"""
+        """Reset all streaming state variables to ensure clean inference"""
         self.cached_features = None
         self.cached_len = 0
         self.current_chunk_size = self.decode_chunk_size
@@ -128,9 +128,9 @@ class XLSREncoder(EncoderInterface):
         self.attention_sink_cache = None
         self.context_cache = None
         self.last_chunk_output = None
-        self.left_context_buffer = []  # Store left context chunks
-        self.past_context = None  # Add past context for streaming
-        self.is_streaming = False  # Track streaming state
+        self.left_context_buffer = []
+        self.past_context = None
+        self.is_streaming = False
 
     def prepare_chunk_with_context(self, chunk: torch.Tensor, left_context: torch.Tensor = None, right_context: torch.Tensor = None) -> torch.Tensor:
         """Prepare chunk with left and right context for better boundary handling"""

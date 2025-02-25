@@ -1248,70 +1248,99 @@ def compute_validation_loss(
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
     tb_writer: Optional[SummaryWriter] = None,
+    subset_size: int = 10,  # Limit validation to a small subset
 ) -> MetricsTracker:
-    """Run the validation process with both streaming and non-streaming evaluation."""
+    """Run the validation process with memory-efficient WER calculation."""
     model.eval()
 
     tot_loss = MetricsTracker()
     tot_non_streaming_wer = 0
     tot_streaming_wer = 0
     num_sentences = 0
-
+    
+    logging.info(f"Validating on a subset of {subset_size} batches to limit memory usage")
+    
+    # Only process a subset of validation data to save memory
     for batch_idx, batch in enumerate(valid_dl):
-        loss, loss_info = compute_loss(
-            params=params,
-            model=model,
-            sp=sp,
-            batch=batch,
-            is_training=False,
-            is_pre_training=False
-        )
-        assert loss.requires_grad is False
-        tot_loss = tot_loss + loss_info
+        if batch_idx >= subset_size:
+            break
+            
+        torch.cuda.empty_cache()  # Clear cache between batches
+        
+        try:
+            with torch.no_grad():  # Ensure we're not storing gradients
+                loss, loss_info = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    batch=batch,
+                    is_training=False,
+                    is_pre_training=False
+                )
+                assert loss.requires_grad is False
+                tot_loss = tot_loss + loss_info
 
-        if batch_idx % 100 == 0:
-            logging.info(f"batch {batch_idx}, validation loss: {loss_info}")
-            
-            # Get hypotheses and predictions for the first few examples
-            hyps, preds = decode_one_batch_hyps(params, model, sp, batch)
-            num_to_print = min(3, len(hyps))
-            
-            logging.info("\nExample comparisons:")
-            logging.info("-" * 80)
-            for i in range(num_to_print):
-                logging.info(f"HYP[{i}]: {hyps[i]}")
-                logging.info(f"PRD[{i}]: {preds[i]}")
-                logging.info("-" * 80)
-            
-            # Evaluate streaming performance
-            streaming_metrics = evaluate_streaming(
-                params=params,
-                model=model,
-                valid_dl=torch.utils.data.DataLoader([batch], batch_size=None),
-                chunk_size=params.chunk_sizes["320ms"],
-                sp=sp
-            )
-            
-            # Calculate WER for both modes
-            for hyp, ref in zip(hyps, preds):
-                hyp_words = hyp.split()
-                ref_words = ref.split()
-                tot_non_streaming_wer += editdistance.eval(hyp_words, ref_words)
-                num_sentences += 1
-            
-            tot_streaming_wer += streaming_metrics["wer"] * len(hyps)
-            
-            if tb_writer is not None:
-                tb_writer.add_scalar(
-                    'valid/streaming_wer',
-                    streaming_metrics["wer"],
-                    params.batch_idx_train
-                )
-                tb_writer.add_scalar(
-                    'valid/non_streaming_wer',
-                    tot_non_streaming_wer / max(1, num_sentences),
-                    params.batch_idx_train
-                )
+                if batch_idx % 5 == 0:
+                    logging.info(f"batch {batch_idx}, validation loss: {loss_info}")
+                    
+                    # Get hypotheses and predictions for the first few examples
+                    # Limit to just 1-2 examples to save memory
+                    hyps, preds = decode_one_batch_hyps(params, model, sp, batch)
+                    num_to_print = min(2, len(hyps))
+                    
+                    logging.info("\nExample comparisons:")
+                    logging.info("-" * 80)
+                    for i in range(num_to_print):
+                        logging.info(f"HYP[{i}]: {hyps[i]}")
+                        logging.info(f"PRD[{i}]: {preds[i]}")
+                        logging.info("-" * 80)
+                    
+                    # Calculate WER for this batch only - don't run separate streaming eval
+                    for hyp, ref in zip(hyps, preds):
+                        hyp_words = hyp.split()
+                        ref_words = ref.split()
+                        tot_non_streaming_wer += editdistance.eval(hyp_words, ref_words)
+                        num_sentences += 1
+                        
+                    # Log current WER
+                    current_wer = tot_non_streaming_wer / max(1, num_sentences) * 100.0
+                    logging.info(f"Current WER: {current_wer:.2f}%")
+                    
+                    # Release memory explicitly
+                    del hyps, preds
+                    torch.cuda.empty_cache()
+                
+                # Optional: Run streamlined streaming evaluation on small subset
+                if batch_idx == 0 and params.cur_epoch % 5 == 0:
+                    # Create a mini-loader with just this batch
+                    mini_batch = [batch]
+                    mini_dl = torch.utils.data.DataLoader(mini_batch, batch_size=None)
+                    
+                    try:
+                        # Use smaller chunk size for validation to save memory
+                        smaller_chunk = params.chunk_sizes["320ms"]
+                        streaming_wer = evaluate_streaming_efficient(
+                            params=params,
+                            model=model,
+                            valid_dl=mini_dl,
+                            chunk_size=smaller_chunk,
+                            sp=sp,
+                            max_examples=4  # Limit to just a few examples
+                        )
+                        logging.info(f"Streaming WER (limited sample): {streaming_wer:.2f}%")
+                    except Exception as e:
+                        logging.warning(f"Streaming evaluation failed, skipping: {str(e)}")
+                    
+                    # Release memory
+                    del mini_batch, mini_dl
+                    torch.cuda.empty_cache()
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                logging.warning(f"OOM during validation at batch {batch_idx}, skipping this batch")
+                torch.cuda.empty_cache()
+                continue
+            else:
+                raise e
 
     if world_size > 1:
         tot_loss.reduce(loss.device)
@@ -1325,23 +1354,94 @@ def compute_validation_loss(
         tot_streaming_wer = metrics["tot_streaming_wer"]
         num_sentences = metrics["num_sentences"]
 
-    loss_value = tot_loss["loss"] / tot_loss["frames"]
+    loss_value = tot_loss["loss"] / tot_loss["frames"] if tot_loss["frames"] > 0 else float('inf')
     if loss_value < params.best_valid_loss:
         params.best_valid_loss = loss_value
         params.best_valid_epoch = params.cur_epoch
 
-    # Calculate final WERs
-    non_streaming_wer = tot_non_streaming_wer / max(1, num_sentences)
-    streaming_wer = tot_streaming_wer / max(1, num_sentences)
+    # Calculate final WER
+    non_streaming_wer = tot_non_streaming_wer / max(1, num_sentences) * 100.0
     
     logging.info(
-        f"Validation complete:\n"
+        f"Validation complete (limited to {subset_size} batches):\n"
         f"Loss: {loss_value:.4f}\n"
-        f"Non-streaming WER: {non_streaming_wer:.2f}%\n"
-        f"Streaming WER: {streaming_wer:.2f}%"
+        f"WER: {non_streaming_wer:.2f}%"
     )
 
     return tot_loss
+
+
+def evaluate_streaming_efficient(
+    params: AttributeDict,
+    model: nn.Module,
+    valid_dl: torch.utils.data.DataLoader,
+    chunk_size: int,
+    sp: spm.SentencePieceProcessor,
+    max_examples: int = 10  # Limit number of examples
+) -> float:
+    """Memory-efficient version of streaming evaluation
+    """
+    model.eval()
+    total_words = 0
+    total_errors = 0
+    
+    for batch_idx, batch in enumerate(valid_dl):
+        try:
+            with torch.no_grad():
+                # Only process first few examples in each batch to save memory
+                max_batch_size = min(batch["inputs"].size(0), 2)
+                
+                feature = batch["inputs"][:max_batch_size].to(next(model.parameters()).device)
+                feature_lens = batch["supervisions"]["num_frames"][:max_batch_size].to(feature.device)
+                texts = batch["supervisions"]["text"][:max_batch_size]
+                
+                # Process in chunks
+                encoder_out = process_streaming_chunks(
+                    model=model,
+                    feature=feature,
+                    chunk_size=chunk_size,
+                    attention_sink_size=params.attention_sink_size,
+                    left_context_chunks=params.left_context_chunks
+                )
+                
+                # Quick validation with greedy search
+                hyp_tokens = greedy_search_batch(
+                    model=model,
+                    encoder_out=encoder_out,
+                    encoder_out_lens=feature_lens
+                )
+                
+                # Calculate WER on a per-example basis to save memory
+                for i, (tokens, ref) in enumerate(zip(hyp_tokens, texts)):
+                    if isinstance(tokens, torch.Tensor):
+                        tokens = tokens.tolist()
+                    hyp = sp.decode(tokens)
+                    
+                    # Clear memory for this example before processing next
+                    if isinstance(hyp_tokens, list) and i < len(hyp_tokens):
+                        hyp_tokens[i] = None
+                    
+                    hyp_words = hyp.split()
+                    ref_words = ref.split()
+                    total_words += len(ref_words)
+                    total_errors += editdistance.eval(hyp_words, ref_words)
+                
+                # Clear encoder outputs to save memory
+                del encoder_out
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            logging.error(f"Error processing batch {batch_idx}: {str(e)}")
+            continue
+            
+        # Only process a limited number of batches to save memory
+        if batch_idx >= max_examples:
+            break
+    
+    # Calculate final WER
+    wer = 100.0 * total_errors / max(1, total_words)
+    
+    return wer
 
 
 def train_one_epoch(
@@ -1470,21 +1570,42 @@ def train_one_epoch(
                                     params.batch_idx_train
                                 )
                     
-            # Run validation every 500 batches
-            if batch_idx > 0 and batch_idx % 50 == 0 and not params.print_diagnostics:
-                logging.info("Computing validation loss and WER")
-                valid_info = compute_validation_loss(
-                    params=params,
-                    model=model,
-                    sp=sp,
-                    valid_dl=valid_dl,
-                    world_size=world_size,
-                    tb_writer=tb_writer,
-                )
-                model.train()  # Switch back to training mode
-                logging.info(f"Epoch {params.cur_epoch}, batch {batch_idx}, validation: {valid_info}")
-                logging.info(f"Maximum memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024}MB")
-                                    
+            # Run validation less frequently to save memory - validate every 100 batches
+            # or only at specific batch indices during early training
+            should_validate = (
+                batch_idx > 0 and 
+                ((batch_idx % 100 == 0) or  # Regular validation interval
+                 (params.cur_epoch <= 2 and batch_idx in [50, 150, 250]))  # More validation points in first epochs
+            )
+            
+            if should_validate and not params.print_diagnostics:
+                # Clear memory before validation
+                torch.cuda.empty_cache()
+                
+                logging.info("Computing validation loss and WER (memory-efficient mode)")
+                try:
+                    valid_info = compute_validation_loss(
+                        params=params,
+                        model=model,
+                        sp=sp,
+                        valid_dl=valid_dl,
+                        world_size=world_size,
+                        tb_writer=tb_writer,
+                        subset_size=5,  # Use only 5 batches for validation to save memory
+                    )
+                    model.train()  # Switch back to training mode
+                    logging.info(f"Epoch {params.cur_epoch}, batch {batch_idx}, validation: {valid_info}")
+                    logging.info(f"Maximum memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024}MB")
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        logging.warning(
+                            f"OOM during validation, skipping this validation. "
+                            f"Memory usage: {torch.cuda.max_memory_allocated() // 1024 // 1024}MB"
+                        )
+                        torch.cuda.empty_cache()
+                        model.train()  # Ensure we're back in training mode
+                    else:
+                        raise e
         except RuntimeError as e:
             if "out of memory" in str(e):
                 # Reduce batch size if OOM

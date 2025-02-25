@@ -1242,13 +1242,28 @@ def decode_one_batch_hyps(
                     )
                     encoder_out_lens = torch.cat([encoder_out_lens, pad_lens])
         
-        # Use beam search batch for decoding as specified in the paper (beam width = 4)
-        hyp_tokens = beam_search_batch(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            beam_size=4,  # Paper's recommended beam width
-        )
+        # Debug logs to help trace the issue
+        logging.debug(f"Encoder output shape before beam search: {encoder_out.shape}")
+        logging.debug(f"Encoder output lengths shape: {encoder_out_lens.shape}")
+        
+        try:
+            # Use beam search batch for decoding as specified in the paper (beam width = 4)
+            hyp_tokens = beam_search_batch(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+                beam_size=4,  # Paper's recommended beam width
+            )
+        except Exception as e:
+            logging.error(f"Error during beam search: {str(e)}")
+            logging.error("Exception details:", exc_info=True)
+            # Fallback to greedy search if beam search fails
+            logging.warning("Falling back to greedy search")
+            hyp_tokens = greedy_search_batch(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens
+            )
     
     # Convert token IDs to text
     hyps = []
@@ -1263,19 +1278,23 @@ def decode_one_batch_hyps(
         hyps.append(texts[i])
         
         # Prediction - handle both tensor and list outputs
-        pred_tokens = hyp_tokens[i]
-        if isinstance(pred_tokens, torch.Tensor):
-            pred_tokens = pred_tokens.tolist()
-        elif not isinstance(pred_tokens, list):
-            pred_tokens = list(pred_tokens)
-            
-        # Remove any padding or special tokens
-        while pred_tokens and pred_tokens[-1] == params.blank_id:
-            pred_tokens.pop()
-            
-        # Convert to text
-        pred = sp.decode(pred_tokens)
-        preds.append(pred)
+        if i < len(hyp_tokens):  # Make sure we don't access out of bounds
+            pred_tokens = hyp_tokens[i]
+            if isinstance(pred_tokens, torch.Tensor):
+                pred_tokens = pred_tokens.tolist()
+            elif not isinstance(pred_tokens, list):
+                pred_tokens = list(pred_tokens)
+                
+            # Remove any padding or special tokens
+            while pred_tokens and pred_tokens[-1] == params.blank_id:
+                pred_tokens.pop()
+                
+            # Convert to text
+            pred = sp.decode(pred_tokens)
+            preds.append(pred)
+        else:
+            # If we don't have a prediction for this sample, use an empty string
+            preds.append("")
     
     return hyps, preds
 
@@ -1317,50 +1336,52 @@ def compute_validation_loss(
         random_batch = random.choice(val_batches)
         batch_size = random_batch["inputs"].size(0)
         
+        # For safer validation, use a batch size of 1
         # Handle case where batch size might be 1
-        if batch_size == 1:
-            random_idx = 0
-        else:
-            random_idx = random.randint(0, batch_size - 1)
+        random_idx = 0 if batch_size == 1 else random.randint(0, batch_size - 1)
         
         logging.info(f"Validating with sample from batch with size {batch_size}, using index {random_idx}")
         
         # Extract just the single sample
         single_sample = {
-            "inputs": random_batch["inputs"][random_idx:random_idx+1],
+            "inputs": random_batch["inputs"][random_idx:random_idx+1].clone(),  # Clone to avoid memory issues
             "supervisions": {
-                "num_frames": random_batch["supervisions"]["num_frames"][random_idx:random_idx+1],
+                "num_frames": random_batch["supervisions"]["num_frames"][random_idx:random_idx+1].clone(),
                 "text": [random_batch["supervisions"]["text"][random_idx]],
             }
         }
         
         with torch.no_grad():
-            # Get hypothesis and prediction
-            hyps, preds = decode_one_batch_hyps(params, model, sp, single_sample)
-            
-            # Make sure we have results before accessing them
-            if len(hyps) > 0 and len(preds) > 0:
-                # Calculate WER for this single sample
-                hyp = hyps[0]
-                pred = preds[0]
-                hyp_words = hyp.split()
-                pred_words = pred.split()
-                errors = editdistance.eval(hyp_words, pred_words)
-                wer = 100.0 * errors / max(1, len(hyp_words))
+            try:
+                # Get hypothesis and prediction
+                hyps, preds = decode_one_batch_hyps(params, model, sp, single_sample)
                 
-                # Display the result
-                logging.info("\nRandom validation sample:")
-                logging.info("-" * 80)
-                logging.info(f"REFERENCE: {hyp}")
-                logging.info(f"PREDICTION: {pred}")
-                logging.info(f"WER: {wer:.2f}%")
-                logging.info(f"Word errors: {errors}/{len(hyp_words)}")
-                logging.info("-" * 80)
-                
-                if tb_writer is not None:
-                    tb_writer.add_scalar('valid/wer_sample', wer, params.batch_idx_train)
-            else:
-                logging.warning("No results returned from decode_one_batch_hyps")
+                # Make sure we have results before accessing them
+                if len(hyps) > 0 and len(preds) > 0:
+                    # Calculate WER for this single sample
+                    hyp = hyps[0]
+                    pred = preds[0]
+                    hyp_words = hyp.split()
+                    pred_words = pred.split()
+                    errors = editdistance.eval(hyp_words, pred_words)
+                    wer = 100.0 * errors / max(1, len(hyp_words))
+                    
+                    # Display the result
+                    logging.info("\nRandom validation sample:")
+                    logging.info("-" * 80)
+                    logging.info(f"REFERENCE: {hyp}")
+                    logging.info(f"PREDICTION: {pred}")
+                    logging.info(f"WER: {wer:.2f}%")
+                    logging.info(f"Word errors: {errors}/{len(hyp_words)}")
+                    logging.info("-" * 80)
+                    
+                    if tb_writer is not None:
+                        tb_writer.add_scalar('valid/wer_sample', wer, params.batch_idx_train)
+                else:
+                    logging.warning("No results returned from decode_one_batch_hyps")
+            except Exception as e:
+                logging.warning(f"Error during prediction: {str(e)}")
+                logging.warning("Exception details:", exc_info=True)
                 
             # Free memory
             del single_sample

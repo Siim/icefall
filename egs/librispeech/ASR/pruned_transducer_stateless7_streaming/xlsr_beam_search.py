@@ -116,14 +116,38 @@ class XLSRBeamSearch:
         # Get the decoder output
         decoder_out = hyp.decoder_out
         
+        # Ensure proper dimensions for both inputs
+        # encoder_frame shape should be (1, 1, encoder_dim)
+        # Make sure encoder has right dimensions
+        if encoder_frame.ndim == 4:  # (1, 1, 1, encoder_dim)
+            encoder_proj = encoder_frame.squeeze(1)  # (1, 1, encoder_dim)
+        elif encoder_frame.ndim == 3:  # (1, 1, encoder_dim)
+            encoder_proj = encoder_frame
+        else:
+            # Handle unexpected dimensions
+            encoder_proj = encoder_frame.view(1, 1, -1)  # Force to (1, 1, encoder_dim)
+        
+        # Make sure decoder has right dimensions
+        if decoder_out.ndim == 2:  # (1, decoder_dim)
+            decoder_proj = decoder_out.unsqueeze(1)  # (1, 1, decoder_dim)
+        elif decoder_out.ndim == 3:  # (1, 1, decoder_dim)
+            decoder_proj = decoder_out
+        else:
+            # Handle unexpected dimensions
+            decoder_proj = decoder_out.view(1, 1, -1)  # Force to (1, 1, decoder_dim)
+        
+        # Double-check dimensions before joiner call
+        assert encoder_proj.ndim == decoder_proj.ndim, f"Dimension mismatch: encoder={encoder_proj.shape}, decoder={decoder_proj.shape}"
+        
         # Compute joiner output (logits)
-        encoder_proj = encoder_frame.unsqueeze(1)  # (1, 1, 1, encoder_dim)
         logits = self.model.joiner(
             encoder_proj,
-            decoder_out.unsqueeze(1),
+            decoder_proj,
             project_input=False
         )
-        logits = logits.squeeze(1).squeeze(1)  # (1, vocab_size)
+        
+        # After joiner, squeeze to get (1, vocab_size)
+        logits = logits.squeeze(1)  # (1, vocab_size)
         
         # Apply blank penalty if needed
         if self.blank_penalty != 0:

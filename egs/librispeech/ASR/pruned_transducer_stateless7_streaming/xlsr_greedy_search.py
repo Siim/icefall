@@ -238,8 +238,7 @@ def greedy_search_batch(
     model: nn.Module,
     encoder_out: torch.Tensor,
     encoder_out_lens: torch.Tensor,
-    sp: spm.SentencePieceProcessor,
-    max_sym_per_frame: int = 3,
+    max_sym_per_frame: int = 3
 ) -> List[str]:
     """XLSR-specific greedy search for a batch of utterances.
     

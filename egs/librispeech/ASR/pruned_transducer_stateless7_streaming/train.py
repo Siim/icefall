@@ -945,9 +945,7 @@ def validate_one_sample(
                 prediction_tokens = xlsr_greedy_search_batch(
                     model=model,
                     encoder_out=encoder_out,
-                    encoder_out_lens=encoder_out_lens,
-                    blank_penalty=2.0,  # Stronger blank penalty for early training
-                    repetition_penalty=2.0  # Repetition penalty to prevent loops
+                    encoder_out_lens=encoder_out_lens
                 )[0]  # Take first (only) result
             except Exception as e:
                 logging.error(f"Error during enhanced greedy validation: {str(e)}")

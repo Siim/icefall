@@ -643,9 +643,8 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
             attention_sink_size=params.attention_sink_size,  # 16 frames (paper's optimal)
             frame_duration=params.frame_duration,  # 25ms per frame
             frame_stride=params.frame_stride,    # 20ms stride
-            min_chunk_size=2560,   # 160ms at 16kHz (16 frames)
-            max_chunk_size=20480,  # 1280ms at 16kHz (128 frames)
-            left_context_chunks=params.left_context_chunks  # 1 chunk (paper's optimal)
+            context_frames=getattr(params, 'context_frames', 10),  # Default to 10 frames
+            transition_frames=getattr(params, 'transition_frames', 5)  # Default to 5 frames
         )
         # Verify the encoder is properly initialized
         assert isinstance(encoder, XLSREncoder), f"Expected XLSREncoder, got {type(encoder)}"

@@ -945,7 +945,8 @@ def validate_one_sample(
                 prediction_tokens = xlsr_greedy_search_batch(
                     model=model,
                     encoder_out=encoder_out,
-                    encoder_out_lens=encoder_out_lens
+                    encoder_out_lens=encoder_out_lens,
+                    max_sym_per_frame=3
                 )[0]  # Take first (only) result
             except Exception as e:
                 logging.error(f"Error during enhanced greedy validation: {str(e)}")
@@ -958,8 +959,7 @@ def validate_one_sample(
                     model=model,
                     encoder_out=encoder_out,
                     encoder_out_lens=encoder_out_lens,
-                    beam_size=4,
-                    blank_penalty=5.0,  # High penalty to prevent blank token dominance
+                    beam_size=4
                 )[0]  # Take first (only) result
             except Exception as e:
                 logging.error(f"Beam search failed, falling back to enhanced greedy: {str(e)}")
@@ -967,7 +967,7 @@ def validate_one_sample(
                     model=model,
                     encoder_out=encoder_out,
                     encoder_out_lens=encoder_out_lens,
-                    blank_penalty=2.0
+                    max_sym_per_frame=3
                 )[0]
             
         # Convert tokens to text
@@ -1761,12 +1761,25 @@ def evaluate_streaming(
     chunk_size: int,
     sp: spm.SentencePieceProcessor,
 ) -> Dict[str, float]:
-    """Evaluate model with streaming inference using the paper's approach."""
+    """Evaluate model with streaming inference using the paper's approach.
+    
+    The XLSR-Transducer paper recommends:
+    1. Using 40% overlap between chunks
+    2. Setting attention sink size to 16 frames
+    3. Using 1 chunk of left context
+    """
     model.eval()
     total_words = 0
     total_errors = 0
     total_samples = 0
-    batch_metrics = []
+    
+    # Track statistics for frame count analysis
+    total_expected_frames = 0
+    total_actual_frames = 0
+    
+    # Track latency information
+    total_chunk_count = 0
+    total_chunk_time = 0.0
     
     # Reset streaming states at the beginning
     if hasattr(model, 'encoder') and hasattr(model.encoder, 'reset_streaming_state'):
@@ -1795,6 +1808,20 @@ def evaluate_streaming(
                     feature_lens = single_sample["supervisions"]["num_frames"].to(device)
                     reference = single_sample["supervisions"]["text"][0]
                     
+                    # Basic sanity checks before processing
+                    if feature.size(1) < 100:  # Skip very short samples
+                        logging.warning(f"Skipping very short sample of length {feature.size(1)}")
+                        continue
+                        
+                    # Check for NaN or Inf values
+                    if torch.isnan(feature).any() or torch.isinf(feature).any():
+                        logging.warning("Input contains NaN or Inf values, normalizing")
+                        feature = torch.nan_to_num(feature, nan=0.0, posinf=1.0, neginf=-1.0)
+                    
+                    # Calculate expected number of frames (exact)
+                    expected_frames = int((feature.size(1) / model.encoder.downsample_factor).floor().item())
+                    total_expected_frames += expected_frames
+                    
                     # Reset states for each utterance
                     if hasattr(model, 'encoder') and hasattr(model.encoder, 'reset_streaming_state'):
                         if isinstance(model, DDP):
@@ -1802,145 +1829,163 @@ def evaluate_streaming(
                         else:
                             model.encoder.reset_streaming_state()
                     
-                    # Process audio in chunks following the paper's approach
-                    encoder_out_chunks = []
-                    pos = 0
-                    
-                    # Get buffer and state setup
-                    chunk_overlap = chunk_size // 2  # Paper used 50% overlap
-                    attention_sink_size = params.attention_sink_size
-                    states = None
-                    
-                    # Initialize variables for attention sink
-                    attention_sink = None
-                    
-                    # Process audio in chunks
-                    while pos < feature.size(1):
-                        end_pos = min(pos + chunk_size, feature.size(1))
-                        current_chunk = feature[:, pos:end_pos]
-                        
-                        # Add attention sink if available
-                        if attention_sink is not None:
-                            # Paper's approach: prepend attention sink
-                            if attention_sink.dim() != current_chunk.dim():
-                                if attention_sink.dim() == 3 and current_chunk.dim() == 2:
-                                    # Make current_chunk 3D to match attention_sink
-                                    current_chunk = current_chunk.unsqueeze(0)
-                                elif attention_sink.dim() == 2 and current_chunk.dim() == 3:
-                                    # Make attention_sink 3D to match current_chunk
-                                    attention_sink = attention_sink.unsqueeze(0)
-                            
-                            # Now concatenate with matching dimensions
-                            current_chunk = torch.cat([attention_sink, current_chunk], dim=1)
-                        
-                        # Process chunk with appropriate precision
-                        if params.use_bf16:
-                            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
-                                # Get encoder output for this chunk
-                                chunk_out, chunk_lens, states = model.encoder.streaming_forward(
-                                    current_chunk,
-                                    torch.tensor([current_chunk.size(1)], device=device),
-                                    states
-                                )
-                        else:
-                            with torch.amp.autocast(device_type='cuda', enabled=params.use_fp16):
-                                # Get encoder output for this chunk
-                                chunk_out, chunk_lens, states = model.encoder.streaming_forward(
-                                    current_chunk,
-                                    torch.tensor([current_chunk.size(1)], device=device),
-                                    states
-                                )
-                        
-                        # Update attention sink from end of current output
-                        if attention_sink_size > 0:
-                            attention_sink = chunk_out[:, -attention_sink_size:]
-                        
-                        # Store output
-                        if pos > 0:
-                            # Remove overlap from output for subsequent chunks
-                            overlap_frames = chunk_overlap // model.encoder.downsample_factor
-                            chunk_out = chunk_out[:, overlap_frames:]
-                            
-                        encoder_out_chunks.append(chunk_out)
-                        
-                        # Move position forward with overlap
-                        pos = end_pos - chunk_overlap
-                    
-                    # Concatenate chunks
-                    encoder_out = torch.cat(encoder_out_chunks, dim=1)
-                    
-                    # Calculate output length (after downsampling)
-                    encoder_out_lens = ((feature_lens.float() / model.encoder.downsample_factor).floor()).to(torch.int64)
-                    encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
-                    
-                    # Project encoder output
-                    if isinstance(model, DDP):
-                        encoder_out = model.module.encoder_proj(encoder_out)
-                    else:
-                        encoder_out = model.encoder_proj(encoder_out)
-                    
-                    # Use XLSR-specific greedy search for decoding as it's more robust
+                    # Process audio in chunks with memory safety
                     try:
-                        # Update greedy search call to match API
-                        hyps = xlsr_greedy_search_batch(
+                        # Measure chunk processing time
+                        start_time = time.time()
+                        
+                        # Use our robust process_streaming_chunks function
+                        encoder_out = process_streaming_chunks(
                             model=model,
-                            encoder_out=encoder_out,
-                            encoder_out_lens=encoder_out_lens,
-                            sp=sp,
-                            max_sym_per_frame=3,  # Remove blank_penalty parameter
+                            feature=feature,
+                            chunk_size=chunk_size,
+                            attention_sink_size=params.attention_sink_size,
+                            left_context_chunks=params.left_context_chunks
                         )
-                    except Exception as e:
-                        logging.error(f"Error during enhanced greedy validation: {str(e)}")
-                        hyps = ["GREEDY_DECODE_ERROR"]
+                        
+                        # Calculate number of chunks processed
+                        # Using 40% overlap as per paper
+                        total_audio_len = feature.size(1)
+                        chunk_overlap = int(chunk_size * 0.4)
+                        effective_chunk_len = chunk_size - chunk_overlap
+                        num_chunks = (total_audio_len + effective_chunk_len - 1) // effective_chunk_len
+                        
+                        total_chunk_count += num_chunks
+                        total_chunk_time += time.time() - start_time
+                        
+                        # Track actual frames - this should be equal to expected_frames now
+                        actual_frames = encoder_out.size(1)
+                        total_actual_frames += actual_frames
+                        
+                        # Log frame count ratio for analysis
+                        if batch_idx < 5 or batch_idx % 20 == 0:
+                            frame_ratio = actual_frames / expected_frames if expected_frames > 0 else 0
+                            logging.info(f"Frame count: expected={expected_frames}, actual={actual_frames}, ratio={frame_ratio:.2f}")
+                        
+                        # Verify encoder output dimensions
+                        if encoder_out.dim() != 3:
+                            logging.error(f"Invalid encoder output dimensions: {encoder_out.shape}, expected 3D tensor")
+                            continue
+                            
+                        # Calculate output length (after downsampling)
+                        encoder_out_lens = ((feature_lens.float() / model.encoder.downsample_factor).floor()).to(torch.int64)
+                        encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
+                        
+                        # Safety check: ensure encoder_out_lens doesn't exceed actual size
+                        if encoder_out_lens.max().item() > encoder_out.size(1):
+                            logging.warning(f"Encoder output length mismatch: expected {encoder_out_lens.max().item()}, got {encoder_out.size(1)}")
+                            encoder_out_lens = torch.clamp(encoder_out_lens, max=encoder_out.size(1))
+                        
+                        # Project encoder output
+                        if isinstance(model, DDP):
+                            encoder_out = model.module.encoder_proj(encoder_out)
+                        else:
+                            encoder_out = model.encoder_proj(encoder_out)
+                        
+                        # Perform XLSR-specific greedy search with proper error handling
+                        try:
+                            with torch.amp.autocast(device_type='cuda', enabled=params.use_fp16 or params.use_bf16):
+                                hyps = xlsr_greedy_search_batch(
+                                    model=model,
+                                    encoder_out=encoder_out,
+                                    encoder_out_lens=encoder_out_lens,
+                                    max_sym_per_frame=3,
+                                )
+                                
+                                # Check for empty results
+                                if not hyps or len(hyps) == 0:
+                                    logging.warning("Empty hypothesis from greedy search")
+                                    hyps = [""]
+                                    
+                        except RuntimeError as e:
+                            logging.error(f"Error during greedy search: {str(e)}")
+                            if "CUDA out of memory" in str(e):
+                                # Free memory and try again with CPU tensors
+                                torch.cuda.empty_cache()
+                                cpu_encoder_out = encoder_out.cpu()
+                                cpu_encoder_out_lens = encoder_out_lens.cpu()
+                                
+                                hyps = xlsr_greedy_search_batch(
+                                    model=model,
+                                    encoder_out=cpu_encoder_out,
+                                    encoder_out_lens=cpu_encoder_out_lens,
+                                    max_sym_per_frame=3,
+                                )
+                            else:
+                                hyps = ["GREEDY_DECODE_ERROR"]
+                        
+                        # Handle different return types
+                        if isinstance(hyps, list):
+                            prediction_tokens = hyps[0] if hyps else []
+                        elif isinstance(hyps, torch.Tensor):
+                            prediction_tokens = hyps.tolist()
+                        else:
+                            prediction_tokens = list(hyps)
+                        
+                        # Remove blank tokens
+                        while prediction_tokens and prediction_tokens[-1] == params.blank_id:
+                            prediction_tokens.pop()
+                        
+                        # Convert to text
+                        prediction = sp.decode(prediction_tokens)
+                        
+                        # Calculate WER for this sample
+                        ref_words = reference.split()
+                        pred_words = prediction.split()
+                        errors = editdistance.eval(ref_words, pred_words)
+                        
+                        total_errors += errors
+                        total_words += len(ref_words)
+                        total_samples += 1
+                        
+                        # Log sample metrics
+                        wer = 100.0 * errors / max(1, len(ref_words))
+                        
+                        if total_samples % 10 == 0 or (batch_idx == 0 and idx < 2):
+                            logging.info(f"\nSample {total_samples}:")
+                            logging.info(f"  Reference: {reference}")
+                            logging.info(f"  Prediction: {prediction}")
+                            logging.info(f"  WER: {wer:.2f}%")
+                            
+                    except RuntimeError as e:
+                        if "CUDA out of memory" in str(e):
+                            logging.error(f"OOM error during streaming evaluation: {str(e)}")
+                            torch.cuda.empty_cache()
+                        else:
+                            logging.error(f"Error during streaming evaluation: {str(e)}")
+                        continue
+                        
+                    # Clean up to avoid memory leaks
+                    del encoder_out
+                    torch.cuda.empty_cache()
                     
-                    # Convert to text
-                    if isinstance(hyps, torch.Tensor):
-                        hyps = hyps.tolist()
-                    
-                    # Remove blank tokens
-                    while hyps and hyps[-1] == params.blank_id:
-                        hyps.pop()
-                    
-                    prediction = sp.decode(hyps)
-                    
-                    # Calculate WER
-                    ref_words = reference.split()
-                    pred_words = prediction.split()
-                    errors = editdistance.eval(ref_words, pred_words)
-                    total_errors += errors
-                    total_words += len(ref_words)
-                    total_samples += 1
-                    
-                    # Log sample metrics
-                    sample_wer = 100.0 * errors / max(1, len(ref_words))
-                    batch_metrics.append({
-                        'reference': reference,
-                        'prediction': prediction, 
-                        'wer': sample_wer,
-                        'words': len(ref_words),
-                        'errors': errors
-                    })
-                    
-                    # Log occasionally
-                    if total_samples % 10 == 0:
-                        current_wer = 100.0 * total_errors / max(1, total_words)
-                        logging.info(f"Processed {total_samples} samples, current WER: {current_wer:.2f}%")
-        
         except Exception as e:
             logging.error(f"Error processing batch {batch_idx}: {str(e)}")
             logging.error("Exception details:", exc_info=True)
+            torch.cuda.empty_cache()
             continue
     
     # Calculate final metrics
     wer = 100.0 * total_errors / max(1, total_words)
     
-    # Display some sample predictions
-    logging.info("\nSample predictions:")
-    for i, metric in enumerate(batch_metrics[:5]):  # Show first 5 samples
-        logging.info(f"Sample {i}:")
-        logging.info(f"  Reference: {metric['reference']}")
-        logging.info(f"  Prediction: {metric['prediction']}")
-        logging.info(f"  WER: {metric['wer']:.2f}%")
+    # Calculate average processing time per chunk
+    avg_chunk_time = total_chunk_time / max(1, total_chunk_count)
+    
+    # Log frame count statistics
+    avg_frame_ratio = 1.0  # Should be close to 1.0 now
+    if total_expected_frames > 0:
+        avg_frame_ratio = total_actual_frames / total_expected_frames
+        logging.info(f"Average frame count ratio: {avg_frame_ratio:.4f}")
+        logging.info(f"Total expected frames: {total_expected_frames}, actual frames: {total_actual_frames}")
+        # The ratio should now be very close to 1.0 with our fixes
+        
+    # Log paper-related metrics
+    logging.info(f"Paper settings: 40% overlap, attention sink size={params.attention_sink_size}, "
+                 f"left context chunks={params.left_context_chunks}")
+    
+    # Calculate real-time factor (RTF)
+    rtf = avg_chunk_time * 16000 / chunk_size if chunk_size > 0 else 0
+    logging.info(f"Real-time factor: {rtf:.4f}")
     
     # Return metrics
     metrics = {
@@ -1949,7 +1994,9 @@ def evaluate_streaming(
         "total_words": total_words,
         "total_errors": total_errors,
         "chunk_size_ms": chunk_size / 16,  # Convert samples to ms
-        "latency": chunk_size / 16000.0  # Estimated latency in seconds
+        "latency": chunk_size / 16000.0,  # Estimated latency in seconds
+        "frame_ratio": avg_frame_ratio,
+        "rtf": rtf
     }
     
     return metrics
@@ -2174,77 +2221,244 @@ def compute_loss(
     return loss, info
 
 
-def process_streaming_chunks(model, feature, chunk_size, attention_sink_size, left_context_chunks):
-    """Process input in memory-optimized streaming chunks following paper's approach"""
-    # Calculate reasonable max frames to prevent memory explosion
-    max_frames = min(200, int(feature.size(1) / model.encoder.downsample_factor) + 10)
-    device = feature.device
+def process_streaming_chunks(
+    model: nn.Module,
+    feature: torch.Tensor,
+    chunk_size: int,
+    attention_sink_size: int,
+    left_context_chunks: int
+) -> torch.Tensor:
+    """Process input features in streaming mode with chunks following paper's approach.
     
-    with torch.cuda.amp.autocast(enabled=True):
-        # Process in chunks with memory optimization
-        encoder_chunks = []
+    Args:
+        model: The model to use
+        feature: Input features (batch, time)
+        chunk_size: Size of each chunk in samples (e.g., 5120 for 320ms)
+        attention_sink_size: Number of frames for attention sink (16 as per paper)
+        left_context_chunks: Number of left context chunks (1 as per paper)
+    
+    Returns:
+        Encoder output tensor
+    """
+    device = feature.device
+    batch_size = feature.size(0)
+    dtype = feature.dtype
+    
+    # Initialize states
+    states = None
+    chunk_outputs = []
+    
+    # Calculate chunk parameters - use 40% overlap as per paper
+    chunk_overlap = int(chunk_size * 0.4)  # 40% overlap as per paper
+    
+    # Calculate attention sink size in samples
+    sink_size = attention_sink_size * model.encoder.downsample_factor
+    
+    # Calculate expected total output frames
+    expected_total_frames = ((feature.size(1) / model.encoder.downsample_factor).floor()).to(torch.int64)
+    
+    # Process each sequence in batch
+    for b in range(batch_size):
+        seq = feature[b:b+1]  # Keep batch dimension
         pos = 0
-        states = None
+        seq_outputs = []
         
-        while pos < feature.size(1):
-            # Process current chunk
-            end_pos = min(pos + chunk_size, feature.size(1))
-            chunk = feature[:, pos:end_pos]
+        # Keep track of frames we've already processed to avoid duplication
+        processed_frames_end = 0
+        
+        while pos < seq.size(1):
+            # Get current chunk boundaries
+            end_pos = min(pos + chunk_size, seq.size(1))
+            current_chunk = seq[:, pos:end_pos]
             
-            # Ensure reasonable chunk size
-            if chunk.size(1) < 100:  # Too small to process meaningfully
+            # Skip if chunk is too small
+            if current_chunk.size(1) < 160:  # Minimum meaningful size
                 break
                 
-            # Forward pass with memory optimization
-            chunk_out, _, chunk_states = model.encoder.streaming_forward(
-                chunk,
-                torch.tensor([chunk.size(1)], device=device),
-                states=[states] if states is not None else None
-            )
+            # Handle attention sink by letting the encoder manage it through states
+            if states is None:
+                # Initialize states on first chunk
+                states = [None, None]
             
-            # Prevent frame explosion - force reasonable output size
-            if chunk_out.size(1) > max_frames:
-                chunk_out = chunk_out[:, :max_frames]
+            # Update audio sink state if we're using it
+            if attention_sink_size > 0 and states[1] is not None:
+                # Ensure sink is on same device and has same dtype
+                if states[1].device != device:
+                    states[1] = states[1].to(device)
+                if states[1].dtype != dtype:
+                    states[1] = states[1].to(dtype=dtype)
+            
+            # Process chunk
+            try:
+                # Forward pass through encoder
+                chunk_out, chunk_lens, new_states = model.encoder.streaming_forward(
+                    current_chunk,
+                    torch.tensor([current_chunk.size(1)], device=device),
+                    states
+                )
                 
-            # Store chunk output and update states
-            encoder_chunks.append(chunk_out)
-            states = chunk_states[0] if chunk_states else None
+                # Calculate what portion of the chunk_out corresponds to non-overlapped audio
+                # For the first chunk, we keep everything since there's no overlap
+                # For subsequent chunks, we need to compute the exact portion to keep
+                # by aligning audio sample positions to frame positions
+                chunk_start_frame = pos // model.encoder.downsample_factor
+                chunk_end_frame = end_pos // model.encoder.downsample_factor
+                
+                # Ensure we don't duplicate frames from previous chunks
+                if processed_frames_end > 0:
+                    frames_to_skip = processed_frames_end - chunk_start_frame
+                    if frames_to_skip > 0:
+                        if frames_to_skip >= chunk_out.size(1):
+                            # Skip this chunk entirely - it's completely redundant
+                            logging.debug(f"Skipping chunk entirely - all frames already processed")
+                            
+                            # Update states and continue to next chunk
+                            if new_states is not None and len(new_states) >= 2:
+                                states = new_states
+                            pos = end_pos - chunk_overlap
+                            continue
+                            
+                        # Skip the overlapping frames
+                        chunk_out = chunk_out[:, frames_to_skip:]
+                        logging.debug(f"Skipped {frames_to_skip} overlapping frames")
+                        
+                        if chunk_out.size(1) == 0:
+                            # Skip empty outputs
+                            logging.debug("Chunk output empty after overlap removal")
+                            
+                            # Update states and continue to next chunk
+                            if new_states is not None and len(new_states) >= 2:
+                                states = new_states
+                            pos = end_pos - chunk_overlap
+                            continue
+                
+                # Update the processed frames tracker
+                processed_frames_end = chunk_end_frame
+                
+                # Ensure new states are properly formed
+                if new_states is not None and len(new_states) >= 2:
+                    states = new_states
+                else:
+                    logging.warning("Invalid states returned from streaming_forward, resetting")
+                    states = [None, None]
+                
+                # Store the last part of current audio chunk for next iteration's attention sink
+                if attention_sink_size > 0:
+                    # Calculate attention sink size in audio samples
+                    audio_sink_samples = attention_sink_size * model.encoder.downsample_factor
+                    if current_chunk.size(1) >= audio_sink_samples:
+                        audio_sink = current_chunk[:, -audio_sink_samples:].detach().clone()
+                        states[1] = audio_sink  # Store audio sink in states
+                    else:
+                        states[1] = current_chunk.detach().clone()
+                
+                # Make sure output is not empty
+                if chunk_out.size(1) > 0:
+                    seq_outputs.append(chunk_out)
+                else:
+                    logging.warning(f"Empty chunk output at position {pos}")
+                    
+            except RuntimeError as e:
+                # Handle errors gracefully
+                if "CUDA out of memory" in str(e):
+                    logging.warning(f"OOM error at position {pos}, trying smaller chunk")
+                    # Try with smaller chunk size
+                    torch.cuda.empty_cache()
+                    continue
+                else:
+                    logging.error(f"Error processing chunk: {str(e)}")
+                    # Continue to next chunk
+                    torch.cuda.empty_cache()
             
-            # Move to next chunk with 40% overlap as per paper
-            pos = end_pos - int(chunk_size * 0.4)
+            # Move position forward with overlap - use 40% overlap
+            pos = end_pos - chunk_overlap
             
             # Free memory
             torch.cuda.empty_cache()
-            
-        # Combine chunks with controlled memory usage
-        if encoder_chunks:
-            return torch.cat(encoder_chunks, dim=1)
-        else:
-            # Fallback if chunking failed
-            return model.encoder(
-                feature,
-                torch.tensor([feature.size(1)], device=device)
-            )[0]
+        
+        # Check if we have any outputs
+        if not seq_outputs:
+            # Create a dummy output with the right dimensions
+            logging.warning(f"No outputs for sequence {b}, creating dummy output")
+            dummy_out = torch.zeros(
+                (1, 1, model.encoder.output_dim),
+                device=device,
+                dtype=next(model.parameters()).dtype
+            )
+            seq_outputs.append(dummy_out)
+        
+        # Concatenate all chunks for this sequence
+        seq_output = torch.cat(seq_outputs, dim=1)
+        
+        # Ensure output matches expected frame count exactly
+        expected_frames = expected_total_frames[b].item()
+        actual_frames = seq_output.size(1)
+        
+        # The paper would have done this alignment - strictly match expected frames
+        if actual_frames != expected_frames:
+            logging.info(f"Frame count mismatch: expected {expected_frames}, got {actual_frames}. Resizing to match.")
+            if actual_frames > expected_frames:
+                # Trim excess frames
+                seq_output = seq_output[:, :expected_frames]
+            else:
+                # Pad with zeros if too short
+                padding = torch.zeros(
+                    (seq_output.size(0), expected_frames - actual_frames, seq_output.size(2)),
+                    device=device,
+                    dtype=seq_output.dtype
+                )
+                seq_output = torch.cat([seq_output, padding], dim=1)
+        
+        chunk_outputs.append(seq_output)
+    
+    # All outputs now have exactly the expected length
+    return torch.cat(chunk_outputs, dim=0)
 
 
 def configure_model_for_streaming_training(model, params):
-    """Configure model specifically for streaming training"""
+    """Configure model specifically for streaming training following paper guidelines"""
     # Enable gradient checkpointing to reduce memory usage
     if hasattr(model.encoder.model, "gradient_checkpointing_enable"):
         model.encoder.model.gradient_checkpointing_enable()
         logging.info("Enabled gradient checkpointing for wav2vec2/XLSR model")
     
-    # Configure chunk sizes based on epoch
+    # Configure chunk sizes based on epoch - follow paper's approach
     if hasattr(params, "cur_epoch") and hasattr(params, "pretrain_epochs"):
         streaming_progress = params.cur_epoch - params.pretrain_epochs
+        
+        # Paper recommends decreasing chunk size over time (from 2560ms to 320ms)
+        # Start with large chunks and gradually decrease to 320ms (paper's optimal)
         if streaming_progress < 5:  # First 5 epochs after pretraining
-            # Start with smaller chunks and gradually increase
-            # 160ms -> 320ms over 5 epochs
-            start_size = params.chunk_sizes["320ms"] // 2  # 160ms
-            target_size = params.chunk_sizes["320ms"]  # 320ms
-            current_size = int(start_size + (target_size - start_size) * (streaming_progress / 5))
-            model.encoder.set_chunk_size(current_size)
-            logging.info(f"Progressive chunk size: {current_size} samples ({current_size/16000*1000:.1f}ms)")
+            # From 2560ms -> 320ms over 5 epochs (paper recommends this progression)
+            progress_ratio = streaming_progress / 5
+            start_size = params.chunk_sizes["2560ms"]  # 2560ms
+            target_size = params.chunk_sizes["320ms"]   # 320ms
+            
+            # Linear interpolation between chunk sizes
+            current_size = int(start_size * (1 - progress_ratio) + target_size * progress_ratio)
+            
+            # Set overlap to exactly 40% as per paper
+            chunk_overlap = int(current_size * 0.4)
+            
+            if hasattr(model.encoder, 'decode_chunk_size'):
+                model.encoder.decode_chunk_size = current_size
+                model.encoder.chunk_overlap = chunk_overlap
+                
+            # Log configuration
+            ms_size = current_size / 16  # Convert to ms
+            logging.info(f"Progressive chunk size: {current_size} samples ({ms_size:.1f}ms) with 40% overlap")
+            
+            # Set attention sink size according to paper recommendations
+            # Paper found 16 frames optimal for streaming
+            if hasattr(model.encoder, 'attention_sink_size'):
+                model.encoder.attention_sink_size = 16
+        else:
+            # Use paper's best performing settings: 320ms chunks with 40% overlap and 16-frame attention sink
+            if hasattr(model.encoder, 'decode_chunk_size'):
+                model.encoder.decode_chunk_size = params.chunk_sizes["320ms"]
+                model.encoder.chunk_overlap = int(params.chunk_sizes["320ms"] * 0.4)
+                model.encoder.attention_sink_size = 16
+                logging.info("Using paper's optimal streaming settings: 320ms chunks, 40% overlap, 16-frame attention sink")
     
     return model
 

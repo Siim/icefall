@@ -53,7 +53,7 @@ class XLSREncoder(EncoderInterface):
         self, 
         model_name: str = "TalTechNLP/xls-r-300m-et",
         decode_chunk_size: int = 5120,  # 320ms at 16kHz (paper's best performing)
-        chunk_overlap: int = None,  # Will be set to decode_chunk_size // 2
+        chunk_overlap: int = None,  # Will be set to 40% of decode_chunk_size
         use_attention_sink: bool = True,
         attention_sink_size: int = 16,  # Paper's optimal setting
         frame_duration: float = 0.025,  # 25ms per frame (from paper)
@@ -85,7 +85,7 @@ class XLSREncoder(EncoderInterface):
         
         # Streaming parameters
         self.decode_chunk_size = decode_chunk_size
-        self.chunk_overlap = chunk_overlap if chunk_overlap is not None else decode_chunk_size // 2
+        self.chunk_overlap = chunk_overlap if chunk_overlap is not None else int(decode_chunk_size * 0.4)  # 40% overlap per paper
         self.min_chunk_size = min_chunk_size
         self.max_chunk_size = max_chunk_size
         self.left_context_chunks = left_context_chunks
@@ -313,7 +313,7 @@ class XLSREncoder(EncoderInterface):
         Args:
             x: Input tensor (batch, time) or (batch, time, 1)
             x_lens: Length of each sequence in batch
-            states: Optional cached states from previous chunk
+            states: Optional cached states from previous chunk [left_context, audio_sink]
         Returns:
             (encoder_out, encoder_out_lens, next_states)
         """
@@ -323,48 +323,51 @@ class XLSREncoder(EncoderInterface):
             x = x.squeeze(-1)
         assert x.ndim == 2, f"Expected 2D input (batch, time), got shape {x.shape}"
         
+        # Validate x_lens
+        if isinstance(x_lens, int):
+            x_lens = torch.tensor([x_lens], device=x.device)
+        elif not isinstance(x_lens, torch.Tensor):
+            x_lens = torch.tensor(x_lens, device=x.device)
+        
+        # Ensure x_lens is on the same device as x
+        if x_lens.device != x.device:
+            x_lens = x_lens.to(x.device)
+        
         # Clamp values silently since inputs are already normalized
         x = torch.clamp(x, min=-1.0, max=1.0)
         
         # Store original input for context updates
         original_x = x.clone()
-        original_x_lens = x_lens.clone()
         
-        # Calculate expected output length before adding context
-        # Account for overlap and context frames precisely
-        chunk_overlap = self.decode_chunk_size // 2
-        context_frames = 0
-        
-        # For subsequent chunks, adjust for overlap
-        if states is not None and states[0] is not None:
-            effective_input_len = x_lens - chunk_overlap
-            # Add small correction factor for chunk boundary alignment
-            boundary_correction = self.downsample_factor // 16  # 20 samples at 16kHz
-            effective_input_len = effective_input_len + boundary_correction
-        else:
-            # For first chunk, use full length
-            effective_input_len = x_lens
-            
-        # Calculate expected frames precisely using ceil instead of floor
-        expected_frames = ((effective_input_len.float() / self.downsample_factor).ceil()).to(torch.int64)
+        # Calculate expected output length for this chunk precisely
+        # This is the exact target length after processing
+        expected_frames = ((x_lens.float() / self.downsample_factor).floor()).to(torch.int64)
         expected_frames = torch.maximum(expected_frames, torch.ones_like(expected_frames))
         
-        # Add left context if available
-        context_added = False
-        if self.left_context_chunks > 0 and self.left_context_buffer:
-            x = self.prepare_left_context(x)
-            context_added = True
-            context_frames += self.left_context_chunks * (self.decode_chunk_size // self.downsample_factor)
-        
-        # Add attention sink if enabled
-        if self.use_attention_sink:
-            x, new_sink_cache = self.prepare_attention_sink(x, self.attention_sink_cache)
-            if self.attention_sink_cache is not None:
-                context_added = True
-                context_frames += self.attention_sink_size
-        else:
-            new_sink_cache = None
+        # Get audio sink from states if available
+        audio_sink = None
+        if states is not None and len(states) > 1 and states[1] is not None:
+            audio_sink = states[1]  # Get audio sink from states
             
+            # Check if audio_sink is on the same device
+            if audio_sink.device != x.device:
+                audio_sink = audio_sink.to(x.device)
+                
+            # Check data type compatibility
+            if audio_sink.dtype != x.dtype:
+                audio_sink = audio_sink.to(dtype=x.dtype)
+                
+            # Add audio sink to current chunk if available
+            if audio_sink is not None and self.use_attention_sink:
+                # Verify dimensions are compatible for concatenation
+                if audio_sink.dim() != x.dim():
+                    logging.warning(f"Dimension mismatch: audio_sink {audio_sink.shape}, x {x.shape}")
+                    audio_sink = audio_sink.reshape(x.size(0), -1)
+                    
+                x = torch.cat([audio_sink, x], dim=1)
+                # Adjust lens to account for the added audio sink
+                x_lens = x_lens + audio_sink.size(1)
+        
         # Process through XLSR model
         outputs = self.model(
             x,
@@ -374,51 +377,51 @@ class XLSREncoder(EncoderInterface):
             return_dict=False
         )[0]
         
-        # Update left context buffer with original input
-        self.left_context_buffer.append(original_x.clone())
-        if len(self.left_context_buffer) > self.left_context_chunks:
-            self.left_context_buffer.pop(0)
+        # Calculate output lengths considering downsampling
+        output_lengths = ((x_lens.float() / self.downsample_factor).floor()).to(torch.int64)
+        output_lengths = torch.maximum(output_lengths, torch.ones_like(output_lengths))
         
-        # Remove context frames from output if context was added
-        if context_added and context_frames > 0 and outputs.size(1) > context_frames:
-            outputs = outputs[:, context_frames:]
+        # Remove audio sink frames from output if they were added
+        if audio_sink is not None and self.use_attention_sink:
+            # Calculate how many encoder frames the audio sink corresponds to
+            sink_frames = (audio_sink.size(1) + self.downsample_factor - 1) // self.downsample_factor
+            if outputs.size(1) > sink_frames:
+                outputs = outputs[:, sink_frames:]
+                output_lengths = output_lengths - sink_frames
         
-        # Ensure outputs match expected length precisely
-        max_len = expected_frames.max().item()
-        if outputs.size(1) > max_len:
-            # Calculate optimal start position to minimize edge effects
-            extra = outputs.size(1) - max_len
-            # Bias towards keeping more recent frames for streaming
-            start = (extra * 2) // 3  # Take more frames from the end
-            outputs = outputs[:, start:start + max_len]
-        elif outputs.size(1) < max_len and outputs.size(1) > 0:  # Only pad if we have some frames
-            # Calculate required padding
-            pad_len = max_len - outputs.size(1)
-            # Add padding at the end to maintain temporal order
-            outputs = torch.nn.functional.pad(
-                outputs,
-                (0, 0, 0, pad_len),
-                mode='replicate'  # Replicate last frame instead of zeros
-            )
-        elif outputs.size(1) == 0:  # Handle empty tensor case
-            # Create a tensor of the expected size filled with zeros
-            outputs = torch.zeros(
-                (outputs.size(0), max_len, outputs.size(2)),
-                device=outputs.device,
-                dtype=outputs.dtype
-            )
+        # Prepare new audio sink from end of current chunk following paper's approach
+        new_audio_sink = None
+        if self.use_attention_sink:
+            # Calculate attention sink size in audio samples (16 frames * downsample factor)
+            audio_sink_samples = self.attention_sink_size * self.downsample_factor
+            if original_x.size(1) >= audio_sink_samples:
+                # Paper recommends taking last N frames for attention sink
+                new_audio_sink = original_x[:, -audio_sink_samples:].detach().clone()
+            else:
+                # If chunk is smaller than sink size, use the entire chunk
+                new_audio_sink = original_x.detach().clone()
         
-        # Apply smooth transition if we have previous output
-        if self.last_chunk_output is not None:
-            outputs = self.smooth_transition(outputs, self.last_chunk_output)
+        # Ensure outputs strictly match expected frame count
+        if outputs.size(1) != expected_frames.max().item():
+            # Paper would have aligned exactly to expected frames
+            # (although they don't explicitly mention this)
+            max_len = expected_frames.max().item()
+            if outputs.size(1) > max_len:
+                logging.debug(f"Trimming encoder output from {outputs.size(1)} to {max_len} frames")
+                outputs = outputs[:, :max_len]
+            elif outputs.size(1) < max_len:
+                # Pad if necessary, though this should rarely happen
+                pad_len = max_len - outputs.size(1)
+                outputs = torch.nn.functional.pad(
+                    outputs, 
+                    (0, 0, 0, pad_len), 
+                    mode='replicate'  # Repeat last frame rather than using zeros
+                )
         
-        # Cache current output for next chunk
-        self.last_chunk_output = outputs.clone()
+        # Update states for next chunk - we store left context and audio sink
+        next_states = [None, new_audio_sink]
         
-        # Update states for next chunk
-        next_states = [original_x.clone(), new_sink_cache]
-        
-        return outputs, expected_frames, next_states
+        return outputs, output_lengths, next_states
 
     def forward(
         self,

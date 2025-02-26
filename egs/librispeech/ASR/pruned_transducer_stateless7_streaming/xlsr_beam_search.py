@@ -209,6 +209,18 @@ class XLSRTransducerBeamSearch:
             
             # Process each encoder frame
             for t in range(length):
+                # Check for empty beam or invalid scores
+                if not beam or any(math.isnan(hyp.score) for hyp in beam):
+                    self.logger.warning(f"Beam search encountered invalid state at frame {t}, returning fallback hypothesis")
+                    # Create a fallback hypothesis with just the blank ID
+                    beam = [Hypothesis(
+                        tokens=[self.blank_id],
+                        score=0.0,
+                        decoder_out=None,
+                        timestamps=[t] if return_timestamps else None
+                    )]
+                    break  # Stop processing and return what we have
+                    
                 # Check for early stopping conditions if enabled
                 if early_stopping:
                     # Check if beam hasn't changed significantly

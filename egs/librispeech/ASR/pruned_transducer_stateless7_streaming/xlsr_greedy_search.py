@@ -49,189 +49,130 @@ def greedy_search(
       If return_timestamps is False, return the decoded result.
       Else, return a DecodingResults object with decoded result and timestamps.
     """
-    assert encoder_out.ndim == 3, f"Expected 3D encoder output, got shape {encoder_out.shape}"
-    assert encoder_out.size(0) == 1, f"Expected batch size 1, got {encoder_out.size(0)}"
-    
-    # Get model parameters
-    blank_id = model.decoder.blank_id
-    context_size = model.decoder.context_size
-    
-    # Get device
-    device = next(model.parameters()).device
-    
-    # Create initial decoder input
-    decoder_input = torch.tensor(
-        [-1] * (context_size - 1) + [blank_id], 
-        device=device, 
-        dtype=torch.int64
-    ).reshape(1, context_size)
-    
-    # Project decoder output
-    decoder_out = model.decoder(decoder_input, need_pad=False)
-    decoder_out = model.joiner.decoder_proj(decoder_out)
-    
-    # Project encoder output for XLSR
-    encoder_out = model.joiner.encoder_proj(encoder_out)
-    
-    # Get sequence length
-    T = encoder_out.size(1)
-    
-    # Initialize hypothesis
-    hyp = [blank_id] * context_size
-    
-    # Initialize counters and buffers
-    t = 0  # Current frame index
-    sym_per_frame = 0  # Symbols emitted in current frame
-    sym_per_utt = 0  # Symbols emitted in total
-    timestamp = []  # Timestamps for when tokens were emitted
-    
-    # Repetition detection
-    n_gram_counters = {
-        2: Counter(),  # Count 2-grams
-        3: Counter(),  # Count 3-grams
-        4: Counter(),  # Count 4-grams
-    }
-    recent_tokens = []  # Keep track of recent tokens (max 8)
-    consecutive_blanks = 0  # Count consecutive blank tokens
-    token_diversity = set()  # Track unique tokens
-    
-    # Process each frame
-    while t < T and sym_per_utt < max_output_length:
-        # Check if we've reached the limit for the current frame
-        if sym_per_frame >= max_sym_per_frame:
-            sym_per_frame = 0
-            t += 1
-            continue
+    try:
+        assert encoder_out.ndim == 3, f"Expected 3D encoder output, got shape {encoder_out.shape}"
+        assert encoder_out.size(0) == 1, f"Expected batch size 1, got {encoder_out.size(0)}"
         
-        try:
-            # Get current encoder output and prepare for joiner
-            current_encoder_out = encoder_out[:, t:t+1, :].unsqueeze(2)
+        # Check for NaN values in encoder output
+        if torch.isnan(encoder_out).any():
+            logging.warning("NaN values detected in encoder output. Using fallback empty result.")
+            if return_timestamps:
+                return DecodingResults(hyps=[], timestamps=[])
+            else:
+                return []
+        
+        # Get model parameters
+        blank_id = model.decoder.blank_id
+        context_size = model.decoder.context_size
+        
+        # Get device
+        device = next(model.parameters()).device
+        
+        # Create initial decoder input
+        decoder_input = torch.tensor(
+            [-1] * (context_size - 1) + [blank_id], 
+            device=device, 
+            dtype=torch.int64
+        ).reshape(1, context_size)
+        
+        # Project decoder output
+        decoder_out = model.decoder(decoder_input, need_pad=False)
+        decoder_out = model.joiner.decoder_proj(decoder_out)
+        
+        # Project encoder output for XLSR
+        encoder_out = model.joiner.encoder_proj(encoder_out)
+        
+        # Get sequence length
+        T = encoder_out.size(1)
+        
+        # Initialize hypothesis
+        hyp = [blank_id]  # Start with blank
+        timestamps = [0] if return_timestamps else None
+        
+        # Token repetition tracking
+        last_token = blank_id
+        
+        # Process each encoder frame
+        for t in range(T):
+            # Skip if we've reached max output length
+            if len(hyp) >= max_output_length:
+                logging.warning(f"Reached maximum output length ({max_output_length}). Stopping early.")
+                break
+                
+            # Get current frame
+            encoder_frame = encoder_out[:, t:t+1]
             
-            # Join encoder and decoder outputs
+            # Joint network forward pass
             logits = model.joiner(
-                current_encoder_out, 
-                decoder_out.unsqueeze(1), 
+                encoder_frame, 
+                decoder_out, 
                 project_input=False
-            ).squeeze(0).squeeze(0)  # Remove batch dims
-            
-            # Get vocabulary size
-            vocab_size = logits.size(0)
+            )
             
             # Apply blank penalty
-            if blank_penalty != 0:
-                logits[blank_id] -= blank_penalty
-            
-            # Apply repetition penalties - ensure tokens are within vocabulary bounds
-            if len(recent_tokens) > 0:
-                # Trim recent tokens list to last 8 tokens
-                if len(recent_tokens) > 8:
-                    recent_tokens = recent_tokens[-8:]
+            if blank_penalty != 0.0:
+                logits[0, 0, 0, blank_id] += blank_penalty
                 
-                # Safely penalize recently seen tokens
-                for token in recent_tokens:
-                    if token != blank_id and 0 <= token < vocab_size:
-                        logits[token] /= repetition_penalty
+            # Check for NaN values
+            if torch.isnan(logits).any():
+                logging.warning(f"NaN values in joint output at frame {t}. Skipping frame.")
+                continue
                 
-                # Extra penalty for the immediately preceding token
-                last_token = recent_tokens[-1]
-                if last_token != blank_id and 0 <= last_token < vocab_size:
-                    logits[last_token] /= 1.5  # Additional penalty for immediate repetition
+            # Apply repetition penalty if needed
+            if repetition_penalty > 1.0 and last_token != blank_id:
+                # Penalize repetition of the last non-blank token
+                logits[0, 0, 0, last_token] /= repetition_penalty
             
-            # Check for severe repetition patterns
-            severe_repetition = False
-            if len(hyp) > context_size + 4:
-                try:
-                    # Check for n-gram repetitions
-                    for n, counter in n_gram_counters.items():
-                        if len(hyp) >= context_size + n:
-                            # Create n-gram from the most recent tokens
-                            ng = tuple(hyp[-n:])
-                            if ng in counter and counter[ng] > 3:  # If we've seen this n-gram more than 3 times
-                                severe_repetition = True
-                                break
+            # Get probabilities
+            probs = torch.softmax(logits[0, 0, 0], dim=0)
+            
+            # Get token with highest probability
+            max_prob, max_idx = torch.max(probs, dim=0)
+            token_id = max_idx.item()
+            
+            # Add symbol and update context
+            if token_id != blank_id:
+                # Skip if we've reached max symbols for this frame
+                if sum(1 for i in range(len(hyp)) if timestamps and timestamps[i] == t) >= max_sym_per_frame:
+                    continue
                     
-                    # Check token diversity ratio
-                    if len(token_diversity) > 0 and sym_per_utt > 20:
-                        diversity_ratio = len(token_diversity) / sym_per_utt
-                        if diversity_ratio < 0.2:  # Less than 20% unique tokens
-                            severe_repetition = True
-                except Exception as e:
-                    logging.warning(f"Error checking repetition patterns: {e}")
-                    # Continue without repetition detection if it fails
-            
-            # Hard-stop for severe repetition - favor blank token
-            if severe_repetition:
-                logits[:] = float('-inf')
-                logits[blank_id] = 0.0
-            
-            # Get predicted token
-            y = logits.argmax().item()
-            
-            # Update state based on predicted token
-            if y == blank_id:
-                consecutive_blanks += 1
-                # Early stopping if too many consecutive blanks
-                if consecutive_blanks > 20:
-                    break
-                # Move to next frame after blank
-                sym_per_frame = 0
-                t += 1
-            else:
-                # Non-blank token
-                consecutive_blanks = 0
-                
                 # Add token to hypothesis
-                hyp.append(y)
-                timestamp.append(t)
-                token_diversity.add(y)
+                hyp.append(token_id)
+                if timestamps is not None:
+                    timestamps.append(t)
                 
-                # Add token to recent tokens list
-                recent_tokens.append(y)
+                # Update last token
+                last_token = token_id
                 
-                # Update n-gram counters for repetition detection
-                try:
-                    for n in n_gram_counters:
-                        if len(hyp) >= context_size + n:
-                            n_gram = tuple(hyp[-n:])
-                            n_gram_counters[n][n_gram] += 1
-                except Exception as e:
-                    logging.warning(f"Error updating n-gram counters: {e}")
+                # Update decoder input and output
+                decoder_input = torch.tensor(
+                    hyp[-context_size:] if len(hyp) >= context_size else ([-1] * (context_size - len(hyp)) + hyp),
+                    device=device,
+                    dtype=torch.int64
+                ).reshape(1, context_size)
                 
-                # Prepare decoder for next step
-                try:
-                    decoder_input = torch.tensor([hyp[-context_size:]], device=device).reshape(
-                        1, context_size
-                    )
-                    
-                    decoder_out = model.decoder(decoder_input, need_pad=False)
-                    decoder_out = model.joiner.decoder_proj(decoder_out)
-                    
-                    # Update counters
-                    sym_per_utt += 1
-                    sym_per_frame += 1
-                except Exception as e:
-                    logging.warning(f"Error updating decoder: {e}")
-                    # If decoder update fails, move to next frame
-                    sym_per_frame = 0
-                    t += 1
-        
-        except Exception as e:
-            logging.warning(f"Error during greedy search: {e}")
-            # Move to next frame on error
-            sym_per_frame = 0
-            t += 1
-    
-    # Remove context from final hypothesis
-    hyp = hyp[context_size:]
-    
-    # Format and return results
-    if not return_timestamps:
-        return hyp
-    else:
-        return DecodingResults(
-            hyps=[hyp],
-            timestamps=[timestamp],
-        )
+                decoder_out = model.decoder(decoder_input, need_pad=False)
+                decoder_out = model.joiner.decoder_proj(decoder_out)
+            
+        # Remove initial blank
+        if hyp[0] == blank_id:
+            hyp = hyp[1:]
+            if timestamps is not None:
+                timestamps = timestamps[1:]
+            
+        # Return appropriate result format
+        if return_timestamps:
+            return DecodingResults(hyps=hyp, timestamps=timestamps)
+        else:
+            return hyp
+            
+    except Exception as e:
+        logging.error(f"Error in greedy search: {str(e)}")
+        # Return fallback result
+        if return_timestamps:
+            return DecodingResults(hyps=[], timestamps=[])
+        else:
+            return []
 
 
 def greedy_search_batch(

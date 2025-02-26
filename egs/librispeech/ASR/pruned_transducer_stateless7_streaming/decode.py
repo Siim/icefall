@@ -176,17 +176,16 @@ class StreamingEncoder:
         self.reset()
 
     def reset(self):
-        """Reset the streaming state"""
+        """Reset all streaming state variables"""
         if hasattr(self.encoder, 'reset_streaming_state'):
             self.encoder.reset_streaming_state()
         self.cached_features = None
         self.cached_len = 0
         self.current_chunk_size = self.chunk_size
         self.last_chunk_latency = 0
-        self.streaming_state = None
+        self.streaming_state = [None, None, None]  # Updated to [left_context, audio_sink, last_chunk_output]
         self.attention_sink_cache = None
         self.context_cache = None
-        self.last_chunk_output = None
         self.left_context_buffer = []  # Store left context chunks
 
     def forward(self, x: torch.Tensor, x_lens: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -226,7 +225,18 @@ class StreamingEncoder:
             
             # Process chunk
             chunk_len = torch.tensor([chunk.shape[1]], dtype=torch.int32)
-            chunk_out, chunk_lens = self.encoder(chunk, chunk_len)
+            
+            # Check if the encoder has streaming_forward method (for XLSR)
+            if hasattr(self.encoder, 'streaming_forward'):
+                # Use streaming_forward with state for XLSR encoder
+                chunk_out, chunk_lens, updated_state = self.encoder.streaming_forward(
+                    chunk, chunk_len, self.streaming_state
+                )
+                # Update streaming state with the new state
+                self.streaming_state = updated_state
+            else:
+                # Fallback to regular forward for other encoders
+                chunk_out, chunk_lens = self.encoder(chunk, chunk_len)
             
             # Update attention sink cache
             if self.use_attention_sink:

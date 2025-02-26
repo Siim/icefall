@@ -340,7 +340,7 @@ def main():
         streaming_outputs = []  # For text output
         streaming_encodings = []  # For encoder outputs (needed for plotting)
         chunk_size = args.chunk_size
-        chunk_overlap = chunk_size // 2
+        chunk_overlap = int(chunk_size * 0.15)
         effective_chunk_size = chunk_size - chunk_overlap
         
         # Calculate number of chunks

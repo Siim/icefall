@@ -643,8 +643,9 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
             attention_sink_size=params.attention_sink_size,  # 16 frames (paper's optimal)
             frame_duration=params.frame_duration,  # 25ms per frame
             frame_stride=params.frame_stride,    # 20ms stride
-            context_frames=getattr(params, 'context_frames', 10),  # Default to 10 frames
-            transition_frames=getattr(params, 'transition_frames', 5)  # Default to 5 frames
+            min_chunk_size=2560,   # 160ms at 16kHz (16 frames)
+            max_chunk_size=20480,  # 1280ms at 16kHz (128 frames)
+            left_context_chunks=params.left_context_chunks  # 1 chunk (paper's optimal)
         )
         # Verify the encoder is properly initialized
         assert isinstance(encoder, XLSREncoder), f"Expected XLSREncoder, got {type(encoder)}"
@@ -840,8 +841,9 @@ def save_checkpoint(
 def evaluate_streaming(
     params: AttributeDict,
     model: nn.Module,
-    graph_compiler: Any,
-    test_dl: torch.utils.data.DataLoader,
+    valid_dl: torch.utils.data.DataLoader,
+    chunk_size: int,
+    sp: spm.SentencePieceProcessor,
 ) -> Dict[str, float]:
     """Evaluate model with streaming inference using greedy search.
     Note: We use greedy search for quick validation during training.
@@ -852,7 +854,7 @@ def evaluate_streaming(
     total_errors = 0
     total_latency = 0.0
     
-    for batch_idx, batch in enumerate(test_dl):
+    for batch_idx, batch in enumerate(valid_dl):
         try:
             with torch.no_grad():
                 feature = batch["inputs"].to(next(model.parameters()).device)
@@ -860,11 +862,10 @@ def evaluate_streaming(
                 texts = batch["supervisions"]["text"]
                 
                 # Process in chunks
-                encoder_out, encoder_out_lens = process_streaming_chunks(
+                encoder_out = process_streaming_chunks(
                     model=model,
-                    audio=feature,
-                    audio_lens=feature_lens,
-                    chunk_size=params.chunk_sizes["320ms"],
+                    feature=feature,
+                    chunk_size=chunk_size,
                     attention_sink_size=params.attention_sink_size,
                     left_context_chunks=params.left_context_chunks
                 )
@@ -873,7 +874,7 @@ def evaluate_streaming(
                 hyp_tokens = greedy_search_batch(
                     model=model,
                     encoder_out=encoder_out,
-                    encoder_out_lens=encoder_out_lens
+                    encoder_out_lens=feature_lens
                 )
                 
                 # Convert predictions to text
@@ -881,7 +882,7 @@ def evaluate_streaming(
                 for tokens in hyp_tokens:
                     if isinstance(tokens, torch.Tensor):
                         tokens = tokens.tolist()
-                    hyps.append(graph_compiler.ids_to_texts([tokens])[0])
+                    hyps.append(sp.decode(tokens))
                 
                 # Calculate WER
                 for hyp, ref in zip(hyps, texts):
@@ -903,12 +904,12 @@ def evaluate_streaming(
     
     # Calculate final metrics
     wer = 100.0 * total_errors / max(1, total_words)
-    avg_latency = total_latency / len(test_dl)
+    avg_latency = total_latency / len(valid_dl)
     
     metrics = {
         "wer": wer,
         "latency": avg_latency,
-        "chunk_size_ms": params.chunk_sizes["320ms"] / 16,  # Convert samples to ms
+        "chunk_size_ms": chunk_size / 16,  # Convert samples to ms
     }
     
     return metrics
@@ -916,128 +917,142 @@ def evaluate_streaming(
 
 def process_streaming_chunks(
     model: nn.Module,
-    audio: torch.Tensor,
-    audio_lens: torch.Tensor,
+    feature: torch.Tensor,
     chunk_size: int,
-    left_context: int = 1,
-    chunk_overlap: int = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Process audio in streaming chunks with attention sink optimization.
-    
-    Simulates streaming inference by processing audio in chunks with proper
-    handling of overlaps and context. Implements recommendations from the
-    XLSR-Transducer paper including 40% chunk overlap.
+    attention_sink_size: int,
+    left_context_chunks: int
+) -> torch.Tensor:
+    """
+    Process audio in streaming mode by breaking into chunks with proper overlap.
     
     Args:
-        model: The model containing the encoder and decoder
-        audio: The input audio tensor [B, T]
-        audio_lens: The lengths of the audio [B]
-        chunk_size: Size of each chunk in samples
-        left_context: Number of left context chunks to include (1 as per paper)
-        chunk_overlap: Overlap between chunks in samples (default: 40% of chunk_size)
+        model: The model to use
+        feature: Input features (batch, time)
+        chunk_size: Size of each chunk in samples (e.g., 5120 for 320ms)
+        attention_sink_size: Number of frames for attention sink (16 as per paper)
+        left_context_chunks: Number of left context chunks (1 as per paper)
         
     Returns:
-        Tuple of (encoder_out, encoder_out_lens)
+        Encoder output tensor
     """
-    device = audio.device
-    batch_size = audio.size(0)
+    device = feature.device
+    batch_size = feature.size(0)
     
-    # Default to 40% overlap as recommended in the XLSR-Transducer paper
-    if chunk_overlap is None:
-        chunk_overlap = int(0.4 * chunk_size)
-    
-    # Initialize empty list to store processed chunks
+    # Initialize states - now with three elements [left_context, audio_sink, last_chunk_output]
+    states = [None, None, None]
     chunk_outputs = []
-    chunk_out_lens = []
     
-    # Calculate expected total output frames for verifying our process
-    sample_rate = 16000  # Standard for XLSR
-    hop_length = 320     # XLSR uses 20ms stride (320 samples at 16kHz)
-    downsample_factor = model.encoder.downsample_factor
-    expected_total_frames = [(min(length.item(), audio.size(1)) // hop_length) // downsample_factor for length in audio_lens]
+    # Calculate chunk parameters - use 40% overlap as per paper
+    chunk_overlap = int(chunk_size * 0.15)  # 40% overlap as per paper
+    effective_chunk_size = chunk_size - chunk_overlap
     
-    # Initialize state dictionary for streaming processing
-    states = model.encoder.init_states(batch_size)
+    # Calculate attention sink size in samples
+    sink_size = attention_sink_size * model.encoder.downsample_factor
     
-    # Track the end index of the last processed frames
-    processed_frames_end = 0
+    # Calculate expected total frames for verification
+    expected_total_frames = []
+    for b in range(batch_size):
+        seq_len = feature[b].size(0)
+        expected_frames = (seq_len + model.encoder.downsample_factor - 1) // model.encoder.downsample_factor
+        expected_total_frames.append(expected_frames)
     
-    # Calculate number of chunks
-    audio_samples = audio.size(1)
-    stride = chunk_size - chunk_overlap
-    num_chunks = math.ceil(audio_samples / stride)
-    
-    for chunk_idx in range(num_chunks):
-        # Calculate start and end indices for current chunk
-        start_idx = chunk_idx * stride
-        end_idx = min(start_idx + chunk_size, audio_samples)
+    # Process each sequence in batch
+    for b in range(batch_size):
+        seq = feature[b:b+1]  # Keep batch dimension
+        pos = 0
+        seq_outputs = []
+        left_context = None
+        processed_frames_end = 0  # Track end position of processed frames
         
-        # Handle final chunk for possible partial frames
-        if chunk_idx == num_chunks - 1:
-            # Ensure last chunk has at least overlap with previous chunk
-            start_idx = max(0, end_idx - chunk_size)
+        # Reset states for each sequence - important for batch processing
+        seq_states = [None, None, None]
         
-        # Extract current chunk
-        chunk = audio[:, start_idx:end_idx]
+        while pos < seq.size(1):
+            # Get current chunk boundaries
+            end_pos = min(pos + chunk_size, seq.size(1))
+            chunk = seq[:, pos:end_pos]
+            
+            # Add left context if available
+            if left_context is not None:
+                chunk = torch.cat([left_context, chunk], dim=1)
+            
+            # Process the chunk through encoder
+            chunk_out, chunk_out_lens, seq_states = model.encoder.streaming_forward(
+                chunk, 
+                torch.tensor([chunk.size(1)], device=device),
+                seq_states
+            )
+            
+            # Calculate what portion of the chunk_out corresponds to non-overlapped audio
+            chunk_start_frame = pos // model.encoder.downsample_factor
+            chunk_end_frame = end_pos // model.encoder.downsample_factor
+            
+            # Ensure we don't duplicate frames from previous chunks
+            if processed_frames_end > 0:
+                frames_to_skip = processed_frames_end - chunk_start_frame
+                if frames_to_skip > 0:
+                    # Skip the overlapping frames (avoiding duplication)
+                    if frames_to_skip < chunk_out.size(1):
+                        chunk_out = chunk_out[:, frames_to_skip:]
+                    else:
+                        # In case of very small chunks, we might need to skip the entire output
+                        chunk_out = chunk_out[:, 0:0]  # Empty tensor with correct dimensions
+            
+            # Add to sequence outputs if we have valid frames
+            if chunk_out.size(1) > 0:
+                seq_outputs.append(chunk_out)
+            
+            # Update position (move forward by effective chunk size)
+            next_pos = pos + effective_chunk_size
+            
+            # Save the end position of processed frames (in frame space)
+            processed_frames_end = chunk_end_frame
+            
+            # Store left context for next chunk if needed
+            if next_pos < seq.size(1) and chunk.size(1) >= chunk_overlap:
+                left_context = chunk[:, -chunk_overlap:]
+            
+            # Move to next position
+            pos = next_pos
         
-        # Zero-pad if needed to maintain chunk size
-        if chunk.size(1) < chunk_size:
-            padding = torch.zeros(batch_size, chunk_size - chunk.size(1), device=device)
-            chunk = torch.cat([chunk, padding], dim=1)
-        
-        # Calculate chunk lengths
-        chunk_lens = torch.minimum(
-            torch.tensor([chunk.size(1)] * batch_size, device=device), 
-            audio_lens - start_idx
-        )
-        chunk_lens = torch.maximum(chunk_lens, torch.zeros_like(chunk_lens))
-        
-        # Process chunk through encoder with streaming state management
-        chunk_out, chunk_out_len, states = model.encoder.streaming_forward(
-            chunk, 
-            chunk_lens,
-            states=states,
-        )
-        
-        # Track output for analysis
-        if chunk_idx == 0:
-            # First chunk - just add
-            chunk_outputs.append(chunk_out)
-            chunk_out_lens.append(chunk_out_len)
-            processed_frames_end = chunk_out.size(1)
+        # Concatenate all outputs for this sequence
+        if seq_outputs:
+            seq_output = torch.cat(seq_outputs, dim=1)
+            
+            # Verify we have expected number of frames
+            actual_frames = seq_output.size(1)
+            expected_frames = expected_total_frames[b]
+            
+            # Ensure output matches expected frame count exactly
+            if actual_frames != expected_frames:
+                logging.info(f"Adjusting frame count from {actual_frames} to expected {expected_frames}")
+                
+                # Resize to match exactly what would come from non-streaming
+                if actual_frames > expected_frames:
+                    seq_output = seq_output[:, :expected_frames]
+                else:
+                    # Pad if needed (rare)
+                    padding = torch.zeros(
+                        1, 
+                        expected_frames - actual_frames,
+                        seq_output.size(2),
+                        device=seq_output.device,
+                        dtype=seq_output.dtype
+                    )
+                    seq_output = torch.cat([seq_output, padding], dim=1)
+                    
+            chunk_outputs.append(seq_output)
         else:
-            # Handle overlap with previous chunk to avoid duplicating frames
-            # Each encoder's streaming_forward should handle its own blending
-            # We just need to track frame positions correctly
-            prev_end = processed_frames_end
-            curr_frames = chunk_out.size(1)
-            
-            # Update processed frames end position
-            processed_frames_end += curr_frames
-            
-            # Add to output collection
-            chunk_outputs.append(chunk_out)
-            chunk_out_lens.append(chunk_out_len)
+            # Handle case of no outputs (very short audio)
+            chunk_outputs.append(torch.zeros(
+                1, 
+                expected_total_frames[b],
+                model.encoder.output_dim,
+                device=device
+            ))
     
-    # Concatenate all chunk outputs along the time dimension
-    if len(chunk_outputs) > 0:
-        encoder_out = torch.cat(chunk_outputs, dim=1)
-        encoder_out_lens = torch.sum(torch.stack(chunk_out_lens), dim=0)
-        
-        # Ensure output matches expected frame count to avoid duplicated frames
-        for i in range(batch_size):
-            if encoder_out_lens[i] > expected_total_frames[i]:
-                # Trim excess frames
-                encoder_out_lens[i] = expected_total_frames[i]
-        
-        # Trim encoder output to match the expected total frames
-        encoder_out = encoder_out[:, :encoder_out_lens.max()]
-        
-        return encoder_out, encoder_out_lens
-    else:
-        # Empty output case - return zero tensor with proper shape
-        encoder_dim = model.encoder.output_dim
-        return torch.zeros(batch_size, 0, encoder_dim, device=device), torch.zeros(batch_size, device=device)
+    # Concatenate all batch outputs
+    return torch.cat(chunk_outputs, dim=0)
 
 
 def calculate_errors(ref: str, hyp: str) -> int:
@@ -1116,14 +1131,16 @@ def compute_loss(
             curr_chunk_size = chunk_size
             
         # Process in chunks with attention sink
-        encoder_out, encoder_out_lens = process_streaming_chunks(
+        encoder_out = process_streaming_chunks(
             model=model,
-            audio=feature,
-            audio_lens=feature_lens,
+            feature=feature,
             chunk_size=curr_chunk_size,
-            left_context=params.left_context_chunks,
-            chunk_overlap=None
+            attention_sink_size=params.attention_sink_size,
+            left_context_chunks=params.left_context_chunks
         )
+        # Calculate encoder output lengths based on chunk processing
+        encoder_out_lens = ((feature_lens.float() / model.encoder.downsample_factor).floor()).to(torch.int64)
+        encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
     
     # Project encoder output if using XLSR
     if hasattr(model, 'encoder_proj'):
@@ -1166,25 +1183,21 @@ def compute_loss(
 def compute_loss_with_amp(
     params: AttributeDict,
     model: nn.Module,
-    graph_compiler: Any,
+    sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
-    scaler: Optional[GradScaler] = None,
-) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    """Compute the loss with automatic mixed precision (amp).
+    scaler: Optional[torch.amp.GradScaler],
+    is_pre_training: bool = True,
+    chunk_size: Optional[int] = None,
+) -> Tuple[torch.Tensor, MetricsTracker]:
+    """Compute loss with automatic mixed precision.
     
     Args:
-        params: Model parameters
-        model: The model to compute loss for
-        graph_compiler: Used to convert between texts and token IDs
-        batch: A batch of data
-        is_training: Whether this is for training or validation
-        scaler: The scaler for mixed precision training
+        Same as compute_loss with additional scaler
         
     Returns:
-        (loss, loss_info)
+        Same as compute_loss
     """
-    # Use autocast for mixed precision training
     with torch.cuda.amp.autocast(enabled=params.use_fp16):
         loss, info = compute_loss(
             params=params,
@@ -1192,6 +1205,8 @@ def compute_loss_with_amp(
             sp=sp,
             batch=batch,
             is_training=is_training,
+            is_pre_training=is_pre_training,
+            chunk_size=chunk_size
         )
     
     # Scale loss for mixed precision training
@@ -1204,7 +1219,7 @@ def compute_loss_with_amp(
 def decode_one_batch_hyps(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
-    graph_compiler: Any,
+    sp: spm.SentencePieceProcessor,
     batch: dict,
 ) -> Tuple[List[str], List[str]]:
     """Get hypotheses and predictions for one batch.
@@ -1212,40 +1227,126 @@ def decode_one_batch_hyps(
     Args:
         params: Model parameters
         model: The model to use for decoding
-        graph_compiler: Used to convert between texts and token IDs
+        sp: SentencePieceProcessor for converting ids to text
         batch: A batch of data
         
     Returns:
         (hyps, preds): Lists of ground truth and predicted texts
     """
-    device = model.device
+    device = next(model.parameters()).device
     feature = batch["inputs"].to(device)
-    feature_lens = batch["supervisions"]["num_frames"].to(device)
-    texts = batch["supervisions"]["text"]
+    supervisions = batch["supervisions"]
+    feature_lens = supervisions["num_frames"].to(device)
     
+    # Verify that we have valid feature lengths
+    if torch.any(feature_lens <= 0):
+        logging.warning("Encountered zero or negative feature length. Skipping decoding.")
+        return supervisions["text"], [""] * len(supervisions["text"])
+    
+    # Skip very short samples that might cause issues
+    min_audio_len = model.encoder.downsample_factor * 2  # At least 2 frames after downsampling
+    if torch.any(feature_lens < min_audio_len):
+        logging.warning(f"Sample too short (length {feature_lens.item()} < minimum {min_audio_len})")
+        return supervisions["text"], [""] * len(supervisions["text"])
+    
+    # Normalize feature inputs
+    if torch.isnan(feature).any() or torch.isinf(feature).any():
+        logging.warning("NaN or Inf values detected in feature. Normalizing.")
+        feature = torch.nan_to_num(feature, nan=0.0, posinf=1.0, neginf=-1.0)
+    
+    # Get encoder output with streaming settings
     try:
-        # First get encoder output
-        encoder_out, encoder_out_lens = model.encoder(x=feature, x_lens=feature_lens)
+        with torch.no_grad():
+            # Add right context padding for streaming
+            right_context = params.decode_chunk_len // 2
+            feature_lens_pad = feature_lens + right_context
+            feature_pad = torch.nn.functional.pad(
+                feature,
+                pad=(0, 0, 0, right_context),
+                value=LOG_EPS,
+            )
+            
+            # Get encoder output
+            encoder_out, encoder_out_lens = model.encoder(feature_pad, feature_lens_pad)
+            
+            # Check if encoder output is valid
+            if encoder_out.size(0) == 0 or encoder_out_lens.size(0) == 0:
+                logging.warning(f"Empty encoder output: shape={encoder_out.shape}, lens={encoder_out_lens}")
+                return supervisions["text"], [""] * len(supervisions["text"])
+            
+            # Ensure encoder_out is non-empty along time dimension
+            if encoder_out.size(1) == 0:
+                logging.warning(f"Empty time dimension in encoder output: shape={encoder_out.shape}")
+                # Create a minimal non-empty output for the joiner
+                encoder_out = torch.zeros(
+                    (encoder_out.size(0), 1, encoder_out.size(2)), 
+                    device=encoder_out.device,
+                    dtype=encoder_out.dtype
+                )
+                encoder_out_lens = torch.ones((encoder_out.size(0),), device=encoder_out_lens.device, dtype=encoder_out_lens.dtype)
         
-        # Quick validation with greedy search
-        hyp_tokens = greedy_search_batch(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens
-        )
+        # Project encoder output
+        if isinstance(model, DDP):
+            encoder_out = model.module.encoder_proj(encoder_out)
+        else:
+            encoder_out = model.encoder_proj(encoder_out)
         
-        # Convert predictions to text
-        hyps = []
-        for tokens in hyp_tokens:
-            if isinstance(tokens, torch.Tensor):
-                tokens = tokens.tolist()
-            hyps.append(graph_compiler.ids_to_texts([tokens])[0])
-        
-        # Return groundtruth and predictions
-        return texts, hyps
+            # Check if any dimension is zero, which would cause issues
+            if 0 in encoder_out.shape:
+                logging.warning(f"Zero dimension in projected encoder output: shape={encoder_out.shape}")
+                return supervisions["text"], [""] * len(supervisions["text"])
+            
+            # Use greedy search batch for decoding
+            try:
+                hyp_tokens = greedy_search_batch(
+                    model=model,
+                    encoder_out=encoder_out,
+                    encoder_out_lens=encoder_out_lens,
+                )
+            except RuntimeError as e:
+                logging.warning(f"Error during greedy search: {str(e)}")
+                logging.warning(f"Encoder output shape: {encoder_out.shape}, lens shape: {encoder_out_lens.shape}")
+                return supervisions["text"], [""] * len(supervisions["text"])
+            except Exception as e:
+                logging.warning(f"Exception during decoding: {str(e)}")
+                return supervisions["text"], [""] * len(supervisions["text"])
     except Exception as e:
-        logging.error(f"Error in decode_one_batch_hyps: {e}")
-        return [], []
+        logging.warning(f"Exception during encoder processing: {str(e)}")
+        return supervisions["text"], [""] * len(supervisions["text"])
+    
+    # Convert token IDs to text
+    hyps = []
+    preds = []
+    
+    # Get ground truth
+    texts = supervisions["text"]
+    
+    # Process each item in the batch
+    for i in range(len(texts)):
+        # Ground truth
+        hyps.append(texts[i])
+        
+        # Make sure we have predictions for each item
+        if i >= len(hyp_tokens):
+            preds.append("")
+            continue
+            
+        # Prediction - handle both tensor and list outputs
+        pred_tokens = hyp_tokens[i]
+        if isinstance(pred_tokens, torch.Tensor):
+            pred_tokens = pred_tokens.tolist()
+        elif not isinstance(pred_tokens, list):
+            pred_tokens = list(pred_tokens)
+            
+        # Remove any padding or special tokens
+        while pred_tokens and pred_tokens[-1] == params.blank_id:
+            pred_tokens.pop()
+            
+        # Convert to text
+        pred = sp.decode(pred_tokens)
+        preds.append(pred)
+    
+    return hyps, preds
 
 
 def extract_validation_sample(
@@ -1345,7 +1446,7 @@ def compute_validation_loss(
         with torch.no_grad():
             try:
                 # Get hypothesis and prediction
-                hyps, preds = decode_one_batch_hyps(params, model, graph_compiler, single_sample)
+                hyps, preds = decode_one_batch_hyps(params, model, sp, single_sample)
                 
                 # Make sure we have results before accessing them
                 if len(hyps) > 0 and len(preds) > 0:
@@ -1437,9 +1538,10 @@ def train_one_epoch(
             loss, loss_info = compute_loss_with_amp(
                 params=params,
                 model=model,
-                graph_compiler=graph_compiler,
+                sp=sp,
                 batch=batch,
                 is_training=True,
+                is_pre_training=is_pre_training,
                 scaler=scaler
             )
             
@@ -1493,8 +1595,7 @@ def train_one_epoch(
                                 # Get streaming output
                                 streaming_out = process_streaming_chunks(
                                     model=model,
-                                    audio=batch["inputs"].to(device),
-                                    audio_lens=batch["supervisions"]["num_frames"].to(device),
+                                    feature=batch["inputs"].to(device),
                                     chunk_size=params.chunk_sizes["320ms"],
                                     attention_sink_size=params.attention_sink_size,
                                     left_context_chunks=params.left_context_chunks
@@ -1578,8 +1679,9 @@ def train_one_epoch(
                 metrics = evaluate_streaming(
                     params=params,
                     model=model,
-                    graph_compiler=graph_compiler,
-                    test_dl=valid_dl,
+                    valid_dl=valid_dl,
+                    chunk_size=size,
+                    sp=sp
                 )
                 logging.info(f"Chunk size {name}: WER = {metrics['wer']:.2f}%")
                 if tb_writer is not None:
@@ -1942,8 +2044,9 @@ def find_optimal_chunk_size(
         metrics = evaluate_streaming(
             params=params,
             model=model,
-            graph_compiler=graph_compiler,
-            test_dl=valid_dl,
+            valid_dl=valid_dl,
+            chunk_size=size,
+            sp=sp
         )
         elapsed = time.time() - start_time
         

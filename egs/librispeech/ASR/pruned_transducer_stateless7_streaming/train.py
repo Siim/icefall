@@ -1310,7 +1310,10 @@ def decode_one_batch_hyps(
                 logging.warning(f"Encoder output shape: {encoder_out.shape}, lens shape: {encoder_out_lens.shape}")
                 return supervisions["text"], [""] * len(supervisions["text"])
             except Exception as e:
-        logging.warning(f"Exception during decoding: {str(e)}")
+                logging.warning(f"Exception during decoding: {str(e)}")
+                return supervisions["text"], [""] * len(supervisions["text"])
+    except Exception as e:
+        logging.warning(f"Exception during encoder processing: {str(e)}")
         return supervisions["text"], [""] * len(supervisions["text"])
     
     # Convert token IDs to text
@@ -1471,7 +1474,7 @@ def compute_validation_loss(
                             tb_writer.add_scalar('validation/wer', wer, params.batch_idx_train)
                 else:
                     logging.warning("No results returned from decode_one_batch_hyps")
-    except Exception as e:
+            except Exception as e:
                 logging.warning(f"Error during validation: {str(e)}")
                 import traceback
                 logging.warning(f"Exception details:\n{traceback.format_exc()}")

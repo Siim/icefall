@@ -90,7 +90,6 @@ from icefall.err import raise_grad_scale_is_too_small_error
 from icefall.hooks import register_inf_check_hooks
 from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
 from beam_search import greedy_search_batch  # Only import what we use for validation
-from icefall.bpe_graph_compiler import BpeCtcTrainingGraphCompiler
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -842,7 +841,7 @@ def save_checkpoint(
 def evaluate_streaming(
     params: AttributeDict,
     model: nn.Module,
-    graph_compiler: BpeCtcTrainingGraphCompiler,
+    graph_compiler: Any,
     test_dl: torch.utils.data.DataLoader,
 ) -> Dict[str, float]:
     """Evaluate model with streaming inference using greedy search.
@@ -1064,7 +1063,7 @@ def calculate_errors(ref: str, hyp: str) -> int:
 def compute_loss(
     params: AttributeDict,
     model: nn.Module,
-    graph_compiler: BpeCtcTrainingGraphCompiler,
+    sp: spm.SentencePieceProcessor,
     batch: dict,
     is_training: bool,
     is_pre_training: bool = True,
@@ -1075,7 +1074,7 @@ def compute_loss(
     Args:
         params: Model parameters
         model: The model to train
-        graph_compiler: Used to convert between texts and token IDs
+        sp: Sentence piece processor
         batch: A batch of data
         is_training: Whether this is a training batch
         is_pre_training: Whether this is pre-training phase
@@ -1091,7 +1090,7 @@ def compute_loss(
     # Get supervisions
     supervisions = batch["supervisions"]
     texts = supervisions["text"]
-    y = graph_compiler.texts_to_ids(texts)
+    y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
     
     if is_pre_training:
@@ -1168,7 +1167,7 @@ def compute_loss(
 def compute_loss_with_amp(
     params: AttributeDict,
     model: nn.Module,
-    graph_compiler: BpeCtcTrainingGraphCompiler,
+    graph_compiler: Any,
     batch: dict,
     is_training: bool,
     scaler: Optional[GradScaler] = None,
@@ -1191,7 +1190,7 @@ def compute_loss_with_amp(
         loss, info = compute_loss(
             params=params,
             model=model,
-            graph_compiler=graph_compiler,
+            sp=sp,
             batch=batch,
             is_training=is_training,
         )
@@ -1206,7 +1205,7 @@ def compute_loss_with_amp(
 def decode_one_batch_hyps(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
-    graph_compiler: BpeCtcTrainingGraphCompiler,
+    graph_compiler: Any,
     batch: dict,
 ) -> Tuple[List[str], List[str]]:
     """Get hypotheses and predictions for one batch.
@@ -1296,7 +1295,7 @@ def extract_validation_sample(
 def compute_validation_loss(
     params: AttributeDict,
     model: Union[nn.Module, DDP],
-    graph_compiler: BpeCtcTrainingGraphCompiler,
+    sp: spm.SentencePieceProcessor,
     valid_dl: torch.utils.data.DataLoader,
     world_size: int = 1,
     tb_writer: Optional[SummaryWriter] = None,
@@ -1532,7 +1531,7 @@ def train_one_epoch(
                     valid_info = compute_validation_loss(
                         params=params,
                         model=model,
-                        graph_compiler=graph_compiler,
+                        sp=sp,
                         valid_dl=valid_dl,
                         world_size=world_size,
                         tb_writer=tb_writer,
@@ -1639,12 +1638,6 @@ def run(rank, world_size, args):
 
     sp = spm.SentencePieceProcessor()
     sp.load(params.bpe_model)
-
-    # Create graph compiler
-    graph_compiler = BpeCtcTrainingGraphCompiler(
-        lang_dir=Path(params.bpe_model).parent,
-        device=device,
-    )
 
     # <blk> is defined in local/train_bpe_model.py
     params.blank_id = sp.piece_to_id("<blk>")
@@ -1881,7 +1874,7 @@ def scan_pessimistic_batches_for_oom(
                     loss, _ = compute_loss(
                         params=params,
                         model=model,
-                        graph_compiler=sp,
+                        sp=sp,
                         batch=batch,
                         is_training=True,
                         is_pre_training=False

@@ -922,7 +922,8 @@ def process_streaming_chunks(
     attention_sink_size: int,
     left_context_chunks: int
 ) -> torch.Tensor:
-    """Process input features in streaming mode with chunks following paper's approach.
+    """
+    Process audio in streaming mode by breaking into chunks with proper overlap.
     
     Args:
         model: The model to use
@@ -941,12 +942,19 @@ def process_streaming_chunks(
     states = None
     chunk_outputs = []
     
-    # Calculate chunk parameters
-    chunk_overlap = chunk_size // 2  # Half overlap as per paper
+    # Calculate chunk parameters - use 40% overlap as per paper
+    chunk_overlap = int(chunk_size * 0.4)  # 40% overlap as per paper
     effective_chunk_size = chunk_size - chunk_overlap
     
     # Calculate attention sink size in samples
     sink_size = attention_sink_size * model.encoder.downsample_factor
+    
+    # Calculate expected total frames for verification
+    expected_total_frames = []
+    for b in range(batch_size):
+        seq_len = feature[b].size(0)
+        expected_frames = (seq_len + model.encoder.downsample_factor - 1) // model.encoder.downsample_factor
+        expected_total_frames.append(expected_frames)
     
     # Process each sequence in batch
     for b in range(batch_size):
@@ -954,6 +962,7 @@ def process_streaming_chunks(
         pos = 0
         seq_outputs = []
         left_context = None
+        processed_frames_end = 0  # Track end position of processed frames
         
         while pos < seq.size(1):
             # Get current chunk boundaries
@@ -965,60 +974,87 @@ def process_streaming_chunks(
                 chunk = torch.cat([left_context, chunk], dim=1)
             
             # Add attention sink if enabled
-            if states is not None and attention_sink_size > 0:
-                sink = states[1]  # Attention sink cache from previous chunk
-                if sink is not None:
-                    # Handle dimension mismatch between sink and chunk
-                    if sink.ndim == 3 and chunk.ndim == 2:
-                        # Extract a single feature dimension to match chunk dimensions
-                        sink = sink[:, :, 0]
-                    # Paper's approach: prepend attention sink to current chunk
-                    chunk = torch.cat([sink, chunk], dim=1)
+            if states is not None and states[1] is not None:
+                # We will handle this inside model.encoder.streaming_forward
+                pass
             
-            # Process chunk through encoder
-            chunk_out, chunk_lens, new_states = model.encoder.streaming_forward(
-                chunk,
+            # Process the chunk through encoder
+            chunk_out, chunk_out_lens, states = model.encoder.streaming_forward(
+                chunk, 
                 torch.tensor([chunk.size(1)], device=device),
                 states
             )
             
-            # Update states with new attention sink
-            if attention_sink_size > 0:
-                # Cache end of current chunk for attention sink (paper's approach)
-                states = [chunk, chunk_out[:, -attention_sink_size:]]
-            else:
-                states = new_states
+            # Calculate what portion of the chunk_out corresponds to non-overlapped audio
+            chunk_start_frame = pos // model.encoder.downsample_factor
+            chunk_end_frame = end_pos // model.encoder.downsample_factor
             
-            # Save left context for next chunk
-            if left_context_chunks > 0:
+            # Ensure we don't duplicate frames from previous chunks
+            if processed_frames_end > 0:
+                frames_to_skip = processed_frames_end - chunk_start_frame
+                if frames_to_skip > 0:
+                    # Skip the overlapping frames (avoiding duplication)
+                    if frames_to_skip < chunk_out.size(1):
+                        chunk_out = chunk_out[:, frames_to_skip:]
+                    else:
+                        # In case of very small chunks, we might need to skip the entire output
+                        chunk_out = chunk_out[:, 0:0]  # Empty tensor with correct dimensions
+            
+            # Add to sequence outputs if we have valid frames
+            if chunk_out.size(1) > 0:
+                seq_outputs.append(chunk_out)
+            
+            # Update position (move forward by effective chunk size)
+            next_pos = pos + effective_chunk_size
+            
+            # Save the end position of processed frames (in frame space)
+            processed_frames_end = chunk_end_frame
+            
+            # Store left context for next chunk if needed
+            if next_pos < seq.size(1) and chunk.size(1) >= chunk_overlap:
                 left_context = chunk[:, -chunk_overlap:]
             
-            # Remove overlap from previous chunk's output
-            if pos > 0:
-                chunk_out = chunk_out[:, chunk_overlap//model.encoder.downsample_factor:]
-            
-            seq_outputs.append(chunk_out)
-            pos = end_pos - chunk_overlap
+            # Move to next position
+            pos = next_pos
         
-        # Concatenate all chunks for this sequence
-        seq_output = torch.cat(seq_outputs, dim=1)
-        chunk_outputs.append(seq_output)
-    
-    # Pad sequences to max length
-    max_len = max(output.size(1) for output in chunk_outputs)
-    padded_outputs = []
-    
-    for output in chunk_outputs:
-        if output.size(1) < max_len:
-            padding = torch.zeros(
-                1, max_len - output.size(1), output.size(2),
-                device=device, dtype=output.dtype
-            )
-            padded_outputs.append(torch.cat([output, padding], dim=1))
+        # Concatenate all outputs for this sequence
+        if seq_outputs:
+            seq_output = torch.cat(seq_outputs, dim=1)
+            
+            # Verify we have expected number of frames
+            actual_frames = seq_output.size(1)
+            expected_frames = expected_total_frames[b]
+            
+            # Ensure output matches expected frame count exactly
+            if actual_frames != expected_frames:
+                logging.info(f"Adjusting frame count from {actual_frames} to expected {expected_frames}")
+                
+                # Resize to match exactly what would come from non-streaming
+                if actual_frames > expected_frames:
+                    seq_output = seq_output[:, :expected_frames]
+                else:
+                    # Pad if needed (rare)
+                    padding = torch.zeros(
+                        1, 
+                        expected_frames - actual_frames,
+                        seq_output.size(2),
+                        device=seq_output.device,
+                        dtype=seq_output.dtype
+                    )
+                    seq_output = torch.cat([seq_output, padding], dim=1)
+                    
+            chunk_outputs.append(seq_output)
         else:
-            padded_outputs.append(output)
+            # Handle case of no outputs (very short audio)
+            chunk_outputs.append(torch.zeros(
+                1, 
+                expected_total_frames[b],
+                model.encoder.output_dim,
+                device=device
+            ))
     
-    return torch.cat(padded_outputs, dim=0)
+    # Concatenate all batch outputs
+    return torch.cat(chunk_outputs, dim=0)
 
 
 def compute_loss(

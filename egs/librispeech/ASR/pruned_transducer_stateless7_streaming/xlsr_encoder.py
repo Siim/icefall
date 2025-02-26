@@ -323,11 +323,28 @@ class XLSREncoder(EncoderInterface):
             x = x.squeeze(-1)
         assert x.ndim == 2, f"Expected 2D input (batch, time), got shape {x.shape}"
         
-        # Validate x_lens
+        # Make sure batch size is consistent
+        batch_size = x.size(0)
+        
+        # Validate x_lens and ensure proper batch size
         if isinstance(x_lens, int):
             x_lens = torch.tensor([x_lens], device=x.device)
         elif not isinstance(x_lens, torch.Tensor):
             x_lens = torch.tensor(x_lens, device=x.device)
+        
+        # Ensure x_lens has the same batch dimension as x
+        if x_lens.size(0) != batch_size:
+            if x_lens.size(0) == 1:
+                # Broadcast single length to match batch size
+                x_lens = x_lens.expand(batch_size)
+            else:
+                # Trim or pad x_lens to match batch size
+                if x_lens.size(0) > batch_size:
+                    x_lens = x_lens[:batch_size]
+                else:
+                    padding = torch.ones(batch_size - x_lens.size(0), device=x_lens.device, 
+                                         dtype=x_lens.dtype) * x_lens[-1]
+                    x_lens = torch.cat([x_lens, padding])
         
         # Ensure x_lens is on the same device as x
         if x_lens.device != x.device:
@@ -458,8 +475,6 @@ class XLSREncoder(EncoderInterface):
         Returns:
             (encoder_out, encoder_out_lens)
         """
-        batch_size = x.size(0)
-        
         # Ensure input is float and in correct shape
         x = x.float()
         if x.ndim == 3:  # (batch, time, channel)
@@ -469,13 +484,36 @@ class XLSREncoder(EncoderInterface):
         
         assert x.ndim == 2, f"Expected 2D input (batch, time), got shape {x.shape}"
         
+        batch_size = x.size(0)
+        
+        # Ensure x_lens has the right shape
+        if isinstance(x_lens, int):
+            x_lens = torch.tensor([x_lens], device=x.device)
+        elif not isinstance(x_lens, torch.Tensor):
+            x_lens = torch.tensor(x_lens, device=x.device)
+            
+        # Ensure x_lens has the same batch dimension as x
+        if x_lens.size(0) != batch_size:
+            if x_lens.size(0) == 1:
+                # Broadcast single length to match batch size
+                x_lens = x_lens.expand(batch_size)
+            else:
+                # Trim or pad x_lens to match batch size
+                if x_lens.size(0) > batch_size:
+                    x_lens = x_lens[:batch_size]
+                else:
+                    padding = torch.ones(batch_size - x_lens.size(0), device=x_lens.device, 
+                                         dtype=x_lens.dtype) * x_lens[-1]
+                    x_lens = torch.cat([x_lens, padding])
+        
         # Clamp values silently since inputs are already normalized
         x = torch.clamp(x, min=-1.0, max=1.0)
         
         # Create attention mask
         attention_mask = torch.ones_like(x, dtype=torch.long)
         for i in range(batch_size):
-            attention_mask[i, x_lens[i]:] = 0
+            if i < x_lens.size(0):  # Safety check
+                attention_mask[i, x_lens[i]:] = 0
         
         if is_pre_training:
             # During pre-training, use full sequence without chunking

@@ -250,7 +250,7 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--pre-train-lr",
         type=float,
-        default=0.0001,
+        default=0.0005,
         help="Learning rate during pre-training phase",
     )
 

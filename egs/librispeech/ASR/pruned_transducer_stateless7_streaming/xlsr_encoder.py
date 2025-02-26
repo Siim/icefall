@@ -346,7 +346,8 @@ class XLSREncoder(EncoderInterface):
         )[0]
         
         # Calculate context frames based on downsample factor
-        context_frames = self.context_frames
+        # This calculates how many output frames correspond to the context input
+        context_frames = int(self.downsample_factor // 20)  # 20ms is the stride size
         
         # Always remove context frames from beginning consistently
         # Regardless of whether left_context was provided or not

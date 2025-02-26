@@ -478,6 +478,12 @@ def main():
                             # Limit data for plotting to avoid memory issues
                             max_frames = 1000
                             
+                            # Check for empty streaming frames
+                            if streaming_cpu.shape[1] == 0:
+                                logging.warning("Empty streaming output detected. Creating minimal placeholder for plotting.")
+                                # Create a placeholder tensor with the same feature dimension but 1 frame
+                                streaming_cpu = torch.zeros((streaming_cpu.shape[0], 1, streaming_cpu.shape[2]), device=streaming_cpu.device)
+                                
                             # Resample both to the same number of frames for plotting
                             ns_sample_rate = max(1, non_streaming_cpu.shape[1] // max_frames)
                             s_sample_rate = max(1, streaming_cpu.shape[1] // max_frames)

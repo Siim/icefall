@@ -89,7 +89,8 @@ from icefall.env import get_env_info
 from icefall.err import raise_grad_scale_is_too_small_error
 from icefall.hooks import register_inf_check_hooks
 from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
-from beam_search import greedy_search_batch  # Only import what we use for validation
+from beam_search import greedy_search_batch  # For compatibility
+from xlsr_greedy_search import greedy_search_batch as xlsr_greedy_search_batch  # XLSR-specific implementation
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -879,11 +880,11 @@ def evaluate_streaming(
                     left_context_chunks=params.left_context_chunks
                 )
                 
-                # Quick validation with greedy search
-                hyp_tokens = greedy_search_batch(
+                # Use XLSR-specific greedy search for decoding - handles batch size mismatches
+                hyp_tokens = xlsr_greedy_search_batch(
                     model=model,
                     encoder_out=encoder_out,
-                    encoder_out_lens=feature_lens
+                    encoder_out_lens=feature_lens,
                 )
                 
                 # Measure processing time
@@ -1042,6 +1043,15 @@ def process_streaming_chunks(
                 states
             )
             
+            # Verify chunk_out has valid dimensions and is not empty
+            if chunk_out.size(1) == 0:
+                # If we got an empty output, use a minimal fallback
+                # Create a small non-zero output based on chunk size
+                min_frames = max(1, int(chunk.size(1) / model.encoder.downsample_factor))
+                logging.warning(f"Empty encoder output detected. Using fallback with {min_frames} frames.")
+                fallback_dim = model.encoder.output_dim
+                chunk_out = torch.zeros((1, min_frames, fallback_dim), device=device)
+            
             # Update cache for next iteration
             if attention_sink_size > 0:
                 # Cache end of current chunk for attention sink
@@ -1052,17 +1062,34 @@ def process_streaming_chunks(
             if left_context_chunks > 0:
                 left_context = chunk[:, -current_overlap:].detach().clone()
             
-            seq_outputs.append(chunk_out)
-            
+            # Add to outputs only if not empty
+            if chunk_out.size(1) > 0:
+                seq_outputs.append(chunk_out)
+            else:
+                logging.warning(f"Skipping empty chunk at position {pos}")
+                
             # Move to next position with overlap
             pos = end_pos - current_overlap
         
-        # Concatenate all outputs for this sequence
-        seq_encoder_out = torch.cat(seq_outputs, dim=1)
-        chunk_outputs.append(seq_encoder_out)
+        # Concatenate all outputs for this sequence if not empty
+        if len(seq_outputs) > 0:
+            seq_encoder_out = torch.cat(seq_outputs, dim=1)
+            chunk_outputs.append(seq_encoder_out)
+        else:
+            # Create fallback output with minimal dimension
+            logging.warning(f"No valid chunks for sequence {i}. Using fallback output.")
+            fallback_dim = model.encoder.output_dim
+            seq_encoder_out = torch.zeros((1, 1, fallback_dim), device=device)
+            chunk_outputs.append(seq_encoder_out)
     
-    # Return batch of outputs
-    return torch.cat(chunk_outputs, dim=0)
+    # Return batch of outputs - check if we have any valid outputs
+    if len(chunk_outputs) > 0:
+        return torch.cat(chunk_outputs, dim=0)
+    else:
+        # Emergency fallback with minimum size tensor
+        logging.error("No valid outputs from any sequence. Using emergency fallback.")
+        fallback_dim = model.encoder.output_dim
+        return torch.zeros((batch_size, 1, fallback_dim), device=device)
 
 
 def compute_loss(
@@ -1251,8 +1278,8 @@ def decode_one_batch_hyps(
         else:
             encoder_out = model.encoder_proj(encoder_out)
         
-        # Use greedy search batch for decoding
-        hyp_tokens = greedy_search_batch(
+        # Use XLSR-specific greedy search for decoding - handles batch size mismatches
+        hyp_tokens = xlsr_greedy_search_batch(
             model=model,
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
@@ -1437,7 +1464,6 @@ def train_one_epoch(
                 sp=sp,
                 batch=batch,
                 is_training=True,
-                is_pre_training=is_pre_training,
                 scaler=scaler
             )
             
@@ -1598,221 +1624,6 @@ def train_one_epoch(
         scaler=scaler,
         rank=rank,
     )
-
-
-def run(rank, world_size, args):
-    """
-    Args:
-      rank:
-        It is a value between 0 and `world_size-1`, which is
-        passed automatically by `mp.spawn()` in :func:`main`.
-        The node with rank 0 is responsible for saving checkpoint.
-      world_size:
-        Number of GPUs for DDP training.
-      args:
-        The return value of get_parser().parse_args()
-    """
-    params = get_params()
-    params.update(vars(args))
-    # We want to keep our validation interval at 500 regardless of dataset
-    # if params.full_libri is False:
-    #     params.valid_interval = 1600
-
-    fix_random_seed(params.seed)
-    if world_size > 1:
-        setup_dist(rank, world_size, params.master_port)
-
-    setup_logger(f"{params.exp_dir}/log/log-train")
-    logging.info("Training started")
-
-    if args.tensorboard and rank == 0:
-        tb_writer = SummaryWriter(log_dir=f"{params.exp_dir}/tensorboard")
-    else:
-        tb_writer = None
-
-    device = torch.device("cpu")
-    if torch.cuda.is_available():
-        device = torch.device("cuda", rank)
-    logging.info(f"Device: {device}")
-
-    sp = spm.SentencePieceProcessor()
-    sp.load(params.bpe_model)
-
-    # <blk> is defined in local/train_bpe_model.py
-    params.blank_id = sp.piece_to_id("<blk>")
-    params.vocab_size = sp.get_piece_size()
-
-    logging.info(params)
-
-    logging.info("About to create model")
-    model = get_transducer_model(params)
-
-    num_param = sum([p.numel() for p in model.parameters()])
-    logging.info(f"Number of model parameters: {num_param}")
-
-    assert params.save_every_n >= params.average_period
-    model_avg: Optional[nn.Module] = None
-    if rank == 0:
-        # model_avg is only used with rank 0
-        model_avg = copy.deepcopy(model).to(torch.float64)
-
-    assert params.start_epoch > 0, params.start_epoch
-    checkpoints = load_checkpoint_if_available(
-        params=params, model=model, model_avg=model_avg
-    )
-
-    model.to(device)
-    if world_size > 1:
-        logging.info("Using DDP")
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-
-    parameters_names = []
-    parameters_names.append(
-        [name_param_pair[0] for name_param_pair in model.named_parameters()]
-    )
-    optimizer = ScaledAdam(
-        model.parameters(),
-        lr=params.base_lr,
-        clipping_scale=2.0,
-        parameters_names=parameters_names,
-    )
-
-    # Paper uses warmup followed by decay
-    def lr_scheduler(step: int, epoch: int) -> float:
-        # Warmup phase
-        if step < params.warmup_steps:
-            return step / params.warmup_steps
-        # Decay phase based on steps and epochs
-        decay_factor = 0.05 * (params.num_epochs - epoch) / params.num_epochs
-        return max(0.05, decay_factor)  # Don't let LR go below 5% of base_lr
-
-    scheduler = Eden(
-        optimizer,
-        lr_batches=params.lr_batches,
-        lr_epochs=params.lr_epochs,
-        warmup_batches=params.warmup_steps,
-    )
-
-    if checkpoints and "optimizer" in checkpoints:
-        logging.info("Loading optimizer state dict")
-        optimizer.load_state_dict(checkpoints["optimizer"])
-
-    if checkpoints and "scheduler" in checkpoints:
-        logging.info("Loading scheduler state dict")
-        scheduler.load_state_dict(checkpoints["scheduler"])
-
-    if params.print_diagnostics:
-        opts = diagnostics.TensorDiagnosticOptions(
-            512
-        )  # allow 4 megabytes per sub-module
-        diagnostic = diagnostics.attach_diagnostics(model, opts)
-
-    if params.inf_check:
-        register_inf_check_hooks(model)
-
-    if params.dataset == "estonian":
-        from estonian_dataset import EstonianASRDataset, collate_fn
-        logging.info("Using Estonian dataset")
-        
-        train_dataset = EstonianASRDataset(params.train_txt, base_path=params.audio_base_path, sp=sp)
-        train_dl = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=params.batch_size,
-            shuffle=True,
-            collate_fn=collate_fn,
-            num_workers=2,
-        )
-        
-        valid_dataset = EstonianASRDataset(params.val_txt, base_path=params.audio_base_path, sp=sp)
-        valid_dl = torch.utils.data.DataLoader(
-            valid_dataset,
-            batch_size=params.batch_size,
-            shuffle=False,
-            collate_fn=collate_fn,
-            num_workers=2,
-        )
-    else:
-        librispeech = LibriSpeechAsrDataModule(args)
-        
-        if params.mini_libri:
-            train_cuts = librispeech.train_clean_5_cuts()
-        else:
-            if params.full_libri:
-                train_cuts = librispeech.train_all_shuf_cuts()
-            else:
-                train_cuts = librispeech.train_clean_100_cuts()
-
-        if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
-            sampler_state_dict = checkpoints["sampler"]
-        else:
-            sampler_state_dict = None
-
-        train_dl = librispeech.train_dataloaders(
-            train_cuts, sampler_state_dict=sampler_state_dict
-        )
-
-        if params.mini_libri:
-            valid_cuts = librispeech.dev_clean_2_cuts()
-        else:
-            valid_cuts = librispeech.dev_clean_cuts()
-            valid_cuts += librispeech.dev_other_cuts()
-        valid_dl = librispeech.valid_dataloaders(valid_cuts)
-
-    if params.print_diagnostics:
-        scan_pessimistic_batches_for_oom(
-            model=model,
-            train_dl=train_dl,
-            optimizer=optimizer,
-            sp=sp,
-            params=params,
-        )
-
-    # Update to use new GradScaler API
-    scaler = torch.amp.GradScaler('cuda', enabled=params.use_fp16, init_scale=1.0) if params.use_fp16 else None
-    if checkpoints and "grad_scaler" in checkpoints:
-        logging.info("Loading grad scaler state dict")
-        scaler.load_state_dict(checkpoints["grad_scaler"])
-
-    for epoch in range(params.start_epoch, params.num_epochs + 1):
-        scheduler.step_epoch(epoch - 1)
-        fix_random_seed(params.seed + epoch - 1)
-        
-        if params.dataset != "estonian":
-            train_dl.sampler.set_epoch(epoch - 1)
-
-        if tb_writer is not None:
-            tb_writer.add_scalar("train/epoch", epoch, params.batch_idx_train)
-
-        params.cur_epoch = epoch
-
-        train_one_epoch(
-            params=params,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            train_dl=train_dl,
-            valid_dl=valid_dl,
-            sp=sp,
-            scaler=scaler,
-            tb_writer=tb_writer,
-            world_size=world_size,
-            rank=rank,
-        )
-
-        if params.print_diagnostics:
-            diagnostic.print_diagnostics()
-            break
-
-        save_checkpoint(
-            params=params,
-            model=model,
-            model_avg=model_avg,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            sampler=train_dl.sampler if params.dataset != "estonian" else None,
-            scaler=scaler,
-            rank=rank,
-        )
 
     logging.info("Done!")
 

@@ -345,14 +345,15 @@ class XLSREncoder(EncoderInterface):
             return_dict=False
         )[0]
         
-        # Calculate context frames based on downsample factor
-        # This calculates how many output frames correspond to the context input
-        context_frames = int(self.downsample_factor // 20)  # 20ms is the stride size
+        # Calculate context frames based on downsample factor and frame stride
+        # Ensure we always have at least 1 context frame
+        context_frames = max(1, int(self.downsample_factor / self.frame_stride))  # Use actual frame stride
         
         # Always remove context frames from beginning consistently
-        # Regardless of whether left_context was provided or not
-        if chunk_with_context.size(1) > x.size(1):
+        # But ensure we don't remove all frames
+        if chunk_with_context.size(1) > x.size(1) and outputs.size(1) > context_frames + 1:
             # If we added context, remove the corresponding frames from output
+            # But keep at least 1 frame
             outputs = outputs[:, context_frames:]
         
         # Apply smooth transition if we have previous output

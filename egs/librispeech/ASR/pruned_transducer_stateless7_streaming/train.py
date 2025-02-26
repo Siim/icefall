@@ -582,7 +582,7 @@ def get_params() -> AttributeDict:
             "valid_interval": 500,
             
             # Paper's training configuration
-            "pretrain_epochs": 5,  # Pre-training phase
+            "pretrain_epochs": 10,  # Pre-training phase
             "streaming_epochs": 15, # Streaming phase
             "beam_size": 4,        # Paper's beam width for decoding
             

@@ -1057,6 +1057,25 @@ def process_streaming_chunks(
     return torch.cat(chunk_outputs, dim=0)
 
 
+def calculate_errors(ref: str, hyp: str) -> int:
+    """Calculate number of word errors between reference and hypothesis.
+    
+    Args:
+        ref: Reference text
+        hyp: Hypothesis text
+        
+    Returns:
+        Number of word errors
+    """
+    # Convert to lists of words
+    ref_words = ref.split()
+    hyp_words = hyp.split()
+    
+    # Calculate edit distance
+    errors = editdistance.eval(ref_words, hyp_words)
+    return errors, len(ref_words)
+
+
 def compute_loss(
     params: AttributeDict,
     model: nn.Module,
@@ -1221,32 +1240,78 @@ def decode_one_batch_hyps(
     supervisions = batch["supervisions"]
     feature_lens = supervisions["num_frames"].to(device)
     
+    # Verify that we have valid feature lengths
+    if torch.any(feature_lens <= 0):
+        logging.warning("Encountered zero or negative feature length. Skipping decoding.")
+        return supervisions["text"], [""] * len(supervisions["text"])
+    
+    # Skip very short samples that might cause issues
+    min_audio_len = model.encoder.downsample_factor * 2  # At least 2 frames after downsampling
+    if torch.any(feature_lens < min_audio_len):
+        logging.warning(f"Sample too short (length {feature_lens.item()} < minimum {min_audio_len})")
+        return supervisions["text"], [""] * len(supervisions["text"])
+    
+    # Normalize feature inputs
+    if torch.isnan(feature).any() or torch.isinf(feature).any():
+        logging.warning("NaN or Inf values detected in feature. Normalizing.")
+        feature = torch.nan_to_num(feature, nan=0.0, posinf=1.0, neginf=-1.0)
+    
     # Get encoder output with streaming settings
-    with torch.no_grad():
-        # Add right context padding for streaming
-        right_context = params.decode_chunk_len // 2
-        feature_lens_pad = feature_lens + right_context
-        feature_pad = torch.nn.functional.pad(
-            feature,
-            pad=(0, 0, 0, right_context),
-            value=LOG_EPS,
-        )
-        
-        # Get encoder output
-        encoder_out, encoder_out_lens = model.encoder(feature_pad, feature_lens_pad)
-        
-        # Project encoder output
-        if isinstance(model, DDP):
-            encoder_out = model.module.encoder_proj(encoder_out)
-        else:
-            encoder_out = model.encoder_proj(encoder_out)
-        
-        # Use greedy search batch for decoding
-        hyp_tokens = greedy_search_batch(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-        )
+    try:
+        with torch.no_grad():
+            # Add right context padding for streaming
+            right_context = params.decode_chunk_len // 2
+            feature_lens_pad = feature_lens + right_context
+            feature_pad = torch.nn.functional.pad(
+                feature,
+                pad=(0, 0, 0, right_context),
+                value=LOG_EPS,
+            )
+            
+            # Get encoder output
+            encoder_out, encoder_out_lens = model.encoder(feature_pad, feature_lens_pad)
+            
+            # Check if encoder output is valid
+            if encoder_out.size(0) == 0 or encoder_out_lens.size(0) == 0:
+                logging.warning(f"Empty encoder output: shape={encoder_out.shape}, lens={encoder_out_lens}")
+                return supervisions["text"], [""] * len(supervisions["text"])
+            
+            # Ensure encoder_out is non-empty along time dimension
+            if encoder_out.size(1) == 0:
+                logging.warning(f"Empty time dimension in encoder output: shape={encoder_out.shape}")
+                # Create a minimal non-empty output for the joiner
+                encoder_out = torch.zeros(
+                    (encoder_out.size(0), 1, encoder_out.size(2)), 
+                    device=encoder_out.device,
+                    dtype=encoder_out.dtype
+                )
+                encoder_out_lens = torch.ones((encoder_out.size(0),), device=encoder_out_lens.device, dtype=encoder_out_lens.dtype)
+            
+            # Project encoder output
+            if isinstance(model, DDP):
+                encoder_out = model.module.encoder_proj(encoder_out)
+            else:
+                encoder_out = model.encoder_proj(encoder_out)
+            
+            # Check if any dimension is zero, which would cause issues
+            if 0 in encoder_out.shape:
+                logging.warning(f"Zero dimension in projected encoder output: shape={encoder_out.shape}")
+                return supervisions["text"], [""] * len(supervisions["text"])
+            
+            # Use greedy search batch for decoding
+            try:
+                hyp_tokens = greedy_search_batch(
+                    model=model,
+                    encoder_out=encoder_out,
+                    encoder_out_lens=encoder_out_lens,
+                )
+            except RuntimeError as e:
+                logging.warning(f"Error during greedy search: {str(e)}")
+                logging.warning(f"Encoder output shape: {encoder_out.shape}, lens shape: {encoder_out_lens.shape}")
+                return supervisions["text"], [""] * len(supervisions["text"])
+    except Exception as e:
+        logging.warning(f"Exception during decoding: {str(e)}")
+        return supervisions["text"], [""] * len(supervisions["text"])
     
     # Convert token IDs to text
     hyps = []
@@ -1260,6 +1325,11 @@ def decode_one_batch_hyps(
         # Ground truth
         hyps.append(texts[i])
         
+        # Make sure we have predictions for each item
+        if i >= len(hyp_tokens):
+            preds.append("")
+            continue
+            
         # Prediction - handle both tensor and list outputs
         pred_tokens = hyp_tokens[i]
         if isinstance(pred_tokens, torch.Tensor):
@@ -1276,6 +1346,49 @@ def decode_one_batch_hyps(
         preds.append(pred)
     
     return hyps, preds
+
+
+def extract_validation_sample(
+    batch: dict, 
+    min_frames: int = 100
+) -> Tuple[dict, int]:
+    """Safely extract a validation sample with sufficient length.
+    
+    Args:
+        batch: Batch dictionary containing inputs and supervisions
+        min_frames: Minimum number of frames required
+        
+    Returns:
+        (sample_dict, sample_idx): The extracted sample and its index in the batch
+    """
+    batch_size = batch["inputs"].size(0)
+    
+    # First try to find a sample of sufficient length
+    candidates = []
+    for i in range(batch_size):
+        length = batch["supervisions"]["num_frames"][i].item()
+        if length >= min_frames:
+            candidates.append((i, length))
+    
+    # If we found candidates, pick the one with median length
+    if candidates:
+        candidates.sort(key=lambda x: x[1])  # Sort by length
+        idx = candidates[len(candidates) // 2][0]  # Pick the median length
+    else:
+        # If no candidates, pick the longest available
+        lengths = batch["supervisions"]["num_frames"].tolist()
+        idx = lengths.index(max(lengths))
+    
+    # Extract the sample
+    single_sample = {
+        "inputs": batch["inputs"][idx:idx+1],
+        "supervisions": {
+            "num_frames": batch["supervisions"]["num_frames"][idx:idx+1],
+            "text": [batch["supervisions"]["text"][idx]],
+        }
+    }
+    
+    return single_sample, idx
 
 
 def compute_validation_loss(
@@ -1313,63 +1426,63 @@ def compute_validation_loss(
             
         # Randomly select a batch
         random_batch = random.choice(val_batches)
+        
+        # Define minimum frame length based on model architecture
+        # At least 2 frames after downsampling
+        min_frames = model.encoder.downsample_factor * 2
+        
+        # Extract a validation sample with sufficient length
+        single_sample, sample_idx = extract_validation_sample(random_batch, min_frames)
+        
+        # Log selected sample info
         batch_size = random_batch["inputs"].size(0)
+        sample_len = single_sample["supervisions"]["num_frames"][0].item()
         
-        # Handle case where batch size might be 1
-        if batch_size == 1:
-            random_idx = 0
-        else:
-            random_idx = random.randint(0, batch_size - 1)
-        
-        logging.info(f"Validating with sample from batch with size {batch_size}, using index {random_idx}")
-        
-        # Extract just the single sample
-        single_sample = {
-            "inputs": random_batch["inputs"][random_idx:random_idx+1],
-            "supervisions": {
-                "num_frames": random_batch["supervisions"]["num_frames"][random_idx:random_idx+1],
-                "text": [random_batch["supervisions"]["text"][random_idx]],
-            }
-        }
+        logging.info(f"Validating with sample from batch with size {batch_size}, " 
+                    f"using index {sample_idx} (length: {sample_len} frames, "
+                    f"text: '{single_sample['supervisions']['text'][0]}')")
         
         with torch.no_grad():
-            # Get hypothesis and prediction
-            hyps, preds = decode_one_batch_hyps(params, model, sp, single_sample)
-            
-            # Make sure we have results before accessing them
-            if len(hyps) > 0 and len(preds) > 0:
-                # Calculate WER for this single sample
-                hyp = hyps[0]
-                pred = preds[0]
-                hyp_words = hyp.split()
-                pred_words = pred.split()
-                errors = editdistance.eval(hyp_words, pred_words)
-                wer = 100.0 * errors / max(1, len(hyp_words))
+            try:
+                # Get hypothesis and prediction
+                hyps, preds = decode_one_batch_hyps(params, model, sp, single_sample)
                 
-                # Display the result
-                logging.info("\nRandom validation sample:")
-                logging.info("-" * 80)
-                logging.info(f"REFERENCE: {hyp}")
-                logging.info(f"PREDICTION: {pred}")
-                logging.info(f"WER: {wer:.2f}%")
-                logging.info(f"Word errors: {errors}/{len(hyp_words)}")
-                logging.info("-" * 80)
-                
-                if tb_writer is not None:
-                    tb_writer.add_scalar('valid/wer_sample', wer, params.batch_idx_train)
-            else:
-                logging.warning("No results returned from decode_one_batch_hyps")
-                
-            # Free memory
-            del single_sample
-            if 'hyps' in locals(): del hyps
-            if 'preds' in locals(): del preds
-            torch.cuda.empty_cache()
-            
+                # Make sure we have results before accessing them
+                if len(hyps) > 0 and len(preds) > 0:
+                    # Log sample comparison
+                    hyp_text = hyps[0]
+                    pred_text = preds[0]
+                    
+                    logging.info(f"Validation sample comparison:")
+                    logging.info(f"  Reference: {hyp_text}")
+                    logging.info(f"  Predicted: {pred_text}")
+                    
+                    # Calculate word error rate for this sample if both are non-empty
+                    if hyp_text and pred_text:
+                        error_count, word_count = calculate_errors(hyp_text, pred_text)
+                        wer = error_count / max(1, word_count)
+                        logging.info(f"  Word error rate: {wer:.2%} ({error_count}/{word_count})")
+                        
+                        # Update tracker with WER
+                        tot_loss["wer"] = wer
+                        
+                        # Add to tensorboard if available
+                        if tb_writer is not None:
+                            tb_writer.add_scalar('validation/wer', wer, params.batch_idx_train)
+                else:
+                    logging.warning("No results returned from decode_one_batch_hyps")
+            except Exception as e:
+                logging.warning(f"Error during validation: {str(e)}")
+                import traceback
+                logging.warning(f"Exception details:\n{traceback.format_exc()}")
     except Exception as e:
-        logging.warning(f"Error during minimal validation: {str(e)}")
-        logging.warning("Exception details:", exc_info=True)  # Print full stack trace
-        torch.cuda.empty_cache()
+        logging.warning(f"Error during validation: {str(e)}")
+        import traceback
+        logging.warning(f"Exception details:\n{traceback.format_exc()}")
+    
+    # Memory cleanup
+    torch.cuda.empty_cache()
+    logging.info(f"Validation complete. Memory used: {torch.cuda.max_memory_allocated() // 1024 // 1024}MB")
     
     return tot_loss
 

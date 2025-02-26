@@ -3,6 +3,13 @@ import torch
 import torchaudio
 from torch.utils.data import Dataset
 import logging
+from lhotse import CutSet, Recording, SupervisionSegment, Cut
+from lhotse.audio import AudioSource
+from lhotse.cut import MixedCut
+from typing import Dict, List, Optional, Union, Any
+import numpy as np
+import random
+from pathlib import Path
 
 class EstonianASRDataset(Dataset):
     def __init__(self, txt_path: str, base_path: str = None, transform=None, sp=None, max_duration: float = 10.0) -> None:
@@ -48,145 +55,123 @@ class EstonianASRDataset(Dataset):
                 wav_path, transcript = parts[0], parts[1]
                 total_files += 1
                 
-                # If base_path is provided, join it with wav_path
-                if base_path:
-                    wav_path = os.path.join(base_path, wav_path)
-                else:
-                    # If no base_path, treat wav_path as absolute or relative to current directory
-                    if not os.path.isabs(wav_path):
-                        wav_path = os.path.abspath(wav_path)
+                # Skip paths that don't exist
+                full_path = wav_path if not base_path else os.path.join(base_path, wav_path)
+                if not os.path.exists(full_path):
+                    self.logger.warning(f"File not found: {full_path}")
+                    continue
                 
                 try:
-                    # Get audio info without loading the whole file
-                    info = torchaudio.info(wav_path)
-                    
-                    # Calculate expected samples after resampling to 16kHz
-                    expected_samples = int(info.num_frames * (16000 / info.sample_rate))
-                    
-                    # Add some margin for resampling artifacts
-                    margin = 100  # Small safety margin
-                    if expected_samples - margin < self.min_samples:
+                    # Check the audio duration
+                    info = torchaudio.info(full_path)
+                    if info.num_frames < self.min_samples:
                         filtered_short += 1
-                        self.logger.debug(f"File too short: {wav_path} ({expected_samples} samples)")
                         continue
-                    if expected_samples + margin > self.max_samples:
+                    if info.num_frames > self.max_samples:
                         filtered_long += 1
-                        self.logger.debug(f"File too long: {wav_path} ({expected_samples} samples)")
                         continue
                     
-                    # Tokenize the transcript
-                    try:
-                        tokens = self.sp.encode(transcript, out_type=int)
-                        if len(tokens) == 0:
-                            self.logger.warning(f"Empty tokens for transcript: {transcript}")
-                            continue
-                        self.samples.append((wav_path, transcript, tokens))
-                    except Exception as e:
-                        self.logger.warning(f"Failed to tokenize: {transcript} - {str(e)}")
-                        continue
-                        
+                    # Add the sample
+                    self.samples.append((full_path, transcript))
+                
                 except Exception as e:
-                    self.logger.warning(f"Error checking file {wav_path}: {str(e)}")
+                    self.logger.error(f"Error loading {full_path}: {e}")
                     continue
         
-        self.logger.info(f"Loaded {len(self.samples)} samples from {txt_path}")
-        self.logger.info(f"Filtered out {filtered_short} samples shorter than {self.min_samples/16000:.1f}s")
-        self.logger.info(f"Filtered out {filtered_long} samples longer than {self.max_samples/16000:.1f}s")
-        self.logger.info(f"Total acceptance rate: {len(self.samples)/total_files*100:.1f}%")
-        self.logger.info(f"Using base path: {base_path if base_path else 'None'}")
-        # Print first few samples for verification
-        for i, (wav_path, transcript, tokens) in enumerate(self.samples[:3]):
-            self.logger.info(f"Sample {i}: {wav_path} | {transcript[:50]}... | tokens: {tokens[:10]}...")
-
+        self.logger.info(f"Loaded {len(self.samples)} files from {txt_path}")
+        self.logger.info(f"Filtered {filtered_short} files shorter than {self.min_samples/16000}s")
+        self.logger.info(f"Filtered {filtered_long} files longer than {self.max_samples/16000}s")
+        self.logger.info(f"Total files in text: {total_files}")
+    
     def __len__(self) -> int:
         return len(self.samples)
-
+    
     def __getitem__(self, idx: int) -> dict:
-        wav_path, transcript, tokens = self.samples[idx]
+        wav_path, transcript = self.samples[idx]
         
         try:
             # Load audio
             waveform, sample_rate = torchaudio.load(wav_path)
             
-            # Resample if needed
+            # Ensure mono audio
+            if waveform.size(0) > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+            
+            # Resample to 16kHz if needed
             if sample_rate != 16000:
                 resampler = torchaudio.transforms.Resample(sample_rate, 16000)
                 waveform = resampler(waveform)
-                
-            # Convert to mono if stereo
-            if waveform.size(0) > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
+                sample_rate = 16000
             
-            # Paper's approach: normalize raw waveform to [-1, 1]
-            waveform = waveform.squeeze()  # Remove channel dimension
-            if waveform.abs().max() > 0:
-                waveform = waveform / waveform.abs().max()
+            # Apply transform if available
+            if self.transform:
+                waveform = self.transform(waveform)
             
-            # Add batch dimension to get shape (1, time)
-            input_values = waveform.unsqueeze(0)
+            # Tokenize text if SentencePieceProcessor is available
+            if self.sp:
+                tokens = self.sp.encode(transcript, out_type=int)
+                token_lens = torch.tensor([len(tokens)], dtype=torch.int32)
+            else:
+                tokens = []
+                token_lens = torch.tensor([0], dtype=torch.int32)
             
-            # Double check shape - should be (1, time)
-            assert input_values.dim() == 2, f"Expected 2D tensor, got {input_values.shape}"
+            # Create supervision information
+            supervisions = {
+                'num_frames': torch.tensor([waveform.size(1)], dtype=torch.int32),
+                'text': transcript,
+                'audio_paths': wav_path,
+                'tokens': tokens,
+                'token_lens': token_lens
+            }
             
-            # Double check length constraints with some margin for resampling
-            margin = 100  # Small safety margin
-            if input_values.size(1) < self.min_samples - margin:
-                raise ValueError(f"Audio too short after processing: {input_values.size(1)} samples")
-            if input_values.size(1) > self.max_samples + margin:
-                raise ValueError(f"Audio too long after processing: {input_values.size(1)} samples")
-            
-            # Validate audio duration vs text length
-            min_chars_per_second = 3  # Estonian ~4.5 chars/sec avg
-            audio_duration = input_values.size(1) / 16000
-            if len(transcript) / audio_duration < min_chars_per_second:
-                self.logger.warning(f"Suspicious sample {wav_path} - {len(transcript)} chars in {audio_duration:.1f}s")
-            
-            # Convert tokens to tensor
-            tokens_tensor = torch.tensor(tokens, dtype=torch.int32)
-            
-            # Return a dictionary with processed input values
             return {
-                'inputs': input_values,  # Shape: (1, time)
-                'supervisions': {
-                    'num_frames': input_values.size(1),  # Use raw audio length
-                    'text': transcript,
-                    'audio_paths': wav_path,
-                    'tokens': tokens_tensor,
-                    'token_lens': torch.tensor([len(tokens)], dtype=torch.int32)
-                }
+                'inputs': waveform,  # Shape: (1, time)
+                'supervisions': supervisions
             }
             
         except Exception as e:
-            self.logger.error(f"Error loading file {wav_path}: {str(e)}")
-            # Skip this sample by loading the next one
-            next_idx = (idx + 1) % len(self)
-            return self[next_idx]
-
+            self.logger.error(f"Error loading {wav_path}: {e}")
+            # Return a minimal filler item - will be filtered in collate_fn
+            return {
+                'inputs': torch.zeros(1, self.min_samples),
+                'supervisions': {
+                    'num_frames': torch.tensor([0], dtype=torch.int32),
+                    'text': '',
+                    'audio_paths': wav_path,
+                    'tokens': [],
+                    'token_lens': torch.tensor([0], dtype=torch.int32)
+                }
+            }
 
 def collate_fn(batch: list, max_duration: float = 10.0) -> dict:
-    """Collate function that respects maximum duration limits
+    """
+    Custom collate function for the Estonian ASR dataset.
+    
     Args:
         batch: List of samples from the dataset
         max_duration: Maximum audio duration in seconds
+        
     Returns:
-        Batched data with padded sequences
+        Batched dictionary with padded inputs and supervisions
     """
-    # Convert max duration to samples (at 16kHz)
-    max_samples = int(max_duration * 16000)
-    
-    # Filter and truncate sequences
+    # Filter out samples with zero frames or other issues
     filtered_batch = []
+    max_samples = int(max_duration * 16000)  # Maximum samples at 16kHz
+    
     for item in batch:
-        if item['inputs'].size(1) > max_samples:
-            # Truncate sequence
+        num_frames = item['supervisions']['num_frames']
+        if num_frames.item() <= 0:
+            continue
+        if num_frames.item() > max_samples:
+            # Truncate long samples
             item['inputs'] = item['inputs'][:, :max_samples]
             item['supervisions']['num_frames'] = torch.tensor([max_samples])
         filtered_batch.append(item)
     
-    if not filtered_batch:
-        # If all sequences were filtered out, take first sequence and truncate it
-        item = batch[0]
-        item['inputs'] = item['inputs'][:, :max_samples]
+    # If all samples were filtered out, return a minimal batch
+    if len(filtered_batch) == 0:
+        item = batch[0].copy()  # Use the first sample as a template
+        item['inputs'] = torch.zeros(1, max_samples)
         item['supervisions']['num_frames'] = torch.tensor([max_samples])
         filtered_batch = [item]
     
@@ -263,4 +248,93 @@ def collate_fn(batch: list, max_duration: float = 10.0) -> dict:
         'token_lens': token_lens
     }
     
-    return {'inputs': inputs, 'supervisions': supervisions} 
+    return {'inputs': inputs, 'supervisions': supervisions}
+
+
+class EstonianCutSet:
+    """Wrapper class that adapts EstonianASRDataset to look like a CutSet for the Icefall pipeline."""
+    
+    def __init__(self, cuts: List[dict] = None):
+        """
+        Args:
+            cuts: List of dictionaries representing cuts
+        """
+        self.cuts = cuts if cuts is not None else []
+        
+    def __getitem__(self, idx: Union[int, List[int]]) -> Dict:
+        """
+        Get a single cut or a batch of cuts.
+        
+        Args:
+            idx: Index or list of indices
+            
+        Returns:
+            Dictionary with batch of inputs and supervisions
+        """
+        if isinstance(idx, int):
+            return self.cuts[idx]
+        elif isinstance(idx, list):
+            selected_cuts = [self.cuts[i] for i in idx]
+            return collate_fn(selected_cuts)
+        else:
+            raise TypeError(f"Unsupported index type: {type(idx)}")
+    
+    def __len__(self) -> int:
+        return len(self.cuts)
+
+
+class EstonianDataModule:
+    """Data module for loading Estonian speech data."""
+    
+    def __init__(self, train_list: str, val_list: str, audio_base_path: str = None, sp=None):
+        """
+        Args:
+            train_list: Path to train list file
+            val_list: Path to validation list file
+            audio_base_path: Base path for audio files
+            sp: SentencePieceProcessor for tokenization
+        """
+        self.train_list = train_list
+        self.val_list = val_list
+        self.audio_base_path = audio_base_path
+        self.sp = sp
+        self.logger = logging.getLogger(__name__)
+        
+        self.train_dataset = None
+        self.val_dataset = None
+        
+    def train_cuts(self) -> EstonianCutSet:
+        """Load and return training data."""
+        if self.train_dataset is None:
+            self.logger.info(f"Loading training data from {self.train_list}")
+            self.train_dataset = EstonianASRDataset(
+                txt_path=self.train_list,
+                base_path=self.audio_base_path,
+                sp=self.sp
+            )
+            
+        # Convert dataset items to cut-like format
+        cuts = []
+        for i in range(len(self.train_dataset)):
+            cuts.append(self.train_dataset[i])
+            
+        self.logger.info(f"Loaded {len(cuts)} training samples")
+        return EstonianCutSet(cuts)
+    
+    def val_cuts(self) -> EstonianCutSet:
+        """Load and return validation data."""
+        if self.val_dataset is None:
+            self.logger.info(f"Loading validation data from {self.val_list}")
+            self.val_dataset = EstonianASRDataset(
+                txt_path=self.val_list,
+                base_path=self.audio_base_path,
+                sp=self.sp
+            )
+            
+        # Convert dataset items to cut-like format
+        cuts = []
+        for i in range(len(self.val_dataset)):
+            cuts.append(self.val_dataset[i])
+            
+        self.logger.info(f"Loaded {len(cuts)} validation samples")
+        return EstonianCutSet(cuts) 

@@ -68,6 +68,7 @@ from joiner import Joiner
 from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
+from lhotse.dataset.dataloading import DataLoader
 from model import Transducer
 from optim import Eden, ScaledAdam
 from torch import Tensor
@@ -1777,6 +1778,245 @@ def find_optimal_chunk_size(
     logging.info(f"Optimal chunk size: {optimal[0]} with efficiency {optimal[1]['efficiency']:.3f}")
     
     return optimal[1]["size"]
+
+
+def run(rank: int, world_size: int, args: argparse.Namespace):
+    """
+    Args:
+      rank: The rank of the current process in the distributed training.
+      world_size: Number of processes participating in the training.
+      args: Command-line arguments parsed by argparse.
+    """
+    fix_random_seed(args.seed)
+    
+    if world_size > 1:
+        setup_dist(rank=rank, world_size=world_size, master_port=args.master_port)
+    
+    setup_logger(f"{args.exp_dir}/log/log-train")
+    logging.info("Training started")
+    logging.info(f"Rank: {rank}/{world_size}")
+    
+    # Display training parameters as key-value pairs
+    params = get_params()
+    for key, value in vars(args).items():
+        params[key] = value
+    
+    # Update params with necessary values
+    params.update({
+        "env_info": get_env_info(),
+        "start_epoch": args.start_epoch, 
+        "num_epochs": args.num_epochs,
+        "start_batch": args.start_batch,
+        "use_fp16": args.use_fp16,
+        "exp_dir": args.exp_dir,
+        "tensorboard": args.tensorboard,
+        "dataset": args.dataset,
+        "use_xlsr": args.use_xlsr,
+        "xlsr_model_name": args.xlsr_model_name,
+        "streaming_start_epoch": args.streaming_start_epoch,
+        "pre_train_epochs": args.pre_train_epochs,
+        "pre_train_lr": args.pre_train_lr,
+        "decode_chunk_size": args.decode_chunk_size,
+        "attention_sink_size": args.attention_sink_size,
+        "left_context_chunks": args.left_context_chunks,
+    })
+    
+    if params.tensorboard and rank == 0:
+        from torch.utils.tensorboard import SummaryWriter
+        tb_writer = SummaryWriter(log_dir=f"{params.exp_dir}/tensorboard")
+    else:
+        tb_writer = None
+    
+    # Save key configurations to a file
+    if rank == 0:
+        with open(f"{params.exp_dir}/configs.yml", "w") as file:
+            for key, value in params.items():
+                if isinstance(value, (str, int, float, bool)):
+                    file.write(f"{key}: {value}\n")
+            for key, value in vars(args).items():
+                if isinstance(value, (str, int, float, bool)):
+                    file.write(f"{key}: {value}\n")
+    
+    logging.info(f"Loading BPE model: {args.bpe_model}")
+    sp = spm.SentencePieceProcessor()
+    sp.load(args.bpe_model)
+    
+    # <blankid> is defined in the spm model
+    params.blank_id = sp.piece_to_id("<blankid>")
+    params.vocab_size = sp.get_piece_size()
+    
+    logging.info(f"Vocab size: {params.vocab_size}")
+    logging.info(f"Blank ID: {params.blank_id}")
+    
+    # Initialize/Load dataset
+    if args.dataset == "librispeech":
+        if not torch.cuda.is_available():
+            logging.warning("No GPU detected, using CPU for training!")
+            
+        dm = LibriSpeechAsrDataModule(args)
+        train_cuts = dm.train_cuts()
+        
+        # For debug
+        if args.full_libri == 1:
+            logging.info("Using full Librispeech")
+        else:
+            # Only use 100h training data
+            logging.info("Using Librispeech train-clean-100")
+            train_cuts = train_cuts.filter(lambda cut: cut.recording.id.startswith("train-clean-100"))
+        
+        if args.enable_musan:
+            # Enable MUSAN augmentation
+            logging.info("Enable MUSAN augmentation")
+            train_cuts = load_manifest_lazy(
+                    Path("data/manifests/librispeech_cuts_musan.jsonl.gz")
+            )  # noqa
+        
+        # Sample up to args.max_duration seconds
+        if args.max_duration > 0:
+            logging.info(
+                f"Sample up to {args.max_duration} seconds from each cut in the training set"
+            )
+            train_cuts = train_cuts.cut_into_windows(
+                duration=args.max_duration
+            ).cut_into_windows(duration=args.max_duration)
+        
+        def remove_short_and_long_utt(c: Cut):
+            # Remove utterances with duration less than 1 second or more than 20 seconds
+            return 1.0 <= c.duration <= 20.0
+            
+        train_cuts = train_cuts.filter(remove_short_and_long_utt)
+        
+        # Create validation dataloaders
+        valid_cuts = dm.dev_cuts()
+        test_cuts = dm.test_cuts()
+    elif args.dataset == "estonian":
+        # Set up Estonian dataset from files
+        from estonian_dataset import EstonianDataModule, EstonianCutSet
+        
+        # Create Estonian datamodule
+        estonia_dm = EstonianDataModule(
+            train_list=args.train_txt,
+            val_list=args.val_txt,
+            audio_base_path=args.audio_base_path
+        )
+        
+        # Get train and validation data
+        train_cuts = estonia_dm.train_cuts()
+        valid_cuts = estonia_dm.val_cuts()
+        test_cuts = valid_cuts  # Use validation data as test since we don't have separate test set
+        
+        logging.info(f"Estonian dataset loaded with {len(train_cuts)} training and {len(valid_cuts)} validation samples")
+    else:
+        raise ValueError(f"Unsupported dataset: {args.dataset}")
+    
+    # Create training sampler
+    train_sampler = CutSampler(
+        cuts=train_cuts,
+        max_duration=params.max_duration["non_streaming"] if isinstance(params.max_duration, dict) else params.max_duration,
+        shuffle=True,
+    )
+    
+    logging.info(f"Number of training samples: {len(train_cuts)}")
+    logging.info(f"Number of validation samples: {len(valid_cuts)}")
+    
+    # Create training dataloader
+    train_dl = DataLoader(
+        EstonianCutSet(train_cuts) if args.dataset == "estonian" else train_cuts,
+        batch_size=None,
+        sampler=train_sampler,
+        num_workers=4,
+        persistent_workers=True,
+    )
+    
+    # Create validation dataloader with a smaller batch
+    valid_sampler = CutSampler(
+        cuts=valid_cuts,
+        max_duration=params.max_duration["non_streaming"] if isinstance(params.max_duration, dict) else params.max_duration,
+        shuffle=False,
+    )
+    
+    valid_dl = DataLoader(
+        EstonianCutSet(valid_cuts) if args.dataset == "estonian" else valid_cuts,
+        batch_size=None,
+        sampler=valid_sampler,
+        num_workers=1,
+        persistent_workers=False,
+    )
+    
+    # Create model, optimizer, scheduler, etc.
+    model = get_transducer_model(params)
+    
+    if params.print_diagnostics:
+        diagnostic = diagnostics.attach_diagnostics(model)
+    
+    if params.inf_check:
+        register_inf_check_hooks(model)
+    
+    model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    
+    if world_size > 1:
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+    
+    optimizer = ScaledAdam(
+        model.parameters(),
+        lr=params.base_lr,
+        clipping_scale=2.0,
+        parameters_names=list(name for name, _ in model.named_parameters()),
+    )
+    
+    scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
+    
+    scaler = GradScaler(enabled=params.use_fp16)
+    
+    if params.start_batch > 0 or params.start_epoch > 1:
+        load_checkpoint_if_available(
+            params=params,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+        )
+    
+    # If in early training, run pessimistic OOM check
+    if params.start_epoch == 1 and params.start_batch == 0:
+        scan_pessimistic_batches_for_oom(
+            model=model,
+            train_dl=train_dl,
+            optimizer=optimizer,
+            sp=sp,
+            params=params,
+        )
+    
+    # Main training loop
+    for epoch in range(params.start_epoch, params.num_epochs + 1):
+        if params.start_batch == 0:
+            set_batch_count(model, 0)
+            fix_random_seed(params.seed + epoch - 1)
+        
+        params.cur_epoch = epoch
+        
+        train_one_epoch(
+            params=params,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            train_dl=train_dl,
+            valid_dl=valid_dl,
+            sp=sp,
+            scaler=scaler,
+            tb_writer=tb_writer,
+            world_size=world_size,
+            rank=rank,
+        )
+        
+        if params.print_diagnostics:
+            diagnostic.print_diagnostics()
+            break
+    
+    # Final cleanup
+    logging.info("Training finished")
+    if world_size > 1:
+        torch.distributed.barrier()
+        cleanup_dist()
 
 
 def main():

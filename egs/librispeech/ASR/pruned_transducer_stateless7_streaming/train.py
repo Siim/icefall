@@ -68,7 +68,6 @@ from joiner import Joiner
 from lhotse.cut import Cut
 from lhotse.dataset.sampling.base import CutSampler
 from lhotse.utils import fix_random_seed
-from lhotse.dataset.dataloading import DataLoader
 from model import Transducer
 from optim import Eden, ScaledAdam
 from torch import Tensor
@@ -90,8 +89,7 @@ from icefall.env import get_env_info
 from icefall.err import raise_grad_scale_is_too_small_error
 from icefall.hooks import register_inf_check_hooks
 from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
-from beam_search import greedy_search_batch  # For compatibility
-from xlsr_greedy_search import greedy_search_batch as xlsr_greedy_search_batch  # XLSR-specific implementation
+from beam_search import greedy_search_batch  # Only import what we use for validation
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -854,9 +852,7 @@ def evaluate_streaming(
     model.eval()
     total_words = 0
     total_errors = 0
-    total_duration = 0.0
-    total_processing_time = 0.0
-    total_tokens_predicted = 0
+    total_latency = 0.0
     
     for batch_idx, batch in enumerate(valid_dl):
         try:
@@ -865,32 +861,21 @@ def evaluate_streaming(
                 feature_lens = batch["supervisions"]["num_frames"].to(feature.device)
                 texts = batch["supervisions"]["text"]
                 
-                # Calculate audio duration in seconds
-                audio_duration = feature.size(1) / 16000  # 16kHz sampling rate
-                total_duration += audio_duration
-                
-                # Process in chunks with timing
-                start_time = time.time()
-                
+                # Process in chunks
                 encoder_out = process_streaming_chunks(
                     model=model,
                     feature=feature,
-                    feature_lens=feature_lens,
                     chunk_size=chunk_size,
                     attention_sink_size=params.attention_sink_size,
                     left_context_chunks=params.left_context_chunks
                 )
                 
-                # Use XLSR-specific greedy search for decoding - handles batch size mismatches
-                hyp_tokens = xlsr_greedy_search_batch(
+                # Quick validation with greedy search
+                hyp_tokens = greedy_search_batch(
                     model=model,
                     encoder_out=encoder_out,
-                    encoder_out_lens=feature_lens,
+                    encoder_out_lens=feature_lens
                 )
-                
-                # Measure processing time
-                processing_time = time.time() - start_time
-                total_processing_time += processing_time
                 
                 # Convert predictions to text
                 hyps = []
@@ -898,7 +883,6 @@ def evaluate_streaming(
                     if isinstance(tokens, torch.Tensor):
                         tokens = tokens.tolist()
                     hyps.append(sp.decode(tokens))
-                    total_tokens_predicted += len(tokens)
                 
                 # Calculate WER
                 for hyp, ref in zip(hyps, texts):
@@ -907,88 +891,45 @@ def evaluate_streaming(
                     total_words += len(ref_words)
                     total_errors += editdistance.eval(hyp_words, ref_words)
                 
+                # Calculate latency
+                total_latency += feature.size(1) / 16000  # Convert samples to seconds
+                
         except Exception as e:
             logging.error(f"Error processing batch {batch_idx}: {str(e)}")
             continue
             
         if batch_idx % 10 == 0:
             wer = 100.0 * total_errors / max(1, total_words)
-            rtf = total_processing_time / max(0.001, total_duration)
-            logging.info(f"Batch {batch_idx}, current WER: {wer:.2f}%, RTF: {rtf:.2f}x")
+            logging.info(f"Batch {batch_idx}, current WER: {wer:.2f}%")
     
     # Calculate final metrics
     wer = 100.0 * total_errors / max(1, total_words)
-    
-    # Real-time factor (RTF) - lower is better
-    rtf = total_processing_time / max(0.001, total_duration)
-    
-    # Per-token latency in milliseconds
-    per_token_latency = 1000 * total_processing_time / max(1, total_tokens_predicted)
-    
-    # First-token latency estimate (assuming first chunk processing time)
-    first_token_latency = 1000 * chunk_size / 16000  # milliseconds
+    avg_latency = total_latency / len(valid_dl)
     
     metrics = {
         "wer": wer,
-        "rtf": rtf,
-        "per_token_latency_ms": per_token_latency,
-        "first_token_latency_ms": first_token_latency,
+        "latency": avg_latency,
         "chunk_size_ms": chunk_size / 16,  # Convert samples to ms
-        "total_processing_time": total_processing_time,
-        "total_audio_duration": total_duration,
     }
     
-    logging.info(f"Streaming evaluation results:")
-    logging.info(f"  WER: {wer:.2f}%")
-    logging.info(f"  Real-time factor: {rtf:.2f}x")
-    logging.info(f"  Per-token latency: {per_token_latency:.1f} ms")
-    logging.info(f"  First-token latency (estimated): {first_token_latency:.1f} ms")
-    logging.info(f"  Chunk size: {chunk_size / 16:.1f} ms")
-    
     return metrics
-
-
-def get_random_chunk_size(base_size=8000, variance=0.5, min_size=2560, max_size=20480):
-    """Get a random chunk size for multi-chunk training
-    
-    Args:
-        base_size: Base chunk size in samples (default: 8000 for 500ms at 16kHz)
-        variance: Variance factor for randomization (default: 0.5)
-        min_size: Minimum allowed chunk size (default: 2560 for 160ms at 16kHz)
-        max_size: Maximum allowed chunk size (default: 20480 for 1280ms at 16kHz)
-    
-    Returns:
-        Random chunk size in samples
-    """
-    # Choose a random factor between 1-variance and 1+variance
-    factor = 1.0 + (random.random() * 2 - 1) * variance
-    # Calculate chunk size and ensure it's within bounds
-    chunk_size = int(base_size * factor)
-    chunk_size = max(min_size, min(max_size, chunk_size))
-    # Ensure chunk size is divisible by 320 (Wav2vec2 downsampling factor)
-    chunk_size = (chunk_size // 320) * 320
-    return chunk_size
 
 
 def process_streaming_chunks(
     model: nn.Module,
     feature: torch.Tensor,
-    feature_lens: torch.Tensor,
     chunk_size: int,
     attention_sink_size: int,
-    left_context_chunks: int,
-    multi_chunk_training: bool = False
+    left_context_chunks: int
 ) -> torch.Tensor:
     """Process input features in streaming mode with chunks following paper's approach.
     
     Args:
         model: The model to use
         feature: Input features (batch, time)
-        feature_lens: Lengths of features
-        chunk_size: Size of each chunk in samples
-        attention_sink_size: Number of frames for attention sink
-        left_context_chunks: Number of left context chunks
-        multi_chunk_training: Whether to use randomized chunk sizes during training
+        chunk_size: Size of each chunk in samples (e.g., 5120 for 320ms)
+        attention_sink_size: Number of frames for attention sink (16 as per paper)
+        left_context_chunks: Number of left context chunks (1 as per paper)
     
     Returns:
         Encoder output tensor
@@ -996,46 +937,43 @@ def process_streaming_chunks(
     device = feature.device
     batch_size = feature.size(0)
     
-    # Initialize states and outputs
+    # Initialize states
     states = None
     chunk_outputs = []
     
     # Calculate chunk parameters
-    chunk_overlap = chunk_size // 2  # 50% overlap as per paper
+    chunk_overlap = chunk_size // 2  # Half overlap as per paper
+    effective_chunk_size = chunk_size - chunk_overlap
     
-    # Process each sequence in the batch
-    for i in range(batch_size):
-        seq_len = feature_lens[i]
-        seq = feature[i, :seq_len].unsqueeze(0)  # Add batch dimension back
-        
+    # Calculate attention sink size in samples
+    sink_size = attention_sink_size * model.encoder.downsample_factor
+    
+    # Process each sequence in batch
+    for b in range(batch_size):
+        seq = feature[b:b+1]  # Keep batch dimension
         pos = 0
         seq_outputs = []
         left_context = None
-        sink_cache = None
         
         while pos < seq.size(1):
-            # Randomize chunk size if multi-chunk training is enabled
-            if multi_chunk_training and random.random() > 0.3:  # 70% chance to randomize
-                current_chunk_size = get_random_chunk_size(
-                    base_size=chunk_size, 
-                    variance=0.5
-                )
-                current_overlap = current_chunk_size // 2
-            else:
-                current_chunk_size = chunk_size
-                current_overlap = chunk_overlap
-                
             # Get current chunk boundaries
-            end_pos = min(pos + current_chunk_size, seq.size(1))
+            end_pos = min(pos + chunk_size, seq.size(1))
             chunk = seq[:, pos:end_pos]
             
             # Add left context if available
             if left_context is not None:
                 chunk = torch.cat([left_context, chunk], dim=1)
             
-            # Add attention sink if available
-            if sink_cache is not None:
-                chunk = torch.cat([sink_cache, chunk], dim=1)
+            # Add attention sink if enabled
+            if states is not None and attention_sink_size > 0:
+                sink = states[1]  # Attention sink cache from previous chunk
+                if sink is not None:
+                    # Handle dimension mismatch between sink and chunk
+                    if sink.ndim == 3 and chunk.ndim == 2:
+                        # Extract a single feature dimension to match chunk dimensions
+                        sink = sink[:, :, 0]
+                    # Paper's approach: prepend attention sink to current chunk
+                    chunk = torch.cat([sink, chunk], dim=1)
             
             # Process chunk through encoder
             chunk_out, chunk_lens, new_states = model.encoder.streaming_forward(
@@ -1044,53 +982,43 @@ def process_streaming_chunks(
                 states
             )
             
-            # Verify chunk_out has valid dimensions and is not empty
-            if chunk_out.size(1) == 0:
-                # If we got an empty output, use a minimal fallback
-                # Create a small non-zero output based on chunk size
-                min_frames = max(1, int(chunk.size(1) / model.encoder.downsample_factor))
-                logging.warning(f"Empty encoder output detected. Using fallback with {min_frames} frames.")
-                fallback_dim = model.encoder.output_dim
-                chunk_out = torch.zeros((1, min_frames, fallback_dim), device=device)
-            
-            # Update cache for next iteration
+            # Update states with new attention sink
             if attention_sink_size > 0:
-                # Cache end of current chunk for attention sink
-                sink_size = attention_sink_size * model.encoder.downsample_factor
-                sink_cache = chunk[:, -sink_size:].detach().clone()
-                
+                # Cache end of current chunk for attention sink (paper's approach)
+                states = [chunk, chunk_out[:, -attention_sink_size:]]
+            else:
+                states = new_states
+            
             # Save left context for next chunk
             if left_context_chunks > 0:
-                left_context = chunk[:, -current_overlap:].detach().clone()
+                left_context = chunk[:, -chunk_overlap:]
             
-            # Add to outputs only if not empty
-            if chunk_out.size(1) > 0:
-                seq_outputs.append(chunk_out)
-            else:
-                logging.warning(f"Skipping empty chunk at position {pos}")
-                
-            # Move to next position with overlap
-            pos = end_pos - current_overlap
+            # Remove overlap from previous chunk's output
+            if pos > 0:
+                chunk_out = chunk_out[:, chunk_overlap//model.encoder.downsample_factor:]
+            
+            seq_outputs.append(chunk_out)
+            pos = end_pos - chunk_overlap
         
-        # Concatenate all outputs for this sequence if not empty
-        if len(seq_outputs) > 0:
-            seq_encoder_out = torch.cat(seq_outputs, dim=1)
-            chunk_outputs.append(seq_encoder_out)
-        else:
-            # Create fallback output with minimal dimension
-            logging.warning(f"No valid chunks for sequence {i}. Using fallback output.")
-            fallback_dim = model.encoder.output_dim
-            seq_encoder_out = torch.zeros((1, 1, fallback_dim), device=device)
-            chunk_outputs.append(seq_encoder_out)
+        # Concatenate all chunks for this sequence
+        seq_output = torch.cat(seq_outputs, dim=1)
+        chunk_outputs.append(seq_output)
     
-    # Return batch of outputs - check if we have any valid outputs
-    if len(chunk_outputs) > 0:
-        return torch.cat(chunk_outputs, dim=0)
-    else:
-        # Emergency fallback with minimum size tensor
-        logging.error("No valid outputs from any sequence. Using emergency fallback.")
-        fallback_dim = model.encoder.output_dim
-        return torch.zeros((batch_size, 1, fallback_dim), device=device)
+    # Pad sequences to max length
+    max_len = max(output.size(1) for output in chunk_outputs)
+    padded_outputs = []
+    
+    for output in chunk_outputs:
+        if output.size(1) < max_len:
+            padding = torch.zeros(
+                1, max_len - output.size(1), output.size(2),
+                device=device, dtype=output.dtype
+            )
+            padded_outputs.append(torch.cat([output, padding], dim=1))
+        else:
+            padded_outputs.append(output)
+    
+    return torch.cat(padded_outputs, dim=0)
 
 
 def compute_loss(
@@ -1153,11 +1081,9 @@ def compute_loss(
         encoder_out = process_streaming_chunks(
             model=model,
             feature=feature,
-            feature_lens=feature_lens,
             chunk_size=curr_chunk_size,
             attention_sink_size=params.attention_sink_size,
-            left_context_chunks=params.left_context_chunks,
-            multi_chunk_training=False
+            left_context_chunks=params.left_context_chunks
         )
         # Calculate encoder output lengths based on chunk processing
         encoder_out_lens = ((feature_lens.float() / model.encoder.downsample_factor).floor()).to(torch.int64)
@@ -1279,8 +1205,8 @@ def decode_one_batch_hyps(
         else:
             encoder_out = model.encoder_proj(encoder_out)
         
-        # Use XLSR-specific greedy search for decoding - handles batch size mismatches
-        hyp_tokens = xlsr_greedy_search_batch(
+        # Use greedy search batch for decoding
+        hyp_tokens = greedy_search_batch(
             model=model,
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
@@ -1465,6 +1391,7 @@ def train_one_epoch(
                 sp=sp,
                 batch=batch,
                 is_training=True,
+                is_pre_training=is_pre_training,
                 scaler=scaler
             )
             
@@ -1519,11 +1446,9 @@ def train_one_epoch(
                                 streaming_out = process_streaming_chunks(
                                     model=model,
                                     feature=batch["inputs"].to(device),
-                                    feature_lens=batch["supervisions"]["num_frames"].to(device),
                                     chunk_size=params.chunk_sizes["320ms"],
                                     attention_sink_size=params.attention_sink_size,
-                                    left_context_chunks=params.left_context_chunks,
-                                    multi_chunk_training=False
+                                    left_context_chunks=params.left_context_chunks
                                 )
                                 
                                 # Compare outputs
@@ -1625,6 +1550,221 @@ def train_one_epoch(
         scaler=scaler,
         rank=rank,
     )
+
+
+def run(rank, world_size, args):
+    """
+    Args:
+      rank:
+        It is a value between 0 and `world_size-1`, which is
+        passed automatically by `mp.spawn()` in :func:`main`.
+        The node with rank 0 is responsible for saving checkpoint.
+      world_size:
+        Number of GPUs for DDP training.
+      args:
+        The return value of get_parser().parse_args()
+    """
+    params = get_params()
+    params.update(vars(args))
+    # We want to keep our validation interval at 500 regardless of dataset
+    # if params.full_libri is False:
+    #     params.valid_interval = 1600
+
+    fix_random_seed(params.seed)
+    if world_size > 1:
+        setup_dist(rank, world_size, params.master_port)
+
+    setup_logger(f"{params.exp_dir}/log/log-train")
+    logging.info("Training started")
+
+    if args.tensorboard and rank == 0:
+        tb_writer = SummaryWriter(log_dir=f"{params.exp_dir}/tensorboard")
+    else:
+        tb_writer = None
+
+    device = torch.device("cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda", rank)
+    logging.info(f"Device: {device}")
+
+    sp = spm.SentencePieceProcessor()
+    sp.load(params.bpe_model)
+
+    # <blk> is defined in local/train_bpe_model.py
+    params.blank_id = sp.piece_to_id("<blk>")
+    params.vocab_size = sp.get_piece_size()
+
+    logging.info(params)
+
+    logging.info("About to create model")
+    model = get_transducer_model(params)
+
+    num_param = sum([p.numel() for p in model.parameters()])
+    logging.info(f"Number of model parameters: {num_param}")
+
+    assert params.save_every_n >= params.average_period
+    model_avg: Optional[nn.Module] = None
+    if rank == 0:
+        # model_avg is only used with rank 0
+        model_avg = copy.deepcopy(model).to(torch.float64)
+
+    assert params.start_epoch > 0, params.start_epoch
+    checkpoints = load_checkpoint_if_available(
+        params=params, model=model, model_avg=model_avg
+    )
+
+    model.to(device)
+    if world_size > 1:
+        logging.info("Using DDP")
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+
+    parameters_names = []
+    parameters_names.append(
+        [name_param_pair[0] for name_param_pair in model.named_parameters()]
+    )
+    optimizer = ScaledAdam(
+        model.parameters(),
+        lr=params.base_lr,
+        clipping_scale=2.0,
+        parameters_names=parameters_names,
+    )
+
+    # Paper uses warmup followed by decay
+    def lr_scheduler(step: int, epoch: int) -> float:
+        # Warmup phase
+        if step < params.warmup_steps:
+            return step / params.warmup_steps
+        # Decay phase based on steps and epochs
+        decay_factor = 0.05 * (params.num_epochs - epoch) / params.num_epochs
+        return max(0.05, decay_factor)  # Don't let LR go below 5% of base_lr
+
+    scheduler = Eden(
+        optimizer,
+        lr_batches=params.lr_batches,
+        lr_epochs=params.lr_epochs,
+        warmup_batches=params.warmup_steps,
+    )
+
+    if checkpoints and "optimizer" in checkpoints:
+        logging.info("Loading optimizer state dict")
+        optimizer.load_state_dict(checkpoints["optimizer"])
+
+    if checkpoints and "scheduler" in checkpoints:
+        logging.info("Loading scheduler state dict")
+        scheduler.load_state_dict(checkpoints["scheduler"])
+
+    if params.print_diagnostics:
+        opts = diagnostics.TensorDiagnosticOptions(
+            512
+        )  # allow 4 megabytes per sub-module
+        diagnostic = diagnostics.attach_diagnostics(model, opts)
+
+    if params.inf_check:
+        register_inf_check_hooks(model)
+
+    if params.dataset == "estonian":
+        from estonian_dataset import EstonianASRDataset, collate_fn
+        logging.info("Using Estonian dataset")
+        
+        train_dataset = EstonianASRDataset(params.train_txt, base_path=params.audio_base_path, sp=sp)
+        train_dl = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=params.batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=2,
+        )
+        
+        valid_dataset = EstonianASRDataset(params.val_txt, base_path=params.audio_base_path, sp=sp)
+        valid_dl = torch.utils.data.DataLoader(
+            valid_dataset,
+            batch_size=params.batch_size,
+            shuffle=False,
+            collate_fn=collate_fn,
+            num_workers=2,
+        )
+    else:
+        librispeech = LibriSpeechAsrDataModule(args)
+        
+        if params.mini_libri:
+            train_cuts = librispeech.train_clean_5_cuts()
+        else:
+            if params.full_libri:
+                train_cuts = librispeech.train_all_shuf_cuts()
+            else:
+                train_cuts = librispeech.train_clean_100_cuts()
+
+        if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
+            sampler_state_dict = checkpoints["sampler"]
+        else:
+            sampler_state_dict = None
+
+        train_dl = librispeech.train_dataloaders(
+            train_cuts, sampler_state_dict=sampler_state_dict
+        )
+
+        if params.mini_libri:
+            valid_cuts = librispeech.dev_clean_2_cuts()
+        else:
+            valid_cuts = librispeech.dev_clean_cuts()
+            valid_cuts += librispeech.dev_other_cuts()
+        valid_dl = librispeech.valid_dataloaders(valid_cuts)
+
+    if params.print_diagnostics:
+        scan_pessimistic_batches_for_oom(
+            model=model,
+            train_dl=train_dl,
+            optimizer=optimizer,
+            sp=sp,
+            params=params,
+        )
+
+    # Update to use new GradScaler API
+    scaler = torch.amp.GradScaler('cuda', enabled=params.use_fp16, init_scale=1.0) if params.use_fp16 else None
+    if checkpoints and "grad_scaler" in checkpoints:
+        logging.info("Loading grad scaler state dict")
+        scaler.load_state_dict(checkpoints["grad_scaler"])
+
+    for epoch in range(params.start_epoch, params.num_epochs + 1):
+        scheduler.step_epoch(epoch - 1)
+        fix_random_seed(params.seed + epoch - 1)
+        
+        if params.dataset != "estonian":
+            train_dl.sampler.set_epoch(epoch - 1)
+
+        if tb_writer is not None:
+            tb_writer.add_scalar("train/epoch", epoch, params.batch_idx_train)
+
+        params.cur_epoch = epoch
+
+        train_one_epoch(
+            params=params,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            train_dl=train_dl,
+            valid_dl=valid_dl,
+            sp=sp,
+            scaler=scaler,
+            tb_writer=tb_writer,
+            world_size=world_size,
+            rank=rank,
+        )
+
+        if params.print_diagnostics:
+            diagnostic.print_diagnostics()
+            break
+
+        save_checkpoint(
+            params=params,
+            model=model,
+            model_avg=model_avg,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            sampler=train_dl.sampler if params.dataset != "estonian" else None,
+            scaler=scaler,
+            rank=rank,
+        )
 
     logging.info("Done!")
 
@@ -1778,245 +1918,6 @@ def find_optimal_chunk_size(
     logging.info(f"Optimal chunk size: {optimal[0]} with efficiency {optimal[1]['efficiency']:.3f}")
     
     return optimal[1]["size"]
-
-
-def run(rank: int, world_size: int, args: argparse.Namespace):
-    """
-    Args:
-      rank: The rank of the current process in the distributed training.
-      world_size: Number of processes participating in the training.
-      args: Command-line arguments parsed by argparse.
-    """
-    fix_random_seed(args.seed)
-    
-    if world_size > 1:
-        setup_dist(rank=rank, world_size=world_size, master_port=args.master_port)
-    
-    setup_logger(f"{args.exp_dir}/log/log-train")
-    logging.info("Training started")
-    logging.info(f"Rank: {rank}/{world_size}")
-    
-    # Display training parameters as key-value pairs
-    params = get_params()
-    for key, value in vars(args).items():
-        params[key] = value
-    
-    # Update params with necessary values
-    params.update({
-        "env_info": get_env_info(),
-        "start_epoch": args.start_epoch, 
-        "num_epochs": args.num_epochs,
-        "start_batch": args.start_batch,
-        "use_fp16": args.use_fp16,
-        "exp_dir": args.exp_dir,
-        "tensorboard": args.tensorboard,
-        "dataset": args.dataset,
-        "use_xlsr": args.use_xlsr,
-        "xlsr_model_name": args.xlsr_model_name,
-        "streaming_start_epoch": args.streaming_start_epoch,
-        "pre_train_epochs": args.pre_train_epochs,
-        "pre_train_lr": args.pre_train_lr,
-        "decode_chunk_size": args.decode_chunk_size,
-        "attention_sink_size": args.attention_sink_size,
-        "left_context_chunks": args.left_context_chunks,
-    })
-    
-    if params.tensorboard and rank == 0:
-        from torch.utils.tensorboard import SummaryWriter
-        tb_writer = SummaryWriter(log_dir=f"{params.exp_dir}/tensorboard")
-    else:
-        tb_writer = None
-    
-    # Save key configurations to a file
-    if rank == 0:
-        with open(f"{params.exp_dir}/configs.yml", "w") as file:
-            for key, value in params.items():
-                if isinstance(value, (str, int, float, bool)):
-                    file.write(f"{key}: {value}\n")
-            for key, value in vars(args).items():
-                if isinstance(value, (str, int, float, bool)):
-                    file.write(f"{key}: {value}\n")
-    
-    logging.info(f"Loading BPE model: {args.bpe_model}")
-    sp = spm.SentencePieceProcessor()
-    sp.load(args.bpe_model)
-    
-    # <blankid> is defined in the spm model
-    params.blank_id = sp.piece_to_id("<blankid>")
-    params.vocab_size = sp.get_piece_size()
-    
-    logging.info(f"Vocab size: {params.vocab_size}")
-    logging.info(f"Blank ID: {params.blank_id}")
-    
-    # Initialize/Load dataset
-    if args.dataset == "librispeech":
-        if not torch.cuda.is_available():
-            logging.warning("No GPU detected, using CPU for training!")
-            
-        dm = LibriSpeechAsrDataModule(args)
-        train_cuts = dm.train_cuts()
-        
-        # For debug
-        if args.full_libri == 1:
-            logging.info("Using full Librispeech")
-        else:
-            # Only use 100h training data
-            logging.info("Using Librispeech train-clean-100")
-            train_cuts = train_cuts.filter(lambda cut: cut.recording.id.startswith("train-clean-100"))
-        
-        if args.enable_musan:
-            # Enable MUSAN augmentation
-            logging.info("Enable MUSAN augmentation")
-            train_cuts = load_manifest_lazy(
-                    Path("data/manifests/librispeech_cuts_musan.jsonl.gz")
-            )  # noqa
-        
-        # Sample up to args.max_duration seconds
-        if args.max_duration > 0:
-            logging.info(
-                f"Sample up to {args.max_duration} seconds from each cut in the training set"
-            )
-            train_cuts = train_cuts.cut_into_windows(
-                duration=args.max_duration
-            ).cut_into_windows(duration=args.max_duration)
-        
-        def remove_short_and_long_utt(c: Cut):
-            # Remove utterances with duration less than 1 second or more than 20 seconds
-            return 1.0 <= c.duration <= 20.0
-            
-        train_cuts = train_cuts.filter(remove_short_and_long_utt)
-        
-        # Create validation dataloaders
-        valid_cuts = dm.dev_cuts()
-        test_cuts = dm.test_cuts()
-    elif args.dataset == "estonian":
-        # Set up Estonian dataset from files
-        from estonian_dataset import EstonianDataModule, EstonianCutSet
-        
-        # Create Estonian datamodule
-        estonia_dm = EstonianDataModule(
-            train_list=args.train_txt,
-            val_list=args.val_txt,
-            audio_base_path=args.audio_base_path
-        )
-        
-        # Get train and validation data
-        train_cuts = estonia_dm.train_cuts()
-        valid_cuts = estonia_dm.val_cuts()
-        test_cuts = valid_cuts  # Use validation data as test since we don't have separate test set
-        
-        logging.info(f"Estonian dataset loaded with {len(train_cuts)} training and {len(valid_cuts)} validation samples")
-    else:
-        raise ValueError(f"Unsupported dataset: {args.dataset}")
-    
-    # Create training sampler
-    train_sampler = CutSampler(
-        cuts=train_cuts,
-        max_duration=params.max_duration["non_streaming"] if isinstance(params.max_duration, dict) else params.max_duration,
-        shuffle=True,
-    )
-    
-    logging.info(f"Number of training samples: {len(train_cuts)}")
-    logging.info(f"Number of validation samples: {len(valid_cuts)}")
-    
-    # Create training dataloader
-    train_dl = DataLoader(
-        EstonianCutSet(train_cuts) if args.dataset == "estonian" else train_cuts,
-        batch_size=None,
-        sampler=train_sampler,
-        num_workers=4,
-        persistent_workers=True,
-    )
-    
-    # Create validation dataloader with a smaller batch
-    valid_sampler = CutSampler(
-        cuts=valid_cuts,
-        max_duration=params.max_duration["non_streaming"] if isinstance(params.max_duration, dict) else params.max_duration,
-        shuffle=False,
-    )
-    
-    valid_dl = DataLoader(
-        EstonianCutSet(valid_cuts) if args.dataset == "estonian" else valid_cuts,
-        batch_size=None,
-        sampler=valid_sampler,
-        num_workers=1,
-        persistent_workers=False,
-    )
-    
-    # Create model, optimizer, scheduler, etc.
-    model = get_transducer_model(params)
-    
-    if params.print_diagnostics:
-        diagnostic = diagnostics.attach_diagnostics(model)
-    
-    if params.inf_check:
-        register_inf_check_hooks(model)
-    
-    model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    
-    if world_size > 1:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-    
-    optimizer = ScaledAdam(
-        model.parameters(),
-        lr=params.base_lr,
-        clipping_scale=2.0,
-        parameters_names=list(name for name, _ in model.named_parameters()),
-    )
-    
-    scheduler = Eden(optimizer, params.lr_batches, params.lr_epochs)
-    
-    scaler = GradScaler(enabled=params.use_fp16)
-    
-    if params.start_batch > 0 or params.start_epoch > 1:
-        load_checkpoint_if_available(
-            params=params,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-        )
-    
-    # If in early training, run pessimistic OOM check
-    if params.start_epoch == 1 and params.start_batch == 0:
-        scan_pessimistic_batches_for_oom(
-            model=model,
-            train_dl=train_dl,
-            optimizer=optimizer,
-            sp=sp,
-            params=params,
-        )
-    
-    # Main training loop
-    for epoch in range(params.start_epoch, params.num_epochs + 1):
-        if params.start_batch == 0:
-            set_batch_count(model, 0)
-            fix_random_seed(params.seed + epoch - 1)
-        
-        params.cur_epoch = epoch
-        
-        train_one_epoch(
-            params=params,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            train_dl=train_dl,
-            valid_dl=valid_dl,
-            sp=sp,
-            scaler=scaler,
-            tb_writer=tb_writer,
-            world_size=world_size,
-            rank=rank,
-        )
-        
-        if params.print_diagnostics:
-            diagnostic.print_diagnostics()
-            break
-    
-    # Final cleanup
-    logging.info("Training finished")
-    if world_size > 1:
-        torch.distributed.barrier()
-        cleanup_dist()
 
 
 def main():

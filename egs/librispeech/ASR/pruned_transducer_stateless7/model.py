@@ -212,13 +212,20 @@ class Transducer(nn.Module):
             s_range=prune_range,
         )
 
-        # Prune and get final logits
+        # Prune and get final logits - FIX: Avoid double projection by first preparing projected values
+        # First prepare the projected encoder and decoder outputs
+        encoder_proj = self.joiner.encoder_proj(encoder_out)
+        decoder_proj = self.joiner.decoder_proj(decoder_out)
+        
+        # Use these for pruning
         am_pruned, lm_pruned = k2.do_rnnt_pruning(
-            am=self.joiner.encoder_proj(encoder_out),
-            lm=self.joiner.decoder_proj(decoder_out),
+            am=encoder_proj,
+            lm=decoder_proj,
             ranges=ranges,
         )
 
+        # IMPORTANT: We set project_input=False since we've already 
+        # projected the inputs with joiner.encoder_proj and joiner.decoder_proj above
         logits = self.joiner(am_pruned, lm_pruned, project_input=False)
 
         # Compute pruned loss

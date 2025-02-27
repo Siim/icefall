@@ -1143,6 +1143,21 @@ def compute_loss(
     if hasattr(model, 'encoder_proj'):
         encoder_out = model.encoder_proj(encoder_out)
     
+    # Debug projections only on the first training batch
+    if is_training and params.batch_idx_train == 1 and hasattr(model, 'debug_projections'):
+        logging.info("================= DEBUGGING PROJECTIONS =================")
+        # Create small sample for debugging
+        sample_size = min(2, encoder_out.size(0))  # Just use 2 samples from batch
+        sample_length = min(10, encoder_out.size(1))  # Just use 10 frames
+        sample = encoder_out[:sample_size, :sample_length].clone()
+        
+        # For DDP models, access the module
+        if isinstance(model, DDP):
+            model.module.debug_projections(sample)
+        else:
+            model.debug_projections(sample)
+        logging.info("======================= END DEBUG =======================")
+    
     # Calculate loss transition scaling based on epoch
     # During pre-training: simple_loss_scale = 1.0 (use only simple loss)
     # During transition: gradually decrease simple_loss_scale from 1.0 to params.simple_loss_scale

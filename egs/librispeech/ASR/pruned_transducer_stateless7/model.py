@@ -69,6 +69,10 @@ class Transducer(nn.Module):
         # Add projection layer for XLSR encoder if needed
         if isinstance(encoder, XLSREncoder):
             self.encoder_proj = nn.Linear(1024, encoder_dim)
+            # Log dimensions for verification
+            import logging
+            logging.info(f"XLSR encoder projection: 1024 -> {encoder_dim}")
+            logging.info(f"Joiner projections: encoder_dim={encoder_dim} -> joiner_dim={joiner_dim}, decoder_dim={decoder_dim} -> joiner_dim={joiner_dim}")
         else:
             self.encoder_proj = nn.Identity()
 
@@ -240,3 +244,36 @@ class Transducer(nn.Module):
             )
 
         return (simple_loss, pruned_loss)
+
+    def debug_projections(self, x: torch.Tensor):
+        """Debug the encoder projection path to verify dimensions match correctly
+        
+        Args:
+            x: A tensor with shape [batch_size, seq_len, xlsr_dim=1024]
+            
+        Returns:
+            None, but logs projection shapes for debugging
+        """
+        import logging
+        
+        # Original shape
+        logging.info(f"Input shape: {x.shape}")
+        
+        # After encoder_proj
+        after_encoder_proj = self.encoder_proj(x)
+        logging.info(f"After model.encoder_proj: {after_encoder_proj.shape}")
+        
+        # After joiner's encoder_proj
+        after_joiner_encoder_proj = self.joiner.encoder_proj(after_encoder_proj)
+        logging.info(f"After joiner.encoder_proj: {after_joiner_encoder_proj.shape}")
+        
+        # Check if the simple_am_proj matches the encoder output dimension
+        logging.info(f"simple_am_proj expects input with last dim: {self.simple_am_proj.weight.shape[1]}")
+        logging.info(f"encoder_proj outputs dim: {after_encoder_proj.shape[-1]}")
+        
+        # Check joiner projection dimensions
+        logging.info(f"Joiner encoder_proj: in={self.joiner.encoder_proj.weight.shape[1]}, out={self.joiner.encoder_proj.weight.shape[0]}")
+        logging.info(f"Joiner decoder_proj: in={self.joiner.decoder_proj.weight.shape[1]}, out={self.joiner.decoder_proj.weight.shape[0]}")
+        logging.info(f"Joiner output_linear: in={self.joiner.output_linear.weight.shape[1]}, out={self.joiner.output_linear.weight.shape[0]}")
+        
+        return None

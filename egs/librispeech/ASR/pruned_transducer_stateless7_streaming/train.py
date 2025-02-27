@@ -1977,7 +1977,11 @@ def run(rank, world_size, args):
     scaler = torch.amp.GradScaler('cuda', enabled=params.use_fp16, init_scale=1.0) if params.use_fp16 else None
     if checkpoints and "grad_scaler" in checkpoints:
         logging.info("Loading grad scaler state dict")
-        scaler.load_state_dict(checkpoints["grad_scaler"])
+        # Only load scaler state if scaler exists (FP16 is enabled)
+        if scaler is not None:
+            scaler.load_state_dict(checkpoints["grad_scaler"])
+        else:
+            logging.info("Skipping grad scaler loading since FP16 is disabled")
 
     for epoch in range(params.start_epoch, params.num_epochs + 1):
         scheduler.step_epoch(epoch - 1)

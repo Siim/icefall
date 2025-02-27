@@ -89,7 +89,7 @@ from icefall.env import get_env_info
 from icefall.err import raise_grad_scale_is_too_small_error
 from icefall.hooks import register_inf_check_hooks
 from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
-from beam_search import greedy_search_batch  # Only import what we use for validation
+from beam_search import greedy_search_batch, modified_beam_search  # Only import what we use for validation
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -1344,15 +1344,33 @@ def decode_one_batch_hyps(
             logging.warning(f"Zero dimension in projected encoder output: shape={encoder_out.shape}")
             return supervisions["text"], [""] * len(supervisions["text"])
         
-        # Use greedy search batch for decoding
-        hyp_tokens = greedy_search_batch(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            blank_penalty=params.blank_penalty,  # Add blank penalty to reduce repetitions
-        )
+        # Use modified_beam_search for decoding with a beam width of 4
+        from beam_search import modified_beam_search
+        
+        # Check if we're decoding a batch or just one sample
+        if encoder_out.size(0) == 1:
+            # For a single sample, use the non-batch version
+            hyp_tokens = modified_beam_search(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+                beam=4,  # Use beam width of 4 for decoding
+                temperature=1.0,
+                blank_penalty=params.blank_penalty,
+            )
+        else:
+            # For batch decoding
+            hyp_tokens = modified_beam_search(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+                beam=4,  # Use beam width of 4 for decoding
+                temperature=1.0,
+                blank_penalty=params.blank_penalty,
+            )
+            
     except RuntimeError as e:
-        logging.warning(f"Error during greedy search: {str(e)}")
+        logging.warning(f"Error during beam search: {str(e)}")
         logging.warning(f"Encoder output shape: {encoder_out.shape if encoder_out is not None else 'None'}, lens shape: {encoder_out_lens.shape if encoder_out_lens is not None else 'None'}")
         return supervisions["text"], [""] * len(supervisions["text"])
     except Exception as e:

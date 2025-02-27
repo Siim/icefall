@@ -1300,41 +1300,6 @@ def decode_one_batch_hyps(
             if encoder_out.size(0) == 0 or encoder_out_lens.size(0) == 0:
                 logging.warning(f"Empty encoder output: shape={encoder_out.shape}, lens={encoder_out_lens}")
                 return supervisions["text"], [""] * len(supervisions["text"])
-            # Ensure encoder_out is non-empty along time dimension
-            if encoder_out.size(1) == 0:
-                logging.warning(f"Empty time dimension in encoder output: shape={encoder_out.shape}")
-                # Create a minimal non-empty output for the joiner
-                encoder_out = torch.zeros(
-                    (encoder_out.size(0), 1, encoder_out.size(2)), 
-                    device=encoder_out.device,
-                    dtype=encoder_out.dtype
-                )
-                encoder_out_lens = torch.ones((encoder_out.size(0),), device=encoder_out_lens.device, dtype=encoder_out_lens.dtype)
-        
-        # Project encoder output
-        if isinstance(model, DDP):
-            encoder_out = model.module.encoder_proj(encoder_out)
-        else:
-            encoder_out = model.encoder_proj(encoder_out)
-        
-            # Check if any dimension is zero, which would cause issues
-            if 0 in encoder_out.shape:
-                logging.warning(f"Zero dimension in projected encoder output: shape={encoder_out.shape}")
-                return supervisions["text"], [""] * len(supervisions["text"])
-            # Use greedy search batch for decoding
-            try:
-                hyp_tokens = greedy_search_batch(
-                    model=model,
-                    encoder_out=encoder_out,
-                    encoder_out_lens=encoder_out_lens,
-                )
-            except RuntimeError as e:
-                logging.warning(f"Error during greedy search: {str(e)}")
-                logging.warning(f"Encoder output shape: {encoder_out.shape}, lens shape: {encoder_out_lens.shape}")
-                return supervisions["text"], [""] * len(supervisions["text"])
-            except Exception as e:
-                logging.warning(f"Exception during decoding: {str(e)}")
-                return supervisions["text"], [""] * len(supervisions["text"])
     except Exception as e:
         logging.warning(f"Exception during encoder processing: {str(e)}")
         return supervisions["text"], [""] * len(supervisions["text"])
@@ -1849,8 +1814,6 @@ def run(rank, world_size, args):
         lr_batches=params.lr_batches,
         lr_epochs=params.lr_epochs,
         warmup_batches=params.warmup_steps,
-        warmup_type="linear",
-        scheduler_function=lr_scheduler,
     )
 
     if checkpoints and "optimizer" in checkpoints:

@@ -1472,10 +1472,10 @@ def compute_validation_loss(
                             tb_writer.add_scalar('validation/wer', wer, params.batch_idx_train)
                 else:
                     logging.warning("No results returned from decode_one_batch_hyps")
-    except Exception as e:
-                logging.warning(f"Error during validation: {str(e)}")
-                import traceback
-                logging.warning(f"Exception details:\n{traceback.format_exc()}")
+            except Exception as e:
+                        logging.warning(f"Error during validation: {str(e)}")
+                        import traceback
+                        logging.warning(f"Exception details:\n{traceback.format_exc()}")
     except Exception as e:
         logging.warning(f"Error during validation: {str(e)}")
         import traceback

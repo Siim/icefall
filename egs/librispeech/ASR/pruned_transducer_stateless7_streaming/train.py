@@ -920,10 +920,10 @@ def process_streaming_chunks(
     feature: torch.Tensor,
     chunk_size: int,
     attention_sink_size: int,
-    left_context_chunks: int
+    left_context_chunks: int,
+    is_pre_training: bool = False
 ) -> torch.Tensor:
-    """
-    Process audio in streaming mode by breaking into chunks with proper overlap.
+    """Process audio in streaming mode with overlapping chunks.
     
     Args:
         model: The model to use
@@ -931,6 +931,7 @@ def process_streaming_chunks(
         chunk_size: Size of each chunk in samples (e.g., 5120 for 320ms)
         attention_sink_size: Number of frames for attention sink (16 as per paper)
         left_context_chunks: Number of left context chunks (1 as per paper)
+        is_pre_training: Whether we're in pre-training mode
         
     Returns:
         Encoder output tensor
@@ -942,8 +943,15 @@ def process_streaming_chunks(
     states = [None, None, None]
     chunk_outputs = []
     
-    # Calculate chunk parameters - use 40% overlap as per paper
-    chunk_overlap = int(chunk_size * 0.4)  # 40% overlap as per paper
+    # Calculate chunk parameters with different overlap for pre-training vs streaming
+    if is_pre_training:
+        # During pre-training, use minimal overlap to avoid frame duplication
+        chunk_overlap = int(chunk_size * 0.15)  # Use smaller overlap during pre-training
+        logging.info(f"Using minimal chunk overlap ({chunk_overlap} samples) for pre-training mode")
+    else:
+        # In streaming mode, use standard 40% overlap as per paper
+        chunk_overlap = int(chunk_size * 0.4)  # 40% overlap as per paper
+        
     effective_chunk_size = chunk_size - chunk_overlap
     
     # Calculate attention sink size in samples
@@ -1149,7 +1157,8 @@ def compute_loss(
             feature=feature,
             chunk_size=curr_chunk_size,
             attention_sink_size=params.attention_sink_size,
-            left_context_chunks=params.left_context_chunks
+            left_context_chunks=params.left_context_chunks,
+            is_pre_training=is_pre_training
         )
         # Calculate encoder output lengths based on chunk processing
         encoder_out_lens = ((feature_lens.float() / model.encoder.downsample_factor).floor()).to(torch.int64)

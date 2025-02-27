@@ -124,7 +124,7 @@ class Transducer(nn.Module):
 
         # For debugging, log the shape of the input
         import logging
-        logging.debug(f"Model forward: x shape={x.shape}, encoder_outputs_provided={encoder_outputs_provided}")
+        logging.info(f"Model forward: x shape={x.shape}, x_lens={x_lens}, encoder_outputs_provided={encoder_outputs_provided}")
         
         # Get encoder output
         if encoder_outputs_provided:

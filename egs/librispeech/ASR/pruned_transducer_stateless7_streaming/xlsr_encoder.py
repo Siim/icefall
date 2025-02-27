@@ -510,9 +510,9 @@ class XLSREncoder(EncoderInterface):
         
         # Debug logging
         if is_pre_training:
-            logging.debug(f"XLSR Encoder using pre-training mode (NO chunking) for input shape {x.shape}")
+            logging.info(f"XLSREncoder.forward: USING PRE-TRAINING MODE (no chunking) for input shape {x.shape}")
         else:
-            logging.debug(f"XLSR Encoder using streaming mode WITH chunking for input shape {x.shape}")
+            logging.info(f"XLSREncoder.forward: USING STREAMING MODE with chunking for input shape {x.shape}")
         
         # Ensure input is float and in correct shape
         x = x.float()
@@ -533,7 +533,7 @@ class XLSREncoder(EncoderInterface):
         
         if is_pre_training:
             # During pre-training, use full sequence without chunking
-            logging.debug("Pre-training: Using full sequence processing without chunking")
+            logging.info(f"Pre-training encoder: Processing full sequence of shape {x.shape}")
             outputs = self.model(
                 x,
                 attention_mask=attention_mask,
@@ -546,7 +546,7 @@ class XLSREncoder(EncoderInterface):
             encoder_out_lens = ((x_lens.float() / self.downsample_factor).floor()).to(torch.int64)
             encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
             
-            logging.debug(f"Pre-training: Output shape: {outputs.shape}, lengths: {encoder_out_lens}")
+            logging.info(f"Pre-training encoder: Output shape {outputs.shape}, lengths {encoder_out_lens}")
             return outputs, encoder_out_lens
         else:
             # Use streaming mode with chunks

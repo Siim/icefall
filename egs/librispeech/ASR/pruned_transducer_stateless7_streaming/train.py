@@ -1254,6 +1254,9 @@ def decode_one_batch_hyps(
     supervisions = batch["supervisions"]
     feature_lens = supervisions["num_frames"].to(device)
     
+    # Initialize hyp_tokens to an empty list to avoid NameError
+    hyp_tokens = []
+    
     # Verify that we have valid feature lengths
     if torch.any(feature_lens <= 0):
         logging.warning("Encountered zero or negative feature length. Skipping decoding.")
@@ -1269,6 +1272,9 @@ def decode_one_batch_hyps(
     if torch.isnan(feature).any() or torch.isinf(feature).any():
         logging.warning("NaN or Inf values detected in feature. Normalizing.")
         feature = torch.nan_to_num(feature, nan=0.0, posinf=1.0, neginf=-1.0)
+    
+    encoder_out = None
+    encoder_out_lens = None
     
     # Get encoder output
     try:
@@ -1297,11 +1303,37 @@ def decode_one_batch_hyps(
                 encoder_out, encoder_out_lens = model.encoder(feature_pad, feature_lens_pad)
             
             # Check if encoder output is valid
-            if encoder_out.size(0) == 0 or encoder_out_lens.size(0) == 0:
-                logging.warning(f"Empty encoder output: shape={encoder_out.shape}, lens={encoder_out_lens}")
+            if encoder_out is None or encoder_out_lens is None or encoder_out.size(0) == 0 or encoder_out_lens.size(0) == 0:
+                logging.warning(f"Empty encoder output: shape={encoder_out.shape if encoder_out is not None else 'None'}, lens={encoder_out_lens if encoder_out_lens is not None else 'None'}")
                 return supervisions["text"], [""] * len(supervisions["text"])
     except Exception as e:
         logging.warning(f"Exception during encoder processing: {str(e)}")
+        return supervisions["text"], [""] * len(supervisions["text"])
+    
+    # Project encoder output
+    try:
+        if isinstance(model, DDP):
+            encoder_out = model.module.encoder_proj(encoder_out)
+        else:
+            encoder_out = model.encoder_proj(encoder_out)
+        
+        # Check if any dimension is zero, which would cause issues
+        if 0 in encoder_out.shape:
+            logging.warning(f"Zero dimension in projected encoder output: shape={encoder_out.shape}")
+            return supervisions["text"], [""] * len(supervisions["text"])
+        
+        # Use greedy search batch for decoding
+        hyp_tokens = greedy_search_batch(
+            model=model,
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens,
+        )
+    except RuntimeError as e:
+        logging.warning(f"Error during greedy search: {str(e)}")
+        logging.warning(f"Encoder output shape: {encoder_out.shape if encoder_out is not None else 'None'}, lens shape: {encoder_out_lens.shape if encoder_out_lens is not None else 'None'}")
+        return supervisions["text"], [""] * len(supervisions["text"])
+    except Exception as e:
+        logging.warning(f"Exception during decoding: {str(e)}")
         return supervisions["text"], [""] * len(supervisions["text"])
     
     # Convert token IDs to text

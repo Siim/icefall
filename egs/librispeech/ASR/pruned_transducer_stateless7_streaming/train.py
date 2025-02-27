@@ -268,6 +268,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         help="Epoch to start using streaming (after pre-training)",
     )
 
+    parser.add_argument(
+        "--blank-penalty",
+        type=float,
+        default=0.0,
+        help="Penalty applied to blank symbol during decoding to reduce repetitions",
+    )
+
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -881,7 +888,8 @@ def evaluate_streaming(
                 hyp_tokens = greedy_search_batch(
                     model=model,
                     encoder_out=encoder_out,
-                    encoder_out_lens=feature_lens
+                    encoder_out_lens=feature_lens,
+                    blank_penalty=params.blank_penalty,  # Add blank penalty to reduce repetitions
                 )
                 
                 # Convert predictions to text
@@ -1341,6 +1349,7 @@ def decode_one_batch_hyps(
             model=model,
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
+            blank_penalty=params.blank_penalty,  # Add blank penalty to reduce repetitions
         )
     except RuntimeError as e:
         logging.warning(f"Error during greedy search: {str(e)}")
@@ -1851,9 +1860,12 @@ def run(rank, world_size, args):
         # Use pre_train_lr during pre-training phase, otherwise use base_lr
         current_base_lr = params.pre_train_lr if is_pre_training else params.base_lr
         
+        # Implement a longer warmup for the Estonian dataset (2000 steps)
+        warmup_steps = 2000
+        
         # During warmup phase, the learning rate increases linearly
-        if step < params.warmup_steps:
-            return current_base_lr * step / params.warmup_steps
+        if step < warmup_steps:
+            return current_base_lr * step / warmup_steps
         
         # After warmup, we decay the learning rate based on the current epoch
         # Ensure the learning rate doesn't drop below 5% of the base learning rate
@@ -1863,7 +1875,7 @@ def run(rank, world_size, args):
         optimizer=optimizer,
         lr_batches=params.lr_batches,
         lr_epochs=params.lr_epochs,
-        warmup_batches=params.warmup_steps,
+        warmup_batches=2000,  # Increase warmup steps for Estonian dataset
     )
 
     if checkpoints and "optimizer" in checkpoints:

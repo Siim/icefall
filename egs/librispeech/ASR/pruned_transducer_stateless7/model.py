@@ -16,6 +16,7 @@
 
 
 import random
+from typing import Optional, Tuple
 
 import k2
 import torch
@@ -41,6 +42,7 @@ class Transducer(nn.Module):
         decoder_dim: int,
         joiner_dim: int,
         vocab_size: int,
+        encoder_proj: Optional[nn.Module] = None,
     ):
         """
         Args:

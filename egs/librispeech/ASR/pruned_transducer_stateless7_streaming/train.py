@@ -514,13 +514,6 @@ def get_parser():
     )
 
     parser.add_argument(
-        "--pretrain-epochs",
-        type=int,
-        default=10,
-        help="Number of epochs for pre-training phase with full-sequence processing."
-    )
-
-    parser.add_argument(
         "--progressive-epochs",
         type=int,
         default=10,
@@ -596,7 +589,7 @@ def get_params() -> AttributeDict:
             "valid_interval": 500,
             
             # Paper's training configuration
-            "pretrain_epochs": 5,  # Pre-training phase
+            "pretrain_epochs": 20,  # Pre-training phase - will be overridden by command-line parameter pre_train_epochs
             "streaming_epochs": 15, # Streaming phase
             "beam_size": 4,        # Paper's beam width for decoding
             
@@ -1795,6 +1788,11 @@ def run(rank, world_size, args):
     """
     params = get_params()
     params.update(vars(args))
+    
+    # Update pretrain_epochs with the value from pre_train_epochs if provided
+    if hasattr(params, 'pre_train_epochs'):
+        params.pretrain_epochs = params.pre_train_epochs
+        logging.info(f"Setting pretrain_epochs to {params.pretrain_epochs} from pre_train_epochs")
     
     # Add parameters for loss transition
     params.simple_loss_scale = 0.3  # Paper's setting for pruned loss weighting

@@ -943,7 +943,7 @@ def process_streaming_chunks(
     chunk_outputs = []
     
     # Calculate chunk parameters - use 40% overlap as per paper
-    chunk_overlap = int(chunk_size * 0.4)  # 40% overlap as per paper
+    chunk_overlap = int(chunk_size * 0.15)  # 40% overlap as per paper
     effective_chunk_size = chunk_size - chunk_overlap
     
     # Calculate attention sink size in samples

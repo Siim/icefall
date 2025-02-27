@@ -248,6 +248,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
+        "--loss-transition-epochs",
+        type=int,
+        default=3,
+        help="Number of epochs to gradually transition loss calculation from simple to pruned",
+    )
+
+    parser.add_argument(
         "--pre-train-lr",
         type=float,
         default=0.00001,
@@ -932,148 +939,115 @@ def process_streaming_chunks(
         attention_sink_size: Number of frames for attention sink (16 as per paper)
         left_context_chunks: Number of left context chunks (1 as per paper)
         is_pre_training: Whether we're in pre-training mode
-        
+    
     Returns:
-        Encoder output tensor
+        Encoder outputs processed in streaming mode
     """
-    device = feature.device
-    batch_size = feature.size(0)
-    
-    # Initialize states - now with three elements [left_context, audio_sink, last_chunk_output]
-    states = [None, None, None]
-    chunk_outputs = []
-    
-    # Calculate chunk parameters with different overlap for pre-training vs streaming
     if is_pre_training:
-        # During pre-training, use minimal overlap to avoid frame duplication
-        chunk_overlap = int(chunk_size * 0.15)  # Use smaller overlap during pre-training
-        logging.info(f"Using minimal chunk overlap ({chunk_overlap} samples) for pre-training mode")
+        # During pre-training, use full context without chunking
+        logging.info(f"Processing in pre-training mode (no chunking) for feature shape {feature.shape}")
+        encoder_out, _ = model.encoder(feature, None, is_pre_training=True)
+        return encoder_out
+    
+    # Log important streaming parameters
+    logging.info(f"Processing in streaming mode with chunk_size={chunk_size}, "
+                f"attention_sink_size={attention_sink_size}, "
+                f"left_context_chunks={left_context_chunks}")
+    
+    device = feature.device
+    batch_size, seq_len = feature.shape
+    
+    # Use encoder directly if model is wrapped in DDP
+    if isinstance(model, DDP):
+        encoder = model.module.encoder
     else:
-        # In streaming mode, use standard 40% overlap as per paper
-        chunk_overlap = int(chunk_size * 0.4)  # 40% overlap as per paper
-        
-    effective_chunk_size = chunk_size - chunk_overlap
+        encoder = model.encoder
     
-    # Calculate attention sink size in samples
-    sink_size = attention_sink_size * model.encoder.downsample_factor
+    # Ensure we have valid attention sink settings
+    if attention_sink_size > 0:
+        # Initialize the attention sink cache with zeros
+        # This will be the first set of tokens processed in each chunk
+        attention_sink = torch.zeros(
+            (batch_size, attention_sink_size, encoder.output_dim),
+            device=device
+        )
+    else:
+        attention_sink = None
     
-    # Calculate expected total frames for verification
-    expected_total_frames = []
-    for b in range(batch_size):
-        seq_len = feature[b].size(0)
-        # Ensure we calculate the expected frames correctly
-        expected_frames = (seq_len + model.encoder.downsample_factor - 1) // model.encoder.downsample_factor
-        # Make sure we have at least 1 frame
-        expected_frames = max(1, expected_frames)
-        expected_total_frames.append(expected_frames)
+    # Calculate the actual context size in samples
+    left_context_size = left_context_chunks * chunk_size
     
-    # Process each sequence in batch
-    for b in range(batch_size):
-        seq = feature[b:b+1]  # Keep batch dimension
-        pos = 0
-        seq_outputs = []
-        left_context = None
-        processed_frames_end = 0  # Track end position of processed frames
+    # Process the audio in chunks
+    outputs = []
+    cached_left_context = None
+    
+    for chunk_start in range(0, seq_len, chunk_size):
+        # Extract current chunk
+        chunk_end = min(chunk_start + chunk_size, seq_len)
+        current_chunk = feature[:, chunk_start:chunk_end]
         
-        # Reset states for each sequence - important for batch processing
-        seq_states = [None, None, None]
-        
-        while pos < seq.size(1):
-            # Get current chunk boundaries
-            end_pos = min(pos + chunk_size, seq.size(1))
-            chunk = seq[:, pos:end_pos]
-            
-            # Add left context if available
-            if left_context is not None:
-                chunk = torch.cat([left_context, chunk], dim=1)
-            
-            # Process the chunk through encoder
-            chunk_out, chunk_out_lens, seq_states = model.encoder.streaming_forward(
-                chunk, 
-                torch.tensor([chunk.size(1)], device=device),
-                seq_states
-            )
-            
-            # Calculate what portion of the chunk_out corresponds to non-overlapped audio
-            chunk_start_frame = pos // model.encoder.downsample_factor
-            chunk_end_frame = end_pos // model.encoder.downsample_factor
-            
-            # Ensure we don't duplicate frames from previous chunks
-            if processed_frames_end > 0:
-                frames_to_skip = processed_frames_end - chunk_start_frame
-                if frames_to_skip > 0:
-                    # Skip the overlapping frames (avoiding duplication)
-                    if frames_to_skip < chunk_out.size(1):
-                        chunk_out = chunk_out[:, frames_to_skip:]
-                    else:
-                        # In case of very small chunks, we might need to skip the entire output
-                        # Create an empty tensor with the correct dimensions instead of [batch, 0, features]
-                        # This avoids the tensor size mismatch error
-                        chunk_out = torch.zeros(
-                            chunk_out.size(0),
-                            0,
-                            chunk_out.size(2),
-                            device=chunk_out.device,
-                            dtype=chunk_out.dtype
-                        )
-            
-            # Add to sequence outputs if we have valid frames
-            if chunk_out.size(1) > 0:
-                seq_outputs.append(chunk_out)
-            
-            # Update position (move forward by effective chunk size)
-            next_pos = pos + effective_chunk_size
-            
-            # Save the end position of processed frames (in frame space)
-            processed_frames_end = chunk_end_frame
-            
-            # Store left context for next chunk if needed
-            if next_pos < seq.size(1) and chunk.size(1) >= chunk_overlap:
-                left_context = chunk[:, -chunk_overlap:]
-            
-            # Move to next position
-            pos = next_pos
-        
-        # Concatenate all outputs for this sequence
-        if seq_outputs:
-            seq_output = torch.cat(seq_outputs, dim=1)
-            
-            # Verify we have expected number of frames
-            actual_frames = seq_output.size(1)
-            expected_frames = expected_total_frames[b]
-            
-            # Ensure output matches expected frame count exactly
-            if actual_frames != expected_frames:
-                logging.info(f"Adjusting frame count from {actual_frames} to expected {expected_frames}")
-                
-                # Resize to match exactly what would come from non-streaming
-                if actual_frames > expected_frames:
-                    seq_output = seq_output[:, :expected_frames]
-                else:
-                    # Pad if needed (rare)
-                    padding = torch.zeros(
-                        1, 
-                        expected_frames - actual_frames,
-                        seq_output.size(2),
-                        device=seq_output.device,
-                        dtype=seq_output.dtype
-                    )
-                    seq_output = torch.cat([seq_output, padding], dim=1)
-                    
-            chunk_outputs.append(seq_output)
+        # Add left context if available
+        if cached_left_context is not None:
+            context_size = min(left_context_size, cached_left_context.size(1))
+            with_context = torch.cat([
+                cached_left_context[:, -context_size:], 
+                current_chunk
+            ], dim=1)
         else:
-            # Handle case of no outputs (very short audio)
-            # Create a properly sized tensor with the correct output dimension
-            chunk_outputs.append(torch.zeros(
-                1, 
-                expected_total_frames[b],
-                model.encoder.output_dim,
-                device=device,
-                dtype=torch.float32
-            ))
+            # For the first chunk, pad with zeros as left context
+            context_size = min(left_context_size, chunk_start)
+            if context_size > 0:
+                left_pad = feature[:, chunk_start-context_size:chunk_start]
+                with_context = torch.cat([left_pad, current_chunk], dim=1)
+            else:
+                with_context = current_chunk
+        
+        # Process the chunk
+        # For XLSR, we set is_streaming=True to trigger the streaming behavior
+        chunk_out, _ = encoder(
+            with_context, 
+            None,  # No need for lens in streaming mode
+            streaming_state=None,
+            is_pre_training=False
+        )
+        
+        # Apply attention sink if enabled
+        if attention_sink is not None:
+            # Prepend attention sink tokens to the chunk output for attention
+            chunk_out = torch.cat([attention_sink, chunk_out], dim=1)
+            
+            # Keep only the original chunk output (discard the attention sink portion)
+            chunk_result = chunk_out[:, attention_sink_size:]
+            
+            # Update attention sink for next chunk (use last n frames of current output)
+            sink_end = min(chunk_out.size(1), attention_sink_size)
+            attention_sink = chunk_out[:, -sink_end:]
+        else:
+            # Without attention sink, use only the output for the current chunk
+            # excluding the left context portion
+            left_context_frames = context_size // encoder.downsample_factor
+            chunk_result = chunk_out[:, left_context_frames:]
+        
+        # Store output
+        outputs.append(chunk_result)
+        
+        # Update cached context
+        cached_left_context = current_chunk
     
-    # Concatenate all batch outputs
-    return torch.cat(chunk_outputs, dim=0)
+    # Concatenate all outputs
+    if outputs:
+        combined_output = torch.cat(outputs, dim=1)
+        # Ensure the output is not longer than expected after encoder downsampling
+        expected_length = (seq_len // encoder.downsample_factor) + 1
+        if combined_output.size(1) > expected_length:
+            combined_output = combined_output[:, :expected_length]
+        
+        logging.info(f"Streaming processing complete. Output shape: {combined_output.shape}")
+        return combined_output
+    else:
+        logging.warning("No outputs generated during streaming processing")
+        # Return empty tensor with correct dimensions
+        return torch.zeros((batch_size, 0, encoder.output_dim), device=device)
 
 
 def calculate_errors(ref: str, hyp: str) -> int:
@@ -1139,11 +1113,12 @@ def compute_loss(
         # Determine chunk size based on training phase
         if chunk_size is None:
             if params.cur_epoch <= params.pretrain_epochs + 5:  # 5 epochs transition
-                # Progressive chunk size selection
-                progress = (params.cur_epoch - params.pretrain_epochs) / 5
+                # Progressive chunk size selection - decrease chunk size gradually
+                transition_progress = (params.cur_epoch - params.pretrain_epochs) / 5
+                # Start with larger chunks (2560ms) and decrease to target size (320ms)
                 curr_chunk_size = int(
-                    params.chunk_sizes["2560ms"] * (1 - progress) + 
-                    params.chunk_sizes["320ms"] * progress
+                    params.chunk_sizes["2560ms"] * (1 - transition_progress) + 
+                    params.chunk_sizes["320ms"] * transition_progress
                 )
             else:
                 # Use optimal chunk size from paper
@@ -1168,8 +1143,22 @@ def compute_loss(
     if hasattr(model, 'encoder_proj'):
         encoder_out = model.encoder_proj(encoder_out)
     
+    # Calculate loss transition scaling based on epoch
+    # During pre-training: simple_loss_scale = 1.0 (use only simple loss)
+    # During transition: gradually decrease simple_loss_scale from 1.0 to params.simple_loss_scale
+    # After transition: use the configured simple_loss_scale from params
+    current_simple_loss_scale = 1.0
+    if hasattr(params, "cur_epoch") and not is_pre_training:
+        if params.cur_epoch <= params.pretrain_epochs + params.loss_transition_epochs:
+            # Gradually transition from simple to pruned loss
+            transition_progress = (params.cur_epoch - params.pretrain_epochs) / params.loss_transition_epochs
+            current_simple_loss_scale = 1.0 - (1.0 - params.simple_loss_scale) * transition_progress
+        else:
+            # After transition period, use the configured simple_loss_scale
+            current_simple_loss_scale = params.simple_loss_scale
+    
     # Compute transducer loss
-    # Important: We provide the encoder output directly to the model
+    # IMPORTANT: We provide the encoder output directly to the model
     # instead of the raw audio, as XLSR encoder has already processed it
     simple_loss, pruned_loss = model(
         x=encoder_out,  # Using encoder output instead of raw audio
@@ -1180,13 +1169,13 @@ def compute_loss(
         lm_scale=params.lm_scale,
     )
     
-    # Combine losses according to paper
+    # Combine losses according to paper and training phase
     if is_pre_training:
         # During pre-training, use only simple loss for better convergence
         loss = simple_loss
     else:
         # During streaming, combine both losses with scaling
-        loss = params.simple_loss_scale * simple_loss + (1 - params.simple_loss_scale) * pruned_loss
+        loss = current_simple_loss_scale * simple_loss + (1.0 - current_simple_loss_scale) * pruned_loss
     
     assert loss.requires_grad == is_training
     
@@ -1196,6 +1185,7 @@ def compute_loss(
     if not is_pre_training:
         info["simple_loss"] = simple_loss.detach().cpu().item()
         info["pruned_loss"] = pruned_loss.detach().cpu().item()
+        info["simple_loss_scale"] = current_simple_loss_scale
         if is_training and hasattr(params, "cur_epoch"):
             info["chunk_size"] = curr_chunk_size if not is_pre_training else 0
     
@@ -1760,6 +1750,10 @@ def run(rank, world_size, args):
     """
     params = get_params()
     params.update(vars(args))
+    
+    # Add parameters for loss transition
+    params.simple_loss_scale = 0.3  # Paper's setting for pruned loss weighting
+
     # We want to keep our validation interval at 500 regardless of dataset
     # if params.full_libri is False:
     #     params.valid_interval = 1600

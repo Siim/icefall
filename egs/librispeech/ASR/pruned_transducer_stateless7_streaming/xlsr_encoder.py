@@ -116,7 +116,7 @@ class XLSREncoder(EncoderInterface):
         """Get initial states for streaming inference"""
         if device is None:
             device = next(self.parameters()).device
-        return [None, None, None]  # Return [left_context, audio_sink, last_chunk_output]
+        return [None]  # Initial state is None since we'll build it from first chunk
 
     def reset_streaming_state(self):
         """Reset all streaming state variables"""
@@ -124,9 +124,10 @@ class XLSREncoder(EncoderInterface):
         self.cached_len = 0
         self.current_chunk_size = self.decode_chunk_size
         self.last_chunk_latency = 0
-        self.streaming_state = [None, None, None]  # Updated to [left_context, audio_sink, last_chunk_output]
+        self.streaming_state = None
         self.attention_sink_cache = None
         self.context_cache = None
+        self.last_chunk_output = None
         self.left_context_buffer = []  # Store left context chunks
         self.past_context = None  # Add past context for streaming
         self.is_streaming = False  # Track streaming state
@@ -160,7 +161,7 @@ class XLSREncoder(EncoderInterface):
         Args:
             states: States returned from the previous streaming_forward call
         """
-        if states is None or len(states) < 3:
+        if states is None or len(states) < 2:
             return
         
         # Update left context buffer if needed
@@ -312,7 +313,7 @@ class XLSREncoder(EncoderInterface):
         Args:
             x: Input tensor (batch, time) or (batch, time, 1)
             x_lens: Length of each sequence in batch
-            states: Optional cached states from previous chunk [left_context, audio_sink, last_chunk_output]
+            states: Optional cached states from previous chunk [left_context, audio_sink]
         Returns:
             (encoder_out, encoder_out_lens, next_states)
         """
@@ -322,28 +323,11 @@ class XLSREncoder(EncoderInterface):
             x = x.squeeze(-1)
         assert x.ndim == 2, f"Expected 2D input (batch, time), got shape {x.shape}"
         
-        # Make sure batch size is consistent
-        batch_size = x.size(0)
-        
-        # Validate x_lens and ensure proper batch size
+        # Validate x_lens
         if isinstance(x_lens, int):
             x_lens = torch.tensor([x_lens], device=x.device)
         elif not isinstance(x_lens, torch.Tensor):
             x_lens = torch.tensor(x_lens, device=x.device)
-        
-        # Ensure x_lens has the same batch dimension as x
-        if x_lens.size(0) != batch_size:
-            if x_lens.size(0) == 1:
-                # Broadcast single length to match batch size
-                x_lens = x_lens.expand(batch_size)
-            else:
-                # Trim or pad x_lens to match batch size
-                if x_lens.size(0) > batch_size:
-                    x_lens = x_lens[:batch_size]
-                else:
-                    padding = torch.ones(batch_size - x_lens.size(0), device=x_lens.device, 
-                                         dtype=x_lens.dtype) * x_lens[-1]
-                    x_lens = torch.cat([x_lens, padding])
         
         # Ensure x_lens is on the same device as x
         if x_lens.device != x.device:
@@ -359,38 +343,71 @@ class XLSREncoder(EncoderInterface):
         expected_frames = ((x_lens.float() / self.downsample_factor).floor()).to(torch.int64)
         expected_frames = torch.maximum(expected_frames, torch.ones_like(expected_frames))
         
-        # Extract information from states
+        # Get audio sink from states if available
         audio_sink = None
         last_chunk_output = None
-        
         if states is not None:
-            # Get audio sink from states if available
+            # Get left context from states (not used in this implementation)
+            # Get audio sink from states
             if len(states) > 1 and states[1] is not None:
                 audio_sink = states[1]
                 # Check if audio_sink is on the same device
                 if audio_sink.device != x.device:
                     audio_sink = audio_sink.to(x.device)
-                    
-            # Get last chunk output from states if available (new)
+                # Check data type compatibility
+                if audio_sink.dtype != x.dtype:
+                    audio_sink = audio_sink.to(dtype=x.dtype)
+            
+            # Get last chunk output from states
             if len(states) > 2 and states[2] is not None:
                 last_chunk_output = states[2]
-                # Ensure device compatibility
+                # Check if last_chunk_output is on the same device
                 if last_chunk_output.device != x.device:
                     last_chunk_output = last_chunk_output.to(x.device)
-                # Ensure dtype compatibility
+                # Check data type compatibility
                 if last_chunk_output.dtype != x.dtype:
                     last_chunk_output = last_chunk_output.to(dtype=x.dtype)
-            
-            # Add audio sink to current chunk if available
-            if audio_sink is not None and self.use_attention_sink:
-                # Verify dimensions are compatible for concatenation
-                if audio_sink.dim() != x.dim():
-                    logging.warning(f"Dimension mismatch: audio_sink {audio_sink.shape}, x {x.shape}")
-                    audio_sink = audio_sink.reshape(x.size(0), -1)
-                    
+        
+        # Add audio sink to current chunk if available
+        if audio_sink is not None and self.use_attention_sink:
+            # Verify dimensions are compatible for concatenation
+            if audio_sink.dim() != x.dim():
+                logging.warning(f"Dimension mismatch: audio_sink {audio_sink.shape}, x {x.shape}")
+                # Ensure audio_sink has the same batch dimension as x
+                if audio_sink.size(0) != x.size(0):
+                    # If audio_sink has batch size 1, expand it to match x's batch size
+                    if audio_sink.size(0) == 1 and x.size(0) > 1:
+                        audio_sink = audio_sink.expand(x.size(0), -1)
+                    # If audio_sink has different batch size, reshape it properly
+                    else:
+                        # Create a new audio sink with the right batch size
+                        new_sink = torch.zeros(
+                            x.size(0),
+                            audio_sink.size(-1) if audio_sink.dim() > 1 else audio_sink.size(0),
+                            device=x.device,
+                            dtype=x.dtype
+                        )
+                        # Copy data for the available batch elements
+                        common_batch = min(x.size(0), audio_sink.size(0))
+                        if audio_sink.dim() > 1:
+                            new_sink[:common_batch] = audio_sink[:common_batch]
+                        else:
+                            new_sink[:common_batch, :audio_sink.size(0)] = audio_sink.unsqueeze(0)
+                        audio_sink = new_sink
+                
+                # Ensure audio_sink has the right shape for concatenation
+                if audio_sink.dim() == 1:
+                    audio_sink = audio_sink.unsqueeze(0)
+                
+            # Now concatenate with input
+            try:
                 x = torch.cat([audio_sink, x], dim=1)
                 # Adjust lens to account for the added audio sink
                 x_lens = x_lens + audio_sink.size(1)
+            except RuntimeError as e:
+                logging.error(f"Failed to concatenate audio_sink {audio_sink.shape} with x {x.shape}: {str(e)}")
+                # Skip using audio sink if concatenation fails
+                pass
         
         # Process through XLSR model
         outputs = self.model(
@@ -430,20 +447,21 @@ class XLSREncoder(EncoderInterface):
             logging.debug(f"Trimming encoder output from {outputs.size(1)} to {max_len} frames")
             outputs = outputs[:, :max_len]
         
+        # Make sure we have at least one frame in the output
+        if outputs.size(1) == 0:
+            logging.warning(f"Empty encoder output detected. Creating a minimal output with 1 frame.")
+            outputs = torch.zeros(
+                outputs.size(0),
+                1,
+                outputs.size(2),
+                device=outputs.device,
+                dtype=outputs.dtype
+            )
+            output_lengths = torch.ones_like(output_lengths)
+        
         # Apply smooth transition if we have previous output
         if last_chunk_output is not None:
-            # Ensure batch sizes match - this is the key fix
-            if last_chunk_output.size(0) != outputs.size(0):
-                # If the batch sizes don't match, we need to reshape or select
-                if last_chunk_output.size(0) > outputs.size(0):
-                    # Take only the needed elements
-                    batch_indices = torch.arange(outputs.size(0), device=last_chunk_output.device)
-                    last_chunk_output = last_chunk_output[batch_indices]
-                else:
-                    # Repeat the last chunk to match the batch size
-                    repeats = (outputs.size(0) + last_chunk_output.size(0) - 1) // last_chunk_output.size(0)
-                    last_chunk_output = last_chunk_output.repeat(repeats, 1, 1)[:outputs.size(0)]
-            
+            # Simple crossfade at chunk boundaries
             # Calculate overlap based on chunk_overlap
             # For 40% overlap, we should blend approximately 40% of the frames
             overlap_frames = min(4, max(2, int(outputs.size(1) * 0.4)), last_chunk_output.size(1))
@@ -464,7 +482,7 @@ class XLSREncoder(EncoderInterface):
                 outputs = outputs.clone()
                 outputs[:, :overlap_frames] = blended
         
-        # Store current output for next chunk in states
+        # Cache current output for next chunk
         next_chunk_output = outputs.detach().clone()
         
         # Update states for next chunk - we store left context, audio sink, and last chunk output
@@ -488,6 +506,14 @@ class XLSREncoder(EncoderInterface):
         Returns:
             (encoder_out, encoder_out_lens)
         """
+        batch_size = x.size(0)
+        
+        # Debug logging
+        if is_pre_training:
+            logging.debug(f"XLSR Encoder using pre-training mode (NO chunking) for input shape {x.shape}")
+        else:
+            logging.debug(f"XLSR Encoder using streaming mode WITH chunking for input shape {x.shape}")
+        
         # Ensure input is float and in correct shape
         x = x.float()
         if x.ndim == 3:  # (batch, time, channel)
@@ -497,39 +523,17 @@ class XLSREncoder(EncoderInterface):
         
         assert x.ndim == 2, f"Expected 2D input (batch, time), got shape {x.shape}"
         
-        batch_size = x.size(0)
-        
-        # Ensure x_lens has the right shape
-        if isinstance(x_lens, int):
-            x_lens = torch.tensor([x_lens], device=x.device)
-        elif not isinstance(x_lens, torch.Tensor):
-            x_lens = torch.tensor(x_lens, device=x.device)
-            
-        # Ensure x_lens has the same batch dimension as x
-        if x_lens.size(0) != batch_size:
-            if x_lens.size(0) == 1:
-                # Broadcast single length to match batch size
-                x_lens = x_lens.expand(batch_size)
-            else:
-                # Trim or pad x_lens to match batch size
-                if x_lens.size(0) > batch_size:
-                    x_lens = x_lens[:batch_size]
-                else:
-                    padding = torch.ones(batch_size - x_lens.size(0), device=x_lens.device, 
-                                         dtype=x_lens.dtype) * x_lens[-1]
-                    x_lens = torch.cat([x_lens, padding])
-        
         # Clamp values silently since inputs are already normalized
         x = torch.clamp(x, min=-1.0, max=1.0)
         
         # Create attention mask
         attention_mask = torch.ones_like(x, dtype=torch.long)
         for i in range(batch_size):
-            if i < x_lens.size(0):  # Safety check
-                attention_mask[i, x_lens[i]:] = 0
+            attention_mask[i, x_lens[i]:] = 0
         
         if is_pre_training:
             # During pre-training, use full sequence without chunking
+            logging.debug("Pre-training: Using full sequence processing without chunking")
             outputs = self.model(
                 x,
                 attention_mask=attention_mask,
@@ -542,9 +546,11 @@ class XLSREncoder(EncoderInterface):
             encoder_out_lens = ((x_lens.float() / self.downsample_factor).floor()).to(torch.int64)
             encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
             
+            logging.debug(f"Pre-training: Output shape: {outputs.shape}, lengths: {encoder_out_lens}")
             return outputs, encoder_out_lens
         else:
             # Use streaming mode with chunks
+            logging.debug("Streaming mode: Using chunked processing")
             if self.training:
                 # During training with streaming, simulate chunked processing
                 outputs = []

@@ -122,15 +122,21 @@ class Transducer(nn.Module):
         assert y.num_axes == 2, f"Expected y to have 2 axes, got {y.num_axes}"
         assert x.size(0) == x_lens.size(0) == y.dim0, f"Batch size mismatch: x={x.size(0)}, x_lens={x_lens.size(0)}, y={y.dim0}"
 
+        # For debugging, log the shape of the input
+        import logging
+        logging.debug(f"Model forward: x shape={x.shape}, encoder_outputs_provided={encoder_outputs_provided}")
+        
         # Get encoder output
         if encoder_outputs_provided:
             # x is already encoder output but may still need projection if from XLSR
             encoder_out = self.encoder_proj(x)
+            logging.debug(f"Using provided encoder outputs, shape after projection: {encoder_out.shape}")
         else:
             # Process x through the encoder
             encoder_out, x_lens = self.encoder(x, x_lens)
             # Apply encoder projection 
             encoder_out = self.encoder_proj(encoder_out)
+            logging.debug(f"Processed x through encoder, output shape: {encoder_out.shape}")
         
         # Ensure x_lens matches actual encoder output size
         x_lens = torch.minimum(x_lens, torch.tensor(encoder_out.size(1), device=x_lens.device))

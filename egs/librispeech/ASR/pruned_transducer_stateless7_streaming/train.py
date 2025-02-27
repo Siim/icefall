@@ -943,7 +943,7 @@ def process_streaming_chunks(
     chunk_outputs = []
     
     # Calculate chunk parameters - use 40% overlap as per paper
-    chunk_overlap = int(chunk_size * 0.15)  # 40% overlap as per paper
+    chunk_overlap = int(chunk_size * 0.4)  # 40% overlap as per paper
     effective_chunk_size = chunk_size - chunk_overlap
     
     # Calculate attention sink size in samples
@@ -953,7 +953,10 @@ def process_streaming_chunks(
     expected_total_frames = []
     for b in range(batch_size):
         seq_len = feature[b].size(0)
+        # Ensure we calculate the expected frames correctly
         expected_frames = (seq_len + model.encoder.downsample_factor - 1) // model.encoder.downsample_factor
+        # Make sure we have at least 1 frame
+        expected_frames = max(1, expected_frames)
         expected_total_frames.append(expected_frames)
     
     # Process each sequence in batch
@@ -994,9 +997,17 @@ def process_streaming_chunks(
                     # Skip the overlapping frames (avoiding duplication)
                     if frames_to_skip < chunk_out.size(1):
                         chunk_out = chunk_out[:, frames_to_skip:]
-            else:
+                    else:
                         # In case of very small chunks, we might need to skip the entire output
-                        chunk_out = chunk_out[:, 0:0]  # Empty tensor with correct dimensions
+                        # Create an empty tensor with the correct dimensions instead of [batch, 0, features]
+                        # This avoids the tensor size mismatch error
+                        chunk_out = torch.zeros(
+                            chunk_out.size(0),
+                            0,
+                            chunk_out.size(2),
+                            device=chunk_out.device,
+                            dtype=chunk_out.dtype
+                        )
             
             # Add to sequence outputs if we have valid frames
             if chunk_out.size(1) > 0:
@@ -1044,11 +1055,13 @@ def process_streaming_chunks(
             chunk_outputs.append(seq_output)
         else:
             # Handle case of no outputs (very short audio)
+            # Create a properly sized tensor with the correct output dimension
             chunk_outputs.append(torch.zeros(
                 1, 
                 expected_total_frames[b],
                 model.encoder.output_dim,
-                device=device
+                device=device,
+                dtype=torch.float32
             ))
     
     # Concatenate all batch outputs
@@ -1233,6 +1246,9 @@ def decode_one_batch_hyps(
     Returns:
         (hyps, preds): Lists of ground truth and predicted texts
     """
+    # Determine if we're in pre-training mode based on current epoch
+    is_pre_training = params.cur_epoch <= params.pretrain_epochs
+    
     device = next(model.parameters()).device
     feature = batch["inputs"].to(device)
     supervisions = batch["supervisions"]
@@ -1254,26 +1270,36 @@ def decode_one_batch_hyps(
         logging.warning("NaN or Inf values detected in feature. Normalizing.")
         feature = torch.nan_to_num(feature, nan=0.0, posinf=1.0, neginf=-1.0)
     
-    # Get encoder output with streaming settings
+    # Get encoder output
     try:
         with torch.no_grad():
-            # Add right context padding for streaming
-            right_context = params.decode_chunk_len // 2
-            feature_lens_pad = feature_lens + right_context
-            feature_pad = torch.nn.functional.pad(
-                feature,
-                pad=(0, 0, 0, right_context),
-                value=LOG_EPS,
-            )
-            
-            # Get encoder output
-            encoder_out, encoder_out_lens = model.encoder(feature_pad, feature_lens_pad)
+            # Different handling for pre-training vs streaming mode
+            if is_pre_training:
+                # In pre-training phase, use full sequence processing without chunking
+                logging.info("Using full sequence processing for decoding (pre-training mode)")
+                encoder_out, encoder_out_lens = model.encoder(
+                    x=feature,
+                    x_lens=feature_lens,
+                    is_pre_training=True
+                )
+            else:
+                # In streaming mode, add right context padding
+                logging.info("Using streaming mode for decoding")
+                right_context = params.decode_chunk_len // 2
+                feature_lens_pad = feature_lens + right_context
+                feature_pad = torch.nn.functional.pad(
+                    feature,
+                    pad=(0, 0, 0, right_context),
+                    value=LOG_EPS,
+                )
+                
+                # Get encoder output
+                encoder_out, encoder_out_lens = model.encoder(feature_pad, feature_lens_pad)
             
             # Check if encoder output is valid
             if encoder_out.size(0) == 0 or encoder_out_lens.size(0) == 0:
                 logging.warning(f"Empty encoder output: shape={encoder_out.shape}, lens={encoder_out_lens}")
                 return supervisions["text"], [""] * len(supervisions["text"])
-            
             # Ensure encoder_out is non-empty along time dimension
             if encoder_out.size(1) == 0:
                 logging.warning(f"Empty time dimension in encoder output: shape={encoder_out.shape}")
@@ -1295,7 +1321,6 @@ def decode_one_batch_hyps(
             if 0 in encoder_out.shape:
                 logging.warning(f"Zero dimension in projected encoder output: shape={encoder_out.shape}")
                 return supervisions["text"], [""] * len(supervisions["text"])
-            
             # Use greedy search batch for decoding
             try:
                 hyp_tokens = greedy_search_batch(
@@ -1403,6 +1428,10 @@ def compute_validation_loss(
     """Run minimal validation by randomly sampling a single example."""
     model.eval()
     
+    # Determine if we're in pre-training mode
+    is_pre_training = params.cur_epoch <= params.pretrain_epochs
+    logging.info(f"Validation during {'pre-training' if is_pre_training else 'streaming'} mode (epoch {params.cur_epoch})")
+    
     # Create a placeholder metrics tracker
     tot_loss = MetricsTracker()
     tot_loss["frames"] = 1  # Avoid division by zero
@@ -1473,9 +1502,11 @@ def compute_validation_loss(
                 else:
                     logging.warning("No results returned from decode_one_batch_hyps")
             except Exception as e:
-                        logging.warning(f"Error during validation: {str(e)}")
-                        import traceback
-                        logging.warning(f"Exception details:\n{traceback.format_exc()}")
+                logging.error(f"Error during validation decoding: {str(e)}")
+                import traceback
+                logging.error(f"Exception details:\n{traceback.format_exc()}")
+                # Return empty placeholder
+                hyps, preds = [""], [""]
     except Exception as e:
         logging.warning(f"Error during validation: {str(e)}")
         import traceback
@@ -1512,15 +1543,6 @@ def train_one_epoch(
     # Determine training phase
     is_pre_training = params.cur_epoch <= params.pretrain_epochs
     
-    # Adjust learning rate based on training phase
-    if is_pre_training:
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = params.pre_train_lr
-        logging.info(f"Pre-training phase (Epoch {params.cur_epoch}), lr={params.pre_train_lr}")
-    else:
-        # Let the scheduler handle the learning rate for non-pre-training phases
-        pass
-    
     # Set batch size based on phase
     if isinstance(params.batch_size, dict):
         curr_batch_size = params.batch_size["non_streaming" if is_pre_training else "streaming"]
@@ -1528,15 +1550,22 @@ def train_one_epoch(
         # If batch_size is an integer (from command line args), use it directly
         curr_batch_size = params.batch_size
     
-    phase = (
-        "Pre-training" if is_pre_training
-        else "Progressive streaming" if params.cur_epoch <= params.pretrain_epochs + 5
-        else "Final streaming"
+    # Log training phase
+    phase = "Pre-training" if is_pre_training else (
+        "Progressive streaming" if params.cur_epoch <= params.pretrain_epochs + 5 else "Final streaming"
     )
+    logging.info(f"Epoch {params.cur_epoch}, training phase: {phase}")
+    logging.info(f"Batch size: {curr_batch_size}")
     
-    logging.info(
-        f"Epoch {params.cur_epoch}: {phase} phase, batch_size={curr_batch_size}"
-    )
+    # Log current learning rate
+    current_lr = optimizer.param_groups[0]['lr']
+    logging.info(f"Current learning rate: {current_lr:.6f}")
+    
+    # Log whether we're using pre-training learning rate
+    if params.cur_epoch < params.pretrain_epochs:
+        logging.info(f"Using pre-training learning rate: {params.pre_train_lr:.6f}")
+    else:
+        logging.info(f"Using base learning rate: {params.base_lr:.6f}")
     
     for batch_idx, batch in enumerate(train_dl):
         try:
@@ -1622,7 +1651,7 @@ def train_one_epoch(
                                     output_diff.mean().item(),
                                     params.batch_idx_train
                                 )
-            
+                    
             # Run validation less frequently to save memory - validate every 100 batches
             # or only at specific batch indices during early training
             should_validate = (
@@ -1789,19 +1818,39 @@ def run(rank, world_size, args):
     )
 
     # Paper uses warmup followed by decay
-    def lr_scheduler(step: int, epoch: int) -> float:
-        # Warmup phase
+    def lr_scheduler(step: int, epoch: float) -> float:
+        """
+        The learning rate scheduler function determines the learning rate based on the current step and epoch.
+        It implements a warmup phase followed by a decay phase.
+        
+        Args:
+            step: The current step in training
+            epoch: The current epoch in training
+            
+        Returns:
+            The learning rate for the current step
+        """
+        # Check if we're in pre-training phase
+        is_pre_training = epoch < params.num_epochs_pre_train
+        
+        # Use pre_train_lr during pre-training phase, otherwise use base_lr
+        current_base_lr = params.pre_train_lr if is_pre_training else params.base_lr
+        
+        # During warmup phase, the learning rate increases linearly
         if step < params.warmup_steps:
-            return step / params.warmup_steps
-        # Decay phase based on steps and epochs
-        decay_factor = 0.05 * (params.num_epochs - epoch) / params.num_epochs
-        return max(0.05, decay_factor)  # Don't let LR go below 5% of base_lr
+            return current_base_lr * step / params.warmup_steps
+        
+        # After warmup, we decay the learning rate based on the current epoch
+        # Ensure the learning rate doesn't drop below 5% of the base learning rate
+        return max(0.05 * current_base_lr, current_base_lr * (1.0 - epoch / params.num_epochs))
 
     scheduler = Eden(
-        optimizer,
+        optimizer=optimizer,
         lr_batches=params.lr_batches,
         lr_epochs=params.lr_epochs,
         warmup_batches=params.warmup_steps,
+        warmup_type="linear",
+        scheduler_function=lr_scheduler,
     )
 
     if checkpoints and "optimizer" in checkpoints:
@@ -1880,7 +1929,7 @@ def run(rank, world_size, args):
 
     # Update to use new GradScaler API
     scaler = torch.amp.GradScaler('cuda', enabled=params.use_fp16, init_scale=1.0) if params.use_fp16 else None
-    if checkpoints and "grad_scaler" in checkpoints and scaler is not None:
+    if checkpoints and "grad_scaler" in checkpoints:
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
 

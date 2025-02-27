@@ -1010,13 +1010,16 @@ def process_streaming_chunks(
             else:
                 with_context = current_chunk
         
-        # Process the chunk
-        # For XLSR, we set is_streaming=True to trigger the streaming behavior
+        # Process the chunk - updated to use is_pre_training parameter properly
+        # Create fake lengths for this chunk (required by some encoders)
+        chunk_lens = torch.tensor([with_context.size(1)] * batch_size, device=device)
+        
+        # Process chunk with the encoder
         chunk_out, _ = encoder(
             with_context, 
-            None,  # No need for lens in streaming mode
-            streaming_state=None,
-            is_pre_training=False
+            chunk_lens,  # Provide length information
+            is_pre_training=False,  # Explicitly set to False for streaming mode
+            streaming_state=None   # Pass streaming_state=None to match the interface
         )
         
         # Apply attention sink if enabled

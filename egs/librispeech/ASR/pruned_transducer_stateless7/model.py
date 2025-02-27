@@ -67,13 +67,10 @@ class Transducer(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.joiner = joiner
-
-        # Add projection layer for XLSR encoder if needed
-        if isinstance(encoder, XLSREncoder):
-            self.encoder_proj = nn.Linear(1024, encoder_dim)
-        else:
-            self.encoder_proj = nn.Identity()
-
+        
+        # Use the provided encoder_proj if given, otherwise create identity
+        self.encoder_proj = encoder_proj
+        
         self.simple_am_proj = nn.Linear(
             encoder_dim,
             vocab_size,

@@ -1880,7 +1880,7 @@ def run(rank, world_size, args):
 
     # Update to use new GradScaler API
     scaler = torch.amp.GradScaler('cuda', enabled=params.use_fp16, init_scale=1.0) if params.use_fp16 else None
-    if checkpoints and "grad_scaler" in checkpoints:
+    if checkpoints and "grad_scaler" in checkpoints and scaler is not None:
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])
 

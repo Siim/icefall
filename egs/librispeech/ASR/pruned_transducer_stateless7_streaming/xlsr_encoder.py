@@ -9,6 +9,7 @@ import numpy as np
 from typing import Optional, List, Tuple
 from icefall.utils import make_pad_mask
 import math
+from encoder_interface import EncoderInterface  # Import the encoder interface
 
 class EncoderInterface(nn.Module):
     """Interface for encoders used in transducer models"""
@@ -51,13 +52,15 @@ class EncoderInterface(nn.Module):
 class XLSREncoder(EncoderInterface):
     def __init__(
         self, 
-        model_name: str = "TalTechNLP/xls-r-300m-et",
-        decode_chunk_size: int = 5120,  # 320ms at 16kHz (paper's best performing)
-        chunk_overlap: int = None,  # Will be set to 40% of decode_chunk_size
+        model_name: str = "facebook/wav2vec2-xls-r-300m",
+        decode_chunk_size: int = 8000,  # Default to 0.5s at 16kHz
+        chunk_overlap: int = None,  # Will be set to decode_chunk_size // 2
         use_attention_sink: bool = True,
-        attention_sink_size: int = 16,  # Paper's optimal setting
-        frame_duration: float = 0.025,  # 25ms per frame (from paper)
-        frame_stride: float = 0.020,  # 20ms stride (from paper)
+        attention_sink_size: int = 4,  # Number of attention sink frames
+        frame_duration: float = 0.025,  # 25ms per frame
+        frame_stride: float = 0.020,  # 20ms stride
+        context_frames: int = 10,  # Additional context frames for each chunk
+        transition_frames: int = 5,  # Frames for smooth chunk transition
         min_chunk_size: int = 2560,  # 160ms at 16kHz (16 frames)
         max_chunk_size: int = 20480,  # 1280ms at 16kHz (128 frames)
         left_context_chunks: int = 1,  # Paper's optimal setting
@@ -85,7 +88,7 @@ class XLSREncoder(EncoderInterface):
         
         # Streaming parameters
         self.decode_chunk_size = decode_chunk_size
-        self.chunk_overlap = chunk_overlap if chunk_overlap is not None else int(decode_chunk_size * 0.4)  # 40% overlap per paper
+        self.chunk_overlap = chunk_overlap if chunk_overlap is not None else int(decode_chunk_size // 2)
         self.min_chunk_size = min_chunk_size
         self.max_chunk_size = max_chunk_size
         self.left_context_chunks = left_context_chunks
@@ -494,7 +497,8 @@ class XLSREncoder(EncoderInterface):
         self,
         x: torch.Tensor,
         x_lens: torch.Tensor,
-        is_pre_training: bool = False
+        is_pre_training: bool = False,
+        streaming_state: Optional[List[torch.Tensor]] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Non-streaming forward pass with option for pre-training mode
         
@@ -502,6 +506,7 @@ class XLSREncoder(EncoderInterface):
             x: Input tensor (batch, time) or (batch, time, 1)
             x_lens: Length of each sequence in batch
             is_pre_training: Whether we're in pre-training mode (no streaming/chunks)
+            streaming_state: Optional cached states from previous chunk (ignored in non-streaming mode)
             
         Returns:
             (encoder_out, encoder_out_lens)
@@ -513,6 +518,11 @@ class XLSREncoder(EncoderInterface):
             logging.info(f"XLSREncoder.forward: USING PRE-TRAINING MODE (no chunking) for input shape {x.shape}")
         else:
             logging.info(f"XLSREncoder.forward: USING STREAMING MODE with chunking for input shape {x.shape}")
+            
+        # Handle streaming mode if not in pre-training
+        if not is_pre_training and streaming_state is not None:
+            outputs, output_lengths, _ = self.streaming_forward(x, x_lens, streaming_state)
+            return outputs, output_lengths
         
         # Ensure input is float and in correct shape
         x = x.float()

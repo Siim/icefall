@@ -994,7 +994,7 @@ def process_streaming_chunks(
                     # Skip the overlapping frames (avoiding duplication)
                     if frames_to_skip < chunk_out.size(1):
                         chunk_out = chunk_out[:, frames_to_skip:]
-                    else:
+            else:
                         # In case of very small chunks, we might need to skip the entire output
                         chunk_out = chunk_out[:, 0:0]  # Empty tensor with correct dimensions
             
@@ -1472,7 +1472,7 @@ def compute_validation_loss(
                             tb_writer.add_scalar('validation/wer', wer, params.batch_idx_train)
                 else:
                     logging.warning("No results returned from decode_one_batch_hyps")
-            except Exception as e:
+    except Exception as e:
                 logging.warning(f"Error during validation: {str(e)}")
                 import traceback
                 logging.warning(f"Exception details:\n{traceback.format_exc()}")
@@ -1511,6 +1511,15 @@ def train_one_epoch(
     
     # Determine training phase
     is_pre_training = params.cur_epoch <= params.pretrain_epochs
+    
+    # Adjust learning rate based on training phase
+    if is_pre_training:
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = params.pre_train_lr
+        logging.info(f"Pre-training phase (Epoch {params.cur_epoch}), lr={params.pre_train_lr}")
+    else:
+        # Let the scheduler handle the learning rate for non-pre-training phases
+        pass
     
     # Set batch size based on phase
     if isinstance(params.batch_size, dict):
@@ -1613,7 +1622,7 @@ def train_one_epoch(
                                     output_diff.mean().item(),
                                     params.batch_idx_train
                                 )
-                    
+            
             # Run validation less frequently to save memory - validate every 100 batches
             # or only at specific batch indices during early training
             should_validate = (

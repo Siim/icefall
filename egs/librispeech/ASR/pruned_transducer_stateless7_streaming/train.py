@@ -89,7 +89,7 @@ from icefall.env import get_env_info
 from icefall.err import raise_grad_scale_is_too_small_error
 from icefall.hooks import register_inf_check_hooks
 from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
-from beam_search import greedy_search_batch, beam_search_batch  # Only import what we use for validation
+from beam_search import greedy_search_batch  # Only import what we use for validation
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -701,21 +701,17 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
     decoder = get_decoder_model(params)
     joiner = get_joiner_model(params)
 
-    # For XLSR encoder, add projection layer to match joiner input
-    if params.use_xlsr:
-        encoder_proj = nn.Linear(encoder.output_dim, params.joiner_dim)
-    else:
-        encoder_proj = nn.Identity()
+    # For XLSR encoder, output dim is fixed at 1024 for XLS-R 300M
+    encoder_dim = 1024 if params.use_xlsr else int(params.encoder_dims.split(",")[-1])
 
     model = Transducer(
         encoder=encoder,
         decoder=decoder,
         joiner=joiner,
-        encoder_dim=params.joiner_dim,  # Use joiner_dim instead of encoder's native dim
+        encoder_dim=encoder_dim,
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
-        encoder_proj=encoder_proj  # Add projection layer
     )
     return model
 
@@ -1186,10 +1182,10 @@ def compute_loss(
     
     # Combine losses according to paper
     if is_pre_training:
-        # During pre-training, use both losses but weight simple loss higher
-        loss = 0.7 * simple_loss + 0.3 * pruned_loss
+        # During pre-training, use only simple loss for better convergence
+        loss = simple_loss
     else:
-        # During streaming phase use paper's recommended weights
+        # During streaming, combine both losses with scaling
         loss = params.simple_loss_scale * simple_loss + (1 - params.simple_loss_scale) * pruned_loss
     
     assert loss.requires_grad == is_training
@@ -1335,12 +1331,11 @@ def decode_one_batch_hyps(
             logging.warning(f"Zero dimension in projected encoder output: shape={encoder_out.shape}")
             return supervisions["text"], [""] * len(supervisions["text"])
         
-        # Use beam search batch for decoding
-        hyp_tokens = beam_search_batch(
+        # Use greedy search batch for decoding
+        hyp_tokens = greedy_search_batch(
             model=model,
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
-            beam=params.beam_size,
         )
     except RuntimeError as e:
         logging.warning(f"Error during greedy search: {str(e)}")
@@ -1830,16 +1825,30 @@ def run(rank, world_size, args):
 
     # Paper uses warmup followed by decay
     def lr_scheduler(step: int, epoch: float) -> float:
-        # Warmup for first 10% of training
-        total_steps = params.num_epochs * len(train_dl)
-        warmup_steps = int(0.1 * total_steps)
+        """
+        The learning rate scheduler function determines the learning rate based on the current step and epoch.
+        It implements a warmup phase followed by a decay phase.
         
-        if step < warmup_steps:
-            return params.base_lr * (step / warmup_steps)
+        Args:
+            step: The current step in training
+            epoch: The current epoch in training
+            
+        Returns:
+            The learning rate for the current step
+        """
+        # Check if we're in pre-training phase
+        is_pre_training = epoch < params.num_epochs_pre_train
         
-        # Cosine decay after warmup
-        decay_steps = total_steps - warmup_steps
-        return params.base_lr * 0.5 * (1 + math.cos(math.pi * (step - warmup_steps) / decay_steps))
+        # Use pre_train_lr during pre-training phase, otherwise use base_lr
+        current_base_lr = params.pre_train_lr if is_pre_training else params.base_lr
+        
+        # During warmup phase, the learning rate increases linearly
+        if step < params.warmup_steps:
+            return current_base_lr * step / params.warmup_steps
+        
+        # After warmup, we decay the learning rate based on the current epoch
+        # Ensure the learning rate doesn't drop below 5% of the base learning rate
+        return max(0.05 * current_base_lr, current_base_lr * (1.0 - epoch / params.num_epochs))
 
     scheduler = Eden(
         optimizer=optimizer,

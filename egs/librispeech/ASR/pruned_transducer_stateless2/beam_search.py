@@ -3181,30 +3181,3 @@ def modified_beam_search_lm_shallow_fusion(
             hyps=ans,
             timestamps=ans_timestamps,
         )
-
-
-def beam_search_batch(
-    model: nn.Module,
-    encoder_out: torch.Tensor,
-    encoder_out_lens: torch.Tensor,
-    beam: int,
-) -> List[List[int]]:
-    """Beam search in batch mode using modified_beam_search infrastructure.
-    
-    Args:
-        model: The transducer model
-        encoder_out: Output from encoder (batch, T, C)
-        encoder_out_lens: Lengths of encoder outputs
-        beam: Beam size to use
-        
-    Returns:
-        List of decoded token sequences
-    """
-    return modified_beam_search(
-        model=model,
-        encoder_out=encoder_out,
-        encoder_out_lens=encoder_out_lens,
-        beam=beam,
-        temperature=1.0,
-        return_timestamps=False
-    )

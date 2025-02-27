@@ -16,7 +16,6 @@
 
 
 import random
-from typing import Optional, Tuple
 
 import k2
 import torch
@@ -42,7 +41,6 @@ class Transducer(nn.Module):
         decoder_dim: int,
         joiner_dim: int,
         vocab_size: int,
-        encoder_proj: Optional[nn.Module] = None,
     ):
         """
         Args:
@@ -67,10 +65,13 @@ class Transducer(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.joiner = joiner
-        
-        # Use the provided encoder_proj if given, otherwise create identity
-        self.encoder_proj = encoder_proj
-        
+
+        # Add projection layer for XLSR encoder if needed
+        if isinstance(encoder, XLSREncoder):
+            self.encoder_proj = nn.Linear(1024, encoder_dim)
+        else:
+            self.encoder_proj = nn.Identity()
+
         self.simple_am_proj = nn.Linear(
             encoder_dim,
             vocab_size,

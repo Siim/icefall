@@ -225,18 +225,18 @@ def process_streaming_chunks(
     left_context_chunks: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Process audio in streaming mode with overlapping chunks.
-
+    """Process audio in non-streaming mode since model is in pre-training phase.
+    
     Args:
         model: The model to use
         feature: Input features (batch, time)
-        chunk_size: Size of each chunk in samples (e.g., 5120 for 320ms)
-        attention_sink_size: Number of frames for attention sink (16 as per paper)
-        left_context_chunks: Number of left context chunks (1 as per paper)
+        chunk_size: Size of each chunk in samples (not used in non-streaming mode)
+        attention_sink_size: Number of frames for attention sink (not used in non-streaming mode)
+        left_context_chunks: Number of left context chunks (not used in non-streaming mode)
         device: Device to run inference on
     
     Returns:
-        Encoder outputs processed in streaming mode
+        Encoder outputs processed in non-streaming mode
     """
     # Check if feature is 2D (batch, time) or 3D (batch, time, dim)
     if feature.dim() == 3 and feature.size(2) > 1:
@@ -255,7 +255,7 @@ def process_streaming_chunks(
         encoder = model.encoder
     
     # Process in non-streaming mode (since model is in pre-training phase)
-    logging.info("Using full sequence processing for decoding (pre-training mode)")
+    logging.info("Using non-streaming mode for decoding (pre-training phase)")
     encoder_out, _ = encoder(
         x=feature,
         x_lens=feature_lens
@@ -301,7 +301,8 @@ def main():
         # Move audio to device
         audio = audio.to(device)
         
-        # Process through encoder
+        # Process through encoder in non-streaming mode
+        logging.info("Using non-streaming mode for decoding since model is in pre-training phase")
         encoder_out = process_streaming_chunks(
             model=model,
             feature=audio,

@@ -1619,13 +1619,13 @@ def train_one_epoch(
             
             # Handle FP16 training with scaler
             if params.use_fp16 and scaler is not None:
-                scaler.scale(loss).backward()
+                scaler.scale(loss).backward(retain_graph=True)
                 scaler.unscale_(optimizer)
                 clip_grad_norm_(model.parameters(), 5.0, 2.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                loss.backward()
+                loss.backward(retain_graph=True)
                 clip_grad_norm_(model.parameters(), 5.0, 2.0)
                 optimizer.step()
             

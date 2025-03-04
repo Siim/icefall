@@ -1318,89 +1318,56 @@ def decode_one_batch_hyps(
             # Check if encoder output is valid
             if encoder_out is None or encoder_out_lens is None or encoder_out.size(0) == 0 or encoder_out_lens.size(0) == 0:
                 logging.warning(f"Empty encoder output: shape={encoder_out.shape if encoder_out is not None else 'None'}, lens={encoder_out_lens if encoder_out_lens is not None else 'None'}")
-                return supervisions["text"], [""] * len(supervisions["text"])
+                return texts, [""] * len(texts)
     except Exception as e:
         logging.warning(f"Exception during encoder processing: {str(e)}")
-        return supervisions["text"], [""] * len(supervisions["text"])
+        return texts, [""] * len(texts)
     
-    # Project encoder output
+    # Project encoder output if needed
     try:
+        # Check if model has encoder_proj attribute
+        has_encoder_proj = False
         if isinstance(model, DDP):
-            encoder_out = model.module.encoder_proj(encoder_out)
+            has_encoder_proj = hasattr(model.module, 'encoder_proj')
         else:
-            encoder_out = model.encoder_proj(encoder_out)
+            has_encoder_proj = hasattr(model, 'encoder_proj')
+        
+        # Apply projection if available
+        if has_encoder_proj:
+            if isinstance(model, DDP):
+                encoder_out = model.module.encoder_proj(encoder_out)
+            else:
+                encoder_out = model.encoder_proj(encoder_out)
         
         # Check if any dimension is zero, which would cause issues
         if 0 in encoder_out.shape:
-            logging.warning(f"Zero dimension in projected encoder output: shape={encoder_out.shape}")
-            return supervisions["text"], [""] * len(supervisions["text"])
+            logging.warning(f"Zero dimension in encoder output: shape={encoder_out.shape}")
+            return texts, [""] * len(texts)
         
         # Use modified_beam_search for decoding with a beam width of 4
         from beam_search import modified_beam_search
         
         # Check if we're decoding a batch or just one sample
-        if encoder_out.size(0) == 1:
-            # For a single sample, use the non-batch version
-            hyp_tokens = modified_beam_search(
-                model=model,
-                encoder_out=encoder_out,
-                encoder_out_lens=encoder_out_lens,
-                beam=4,  # Use beam width of 4 for decoding
-                temperature=1.0,
-                blank_penalty=params.blank_penalty,
-            )
-        else:
-            # For batch decoding
-            hyp_tokens = modified_beam_search(
-                model=model,
-                encoder_out=encoder_out,
-                encoder_out_lens=encoder_out_lens,
-                beam=4,  # Use beam width of 4 for decoding
-                temperature=1.0,
-                blank_penalty=params.blank_penalty,
-            )
+        hyp_tokens = modified_beam_search(
+            model=model,
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens,
+            beam=4,  # Use beam width of 4 for decoding
+            temperature=1.0,
+            blank_penalty=params.blank_penalty if hasattr(params, 'blank_penalty') else 0.0,
+        )
+        
+        # Convert token IDs to text
+        hyps = [sp.decode(h.tolist()) for h in hyp_tokens]
+        return texts, hyps
             
     except RuntimeError as e:
         logging.warning(f"Error during beam search: {str(e)}")
         logging.warning(f"Encoder output shape: {encoder_out.shape if encoder_out is not None else 'None'}, lens shape: {encoder_out_lens.shape if encoder_out_lens is not None else 'None'}")
-        return supervisions["text"], [""] * len(supervisions["text"])
+        return texts, [""] * len(texts)
     except Exception as e:
         logging.warning(f"Exception during decoding: {str(e)}")
-        return supervisions["text"], [""] * len(supervisions["text"])
-    
-    # Convert token IDs to text
-    hyps = []
-    preds = []
-    
-    # Get ground truth
-    texts = supervisions["text"]
-    
-    # Process each item in the batch
-    for i in range(len(texts)):
-        # Ground truth
-        hyps.append(texts[i])
-        
-        # Make sure we have predictions for each item
-        if i >= len(hyp_tokens):
-            preds.append("")
-            continue
-            
-        # Prediction - handle both tensor and list outputs
-        pred_tokens = hyp_tokens[i]
-        if isinstance(pred_tokens, torch.Tensor):
-            pred_tokens = pred_tokens.tolist()
-        elif not isinstance(pred_tokens, list):
-            pred_tokens = list(pred_tokens)
-            
-        # Remove any padding or special tokens
-        while pred_tokens and pred_tokens[-1] == params.blank_id:
-            pred_tokens.pop()
-            
-        # Convert to text
-        pred = sp.decode(pred_tokens)
-        preds.append(pred)
-    
-    return hyps, preds
+        return texts, [""] * len(texts)
 
 
 def extract_validation_sample(

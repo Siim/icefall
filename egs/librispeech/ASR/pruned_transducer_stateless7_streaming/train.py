@@ -1358,7 +1358,14 @@ def decode_one_batch_hyps(
         )
         
         # Convert token IDs to text
-        hyps = [sp.decode(h.tolist()) for h in hyp_tokens]
+        hyps = []
+        for h in hyp_tokens:
+            # Check if h is a tensor or a list
+            if isinstance(h, torch.Tensor):
+                h_list = h.tolist()
+            else:
+                h_list = h
+            hyps.append(sp.decode(h_list))
         return texts, hyps
             
     except RuntimeError as e:

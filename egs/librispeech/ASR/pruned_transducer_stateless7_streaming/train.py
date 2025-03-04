@@ -946,7 +946,7 @@ def process_streaming_chunks(
     attention_sink_size: int,
     left_context_chunks: int,
     is_pre_training: bool = False
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Process audio in streaming mode with overlapping chunks.
     
     Args:
@@ -958,7 +958,7 @@ def process_streaming_chunks(
         is_pre_training: Whether we're in pre-training mode
     
     Returns:
-        Encoder outputs processed in streaming mode
+        Tuple of (encoder_out, encoder_out_lens)
     """
     if is_pre_training:
         # During pre-training, use full context without chunking
@@ -966,8 +966,8 @@ def process_streaming_chunks(
         # Create feature lengths for all sequences
         batch_size = feature.shape[0]
         feature_lens = torch.tensor([feature.shape[1]] * batch_size, device=feature.device)
-        encoder_out, _ = model.encoder(feature, feature_lens)
-        return encoder_out
+        encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
+        return encoder_out, encoder_out_lens
     
     # Log important streaming parameters
     logging.info(f"Processing in streaming mode with chunk_size={chunk_size}, "
@@ -987,6 +987,15 @@ def process_streaming_chunks(
         encoder = model.module.encoder
     else:
         encoder = model.encoder
+    
+    # Get the actual sequence lengths for each item in the batch
+    if isinstance(feature, torch.Tensor):
+        # For padded batch tensors, find the actual lengths by looking for padding
+        feature_lens = torch.tensor([seq_len] * batch_size, device=device)
+        if len(feature.shape) == 3:
+            # Assuming padding is done with zeros or very small values
+            mask = (feature.abs().sum(dim=2) > 1e-6)
+            feature_lens = mask.sum(dim=1)
     
     # Ensure we have valid attention sink settings
     if attention_sink_size > 0:
@@ -1027,14 +1036,14 @@ def process_streaming_chunks(
             else:
                 with_context = current_chunk
         
-        # Process the chunk - updated to use is_pre_training parameter properly
-        # Create fake lengths for this chunk (required by some encoders)
+        # Process the chunk
+        # Create lengths for this chunk
         chunk_lens = torch.tensor([with_context.size(1)] * batch_size, device=device)
         
         # Process chunk with the encoder
         chunk_out, _ = encoder(
             with_context, 
-            chunk_lens  # Provide length information
+            chunk_lens
         )
         
         # Apply attention sink if enabled
@@ -1063,17 +1072,23 @@ def process_streaming_chunks(
     # Concatenate all outputs
     if outputs:
         combined_output = torch.cat(outputs, dim=1)
+        # Calculate actual output lengths based on input lengths and downsampling
+        encoder_out_lens = ((feature_lens.float() / encoder.downsample_factor).floor()).to(torch.int64)
+        encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
+        
         # Ensure the output is not longer than expected after encoder downsampling
-        expected_length = (seq_len // encoder.downsample_factor) + 1
-        if combined_output.size(1) > expected_length:
-            combined_output = combined_output[:, :expected_length]
+        max_len = encoder_out_lens.max().item()
+        if combined_output.size(1) > max_len:
+            combined_output = combined_output[:, :max_len]
         
         logging.info(f"Streaming processing complete. Output shape: {combined_output.shape}")
-        return combined_output
+        return combined_output, encoder_out_lens
     else:
         logging.warning("No outputs generated during streaming processing")
-        # Return empty tensor with correct dimensions
-        return torch.zeros((batch_size, 0, encoder.output_dim), device=device)
+        # Return empty tensor with correct dimensions and zero lengths
+        empty_output = torch.zeros((batch_size, 0, encoder.output_dim), device=device)
+        zero_lengths = torch.zeros(batch_size, device=device, dtype=torch.int64)
+        return empty_output, zero_lengths
 
 
 def calculate_errors(ref: str, hyp: str) -> int:
@@ -1159,7 +1174,7 @@ def compute_loss(
             curr_chunk_size = chunk_size
             
         # Process in chunks with attention sink
-        encoder_out = process_streaming_chunks(
+        encoder_out, encoder_out_lens = process_streaming_chunks(
             model=model,
             feature=feature,
             chunk_size=curr_chunk_size,
@@ -1167,9 +1182,6 @@ def compute_loss(
             left_context_chunks=params.left_context_chunks,
             is_pre_training=is_pre_training
         )
-        # Calculate encoder output lengths based on chunk processing
-        encoder_out_lens = ((feature_lens.float() / model.encoder.downsample_factor).floor()).to(torch.int64)
-        encoder_out_lens = torch.maximum(encoder_out_lens, torch.ones_like(encoder_out_lens))
     
     # Project encoder output if using XLSR
     if hasattr(model, 'encoder_proj'):

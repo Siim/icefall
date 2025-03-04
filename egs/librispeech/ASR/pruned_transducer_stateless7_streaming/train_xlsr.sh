@@ -63,6 +63,6 @@ python "$WORKSPACE_DIR/train.py" \
     --world-size=1 \
     --batch-size=8 \
     --dataset="estonian" \
-    --use-fp16=true
+    --use-fp16=false
 
 echo "Training completed. Models saved to $EXP_DIR" 

@@ -492,23 +492,25 @@ def transcribe_wav(wav_path: str,
         # Handle list of hypotheses format
         best_hyp = hyps[0][0] if isinstance(hyps[0], tuple) else hyps[0]
     
-    logging.info(f"Best hypothesis tokens: {best_hyp}")
+    logging.info(f"Best hypothesis: {best_hyp}")
+    logging.info(f"Type of best hypothesis: {type(best_hyp)}")
     
     # Convert tokens to text
     if isinstance(best_hyp, int):
         tokens = [best_hyp]
+        logging.info(f"Single token hypothesis: {best_hyp}")
     else:
         tokens = best_hyp
-    
-    # Log individual tokens for diagnosis    
-    if len(tokens) <= 10:
-        token_texts = []
-        for token in tokens:
+        token_details = []
+        # Show more detailed token information
+        for i, token in enumerate(tokens[:20]):  # Show first 20 tokens max
             piece = sp.id_to_piece(token)
-            token_texts.append(f"{token} → '{piece}'")
-        logging.info(f"Token details: {', '.join(token_texts)}")
-    else:
-        logging.info(f"First 10 tokens: {tokens[:10]}")
+            token_details.append(f"{i}: {token} → '{piece}'")
+        
+        logging.info(f"Token details:\n" + "\n".join(token_details))
+    
+    # Print total number of tokens
+    logging.info(f"Total tokens: {len(tokens)}")
         
     text = sp.decode(tokens)
     
@@ -590,9 +592,19 @@ def main():
     
     # Set beam search parameters
     params.beam_size = args.beam_size if hasattr(args, 'beam_size') else 4
-    # Use a higher blank penalty to discourage early termination
-    params.blank_penalty = 1.0  # Increased from 0.5 to encourage more tokens
-    params.temperature = 1.0
+    
+    # Use command line blank_penalty from args if specified
+    if hasattr(args, 'blank_penalty'):
+        params.blank_penalty = args.blank_penalty
+    else:
+        # Otherwise use a higher default value
+        params.blank_penalty = 1.0  # Higher value to encourage more tokens
+        
+    # Use command line temperature from args if specified
+    if hasattr(args, 'temperature'):
+        params.temperature = args.temperature
+    else:
+        params.temperature = 1.0
     
     # Set pretrained encoder configs
     params.pretrained_encoder = True

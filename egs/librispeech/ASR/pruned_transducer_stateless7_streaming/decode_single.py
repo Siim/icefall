@@ -117,14 +117,17 @@ def load_checkpoint(
     # Convert model state dict to AttributeDict
     params = AttributeDict()
     params.update(checkpoint.get("params", {}))
-    params.update(vars(get_parser().parse_args([])))  # Add default args
-
-    # Ensure required parameters exist
-    params.vocab_size = checkpoint.get("vocab_size", 2500)  # Default BPE vocab size
-    params.blank_id = 0  # Default blank ID
-    params.context_size = checkpoint.get("context_size", 2)
-    params.decoder_dim = checkpoint.get("decoder_dim", 512)
-    params.joiner_dim = checkpoint.get("joiner_dim", 512)
+    
+    # Add default parameters without parsing command line
+    default_args = {
+        "vocab_size": checkpoint.get("vocab_size", 2500),  # Default BPE vocab size
+        "blank_id": 0,  # Default blank ID
+        "context_size": checkpoint.get("context_size", 2),
+        "decoder_dim": checkpoint.get("decoder_dim", 512),
+        "joiner_dim": checkpoint.get("joiner_dim", 512),
+        "use_xlsr": True,  # Default to using XLSR
+    }
+    params.update(default_args)
 
     # Create model
     from train import get_transducer_model

@@ -340,6 +340,7 @@ def main():
     params.zipformer_downsampling_factors = "1,2,4,8"
     params.use_zipformer = False
     params.attention_dim = 512
+    params.attention_dims = "512,512,512,512,512,512"
     params.num_encoder_layers = 24  # Not used for XLSR but required
     
     # Vocabulary parameters

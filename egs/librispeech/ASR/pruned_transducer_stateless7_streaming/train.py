@@ -19,42 +19,37 @@
 # limitations under the License.
 """
 Usage:
+    # For Estonian dataset
+    python train.py \
+        --dataset estonian \
+        --train-txt Data/train_list.txt \
+        --val-txt Data/val_list.txt \
+        --bpe-model Data/lang_bpe_2500/bpe.model \
+        --use-xlsr true
 
-export CUDA_VISIBLE_DEVICES="0,1,2,3"
-
-./pruned_transducer_stateless7_streaming/train.py \
-  --world-size 4 \
-  --num-epochs 30 \
-  --start-epoch 1 \
-  --exp-dir pruned_transducer_stateless7_streaming/exp \
-  --full-libri 1 \
-  --max-duration 300
-
-# For mix precision training:
-
-./pruned_transducer_stateless7_streaming/train.py \
-  --world-size 4 \
-  --num-epochs 30 \
-  --start-epoch 1 \
-  --use-fp16 1 \
-  --exp-dir pruned_transducer_stateless7_streaming/exp \
-  --full-libri 1 \
-  --max-duration 550
+    # For LibriSpeech dataset
+    python train.py \
+        --world-size 2 \
+        --num-epochs 30 \
+        --start-epoch 1 \
+        --exp-dir exp/pretrained \
+        --full-libri 1 \
+        --max-duration 550
 """
-
 
 import argparse
 import copy
 import logging
+import os
+import random
+import traceback
 import warnings
+from pathlib import Path
+from shutil import copyfile
+from typing import Any, Dict, List, Optional, Tuple, Union
 import editdistance
 import math
 import time
-from pathlib import Path
-from shutil import copyfile
-from typing import Any, Dict, Optional, Tuple, Union, List
-import random
-import os
 
 import k2
 import optim
@@ -1540,7 +1535,7 @@ def compute_validation_loss(
                 logging.info(f"Text: {single_sample['supervisions']['text'][0]}")
             
             # Compute loss on the single sample
-            with torch.cuda.amp.autocast(enabled=params.use_fp16):
+            with torch.amp.autocast('cuda', enabled=params.use_fp16):
                 loss, loss_info = compute_loss(
                     params=params,
                     model=model,

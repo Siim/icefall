@@ -356,19 +356,24 @@ def main():
         # Import the modified_beam_search function
         from beam_search import modified_beam_search
         
-        # Use the exact same beam search parameters as in validation
+        # Use a higher blank penalty to discourage repetitions
+        effective_blank_penalty = args.blank_penalty + 1.0  # Increase the blank penalty significantly
+        logging.info(f"Using effective blank penalty: {effective_blank_penalty} (base: {args.blank_penalty})")
+        
+        # Use the exact same beam search parameters as in validation, but with higher blank penalty
         hyp_tokens = modified_beam_search(
             model=model,
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
             beam=args.beam_size,
             temperature=1.0,  # Use fixed temperature of 1.0 as in validation
-            blank_penalty=args.blank_penalty  # Use the provided blank penalty without modification
+            blank_penalty=effective_blank_penalty  # Use increased blank penalty to discourage repetitions
         )
         
         # Log the raw token IDs for debugging
         if len(hyp_tokens) > 0:
             logging.info(f"Raw token IDs: {hyp_tokens[0]}")
+            logging.info(f"Number of tokens: {len(hyp_tokens[0])}")
         
         # Convert tokens to text
         hyps = []

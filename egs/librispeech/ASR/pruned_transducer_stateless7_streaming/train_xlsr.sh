@@ -61,6 +61,7 @@ python "$WORKSPACE_DIR/train.py" \
     --seed=42 \
     --num-workers=4 \
     --world-size=1 \
+    --batch-size=32 \
     --dataset="estonian"
 
 echo "Training completed. Models saved to $EXP_DIR" 

@@ -51,7 +51,7 @@ python "$WORKSPACE_DIR/train.py" \
     --base-lr=3e-5 \
     --train-data="$DATA_DIR/train_list.txt" \
     --val-data="$DATA_DIR/val_list.txt" \
-    --sp-model="$DATA_DIR/lang_bpe_2500/bpe.model" \
+    --bpe-model="$DATA_DIR/lang_bpe_2500/bpe.model" \
     --exp-dir="$EXP_DIR" \
     --tensorboard=true \
     --save-every-n=1000 \

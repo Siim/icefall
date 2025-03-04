@@ -349,7 +349,7 @@ def main():
     params.zipformer_downsampling_factors = "1,2,4,8"
     params.attention_dim = 512
     params.attention_dims = "512,512,512,512,512,512"
-    params.num_encoder_layers = 24
+    params.num_encoder_layers = "6,6,6,6,6,6"
     params.nhead = "8,8,8,8,8,8"
     params.feedforward_dim = "2048,2048,2048,2048,2048,2048"
     params.feedforward_dims = "2048,2048,2048,2048,2048,2048"

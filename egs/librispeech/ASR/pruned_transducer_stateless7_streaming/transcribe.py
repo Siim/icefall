@@ -186,14 +186,6 @@ def get_parser():
         help="Maximum audio duration in seconds"
     )
     
-    # Add beam search parameters
-    parser.add_argument(
-        "--blank-penalty", 
-        type=float, 
-        default=0.8, 
-        help="Penalty applied to blank token to discourage early termination"
-    )
-    
     parser.add_argument(
         "--temperature", 
         type=float, 
@@ -598,7 +590,7 @@ def main():
         params.blank_penalty = args.blank_penalty
     else:
         # Otherwise use a higher default value
-        params.blank_penalty = 1.0  # Higher value to encourage more tokens
+        params.blank_penalty = 1.5  # Higher value to encourage more tokens
         
     # Use command line temperature from args if specified
     if hasattr(args, 'temperature'):

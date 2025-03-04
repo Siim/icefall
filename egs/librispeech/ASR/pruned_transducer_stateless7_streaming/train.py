@@ -3,6 +3,7 @@
 #                                                       Wei Kang,
 #                                                       Mingshuang Luo,)
 #                                                       Zengwei Yao)
+# Copyright    2024                      (authors: Siim Haugas)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
 #
@@ -46,10 +47,12 @@ export CUDA_VISIBLE_DEVICES="0,1,2,3"
 import argparse
 import copy
 import logging
+import os
+import random
 import warnings
 from pathlib import Path
 from shutil import copyfile
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import k2
 import optim
@@ -83,6 +86,12 @@ from icefall.env import get_env_info
 from icefall.err import raise_grad_scale_is_too_small_error
 from icefall.hooks import register_inf_check_hooks
 from icefall.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
+
+# Import XLSR encoder
+from xlsr_encoder import XLSREncoder
+
+# Import Estonian dataset
+from estonian_dataset import EstonianDataset
 
 LRSchedulerType = Union[torch.optim.lr_scheduler._LRScheduler, optim.LRScheduler]
 
@@ -194,6 +203,71 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         type=int,
         default=32,
         help="The chunk size for decoding (in frames before subsampling)",
+    )
+
+    # Add XLSR-specific arguments
+    parser.add_argument(
+        "--use-xlsr",
+        type=str2bool,
+        default=False,
+        help="Whether to use XLSR encoder instead of Zipformer",
+    )
+    
+    parser.add_argument(
+        "--xlsr-model-name",
+        type=str,
+        default="facebook/wav2vec2-large-xlsr-53",
+        help="Pretrained XLSR model name to use",
+    )
+    
+    parser.add_argument(
+        "--xlsr-chunk-size",
+        type=int,
+        default=8000,
+        help="Chunk size for XLSR streaming inference (in samples)",
+    )
+    
+    parser.add_argument(
+        "--xlsr-use-attention-sink",
+        type=str2bool,
+        default=True,
+        help="Whether to use attention sink in XLSR encoder",
+    )
+    
+    parser.add_argument(
+        "--xlsr-attention-sink-size",
+        type=int,
+        default=16,
+        help="Number of frames to use as attention sink",
+    )
+    
+    parser.add_argument(
+        "--xlsr-left-context-chunks",
+        type=int,
+        default=1,
+        help="Number of left context chunks for XLSR streaming",
+    )
+    
+    # Add Estonian dataset arguments
+    parser.add_argument(
+        "--train-data",
+        type=str,
+        default=None,
+        help="Path to training data list file",
+    )
+    
+    parser.add_argument(
+        "--val-data",
+        type=str,
+        default=None,
+        help="Path to validation data list file",
+    )
+    
+    parser.add_argument(
+        "--sp-model",
+        type=str,
+        default=None,
+        help="Path to SentencePiece model for Estonian tokenization",
     )
 
 
@@ -463,28 +537,40 @@ def get_params() -> AttributeDict:
 
 
 def get_encoder_model(params: AttributeDict) -> nn.Module:
-    # TODO: We can add an option to switch between Zipformer and Transformer
-    def to_int_tuple(s: str):
-        return tuple(map(int, s.split(",")))
+    # Check if we should use XLSR encoder
+    if params.use_xlsr:
+        logging.info(f"Using XLSR encoder with model: {params.xlsr_model_name}")
+        encoder = XLSREncoder(
+            model_name=params.xlsr_model_name,
+            decode_chunk_size=params.xlsr_chunk_size,
+            use_attention_sink=params.xlsr_use_attention_sink,
+            attention_sink_size=params.xlsr_attention_sink_size,
+            context_frames=params.xlsr_left_context_chunks * 10,  # 10 frames per chunk
+        )
+        return encoder
+    else:
+        # Original Zipformer encoder
+        def to_int_tuple(s: str):
+            return tuple(map(int, s.split(",")))
 
-    encoder = Zipformer(
-        num_features=params.feature_dim,
-        output_downsampling_factor=2,
-        zipformer_downsampling_factors=to_int_tuple(
-            params.zipformer_downsampling_factors
-        ),
-        encoder_dims=to_int_tuple(params.encoder_dims),
-        attention_dim=to_int_tuple(params.attention_dims),
-        encoder_unmasked_dims=to_int_tuple(params.encoder_unmasked_dims),
-        nhead=to_int_tuple(params.nhead),
-        feedforward_dim=to_int_tuple(params.feedforward_dims),
-        cnn_module_kernels=to_int_tuple(params.cnn_module_kernels),
-        num_encoder_layers=to_int_tuple(params.num_encoder_layers),
-        num_left_chunks=params.num_left_chunks,
-        short_chunk_size=params.short_chunk_size,
-        decode_chunk_size=params.decode_chunk_len // 2,
-    )
-    return encoder
+        encoder = Zipformer(
+            num_features=params.feature_dim,
+            output_downsampling_factor=2,
+            zipformer_downsampling_factors=to_int_tuple(
+                params.zipformer_downsampling_factors
+            ),
+            encoder_dims=to_int_tuple(params.encoder_dims),
+            attention_dim=to_int_tuple(params.attention_dims),
+            encoder_unmasked_dims=to_int_tuple(params.encoder_unmasked_dims),
+            nhead=to_int_tuple(params.nhead),
+            feedforward_dim=to_int_tuple(params.feedforward_dims),
+            cnn_module_kernels=to_int_tuple(params.cnn_module_kernels),
+            num_encoder_layers=to_int_tuple(params.num_encoder_layers),
+            num_left_chunks=params.num_left_chunks,
+            short_chunk_size=params.short_chunk_size,
+            decode_chunk_size=params.decode_chunk_len // 2,
+        )
+        return encoder
 
 
 def get_decoder_model(params: AttributeDict) -> nn.Module:
@@ -1035,26 +1121,63 @@ def run(rank, world_size, args):
     if params.inf_check:
         register_inf_check_hooks(model)
 
-    librispeech = LibriSpeechAsrDataModule(args)
-
-    assert not (
-        params.mini_libri and params.full_libri
-    ), f"Cannot set both mini-libri and full-libri flags to True, now mini-libri {params.mini_libri} and full-libri {params.full_libri}"
-
-    if params.mini_libri:
-        train_cuts = librispeech.train_clean_5_cuts()
+    # Check if we're using Estonian dataset
+    if args.train_data is not None and args.val_data is not None and args.sp_model is not None:
+        logging.info(f"Using Estonian dataset with train data: {args.train_data}")
+        logging.info(f"Validation data: {args.val_data}")
+        logging.info(f"SentencePiece model: {args.sp_model}")
+        
+        # Create Estonian datasets
+        train_dataset = EstonianDataset(
+            data_file=args.train_data,
+            sp_model=args.sp_model,
+            is_training=True,
+            sample_rate=16000,
+            max_duration=20.0,
+            min_duration=0.5,
+        )
+        
+        val_dataset = EstonianDataset(
+            data_file=args.val_data,
+            sp_model=args.sp_model,
+            is_training=False,
+            sample_rate=16000,
+            max_duration=20.0,
+            min_duration=0.5,
+        )
+        
+        # Create data loaders
+        train_dl = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=params.batch_size,
+            shuffle=True,
+            num_workers=params.num_workers,
+            collate_fn=EstonianDataset.collate_fn,
+            pin_memory=True,
+        )
+        
+        valid_dl = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=params.batch_size,
+            shuffle=False,
+            num_workers=params.num_workers,
+            collate_fn=EstonianDataset.collate_fn,
+            pin_memory=True,
+        )
+        
+        # Load SentencePiece model
+        sp = spm.SentencePieceProcessor()
+        sp.load(args.sp_model)
+        
+        # Update vocabulary size in params
+        params.vocab_size = sp.get_piece_size()
+        
     else:
+        # Original LibriSpeech data loading
+        librispeech = LibriSpeechAsrDataModule(args)
+        
         if params.full_libri:
             train_cuts = librispeech.train_all_shuf_cuts()
-
-            # previously we used the following code to load all training cuts,
-            # strictly speaking, shuffled training cuts should be used instead,
-            # but we leave the code here to demonstrate that there is an option
-            # like this to combine multiple cutsets
-
-            # train_cuts = librispeech.train_clean_100_cuts()
-            # train_cuts += librispeech.train_clean_360_cuts()
-            # train_cuts += librispeech.train_other_500_cuts()
         else:
             train_cuts = librispeech.train_clean_100_cuts()
 

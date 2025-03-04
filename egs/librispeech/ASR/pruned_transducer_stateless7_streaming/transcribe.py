@@ -42,19 +42,20 @@ def get_encoder_model(params: AttributeDict):
     Returns:
         An instance of XLSREncoder.
     """
-    from icefall.xlsr_encoder import XLSREncoder
+    from xlsr_encoder import XLSREncoder
     
     logging.info(f"Creating XLSR encoder with model name: {params.xlsr_model_name}")
     
+    # Set default values to ensure they match the XLSREncoder constructor
+    decode_chunk_size = getattr(params, 'decode_chunk_size', 8000)
+    use_attention_sink = getattr(params, 'use_attention_sink', True)
+    attention_sink_size = getattr(params, 'attention_sink_size', 4)
+    
     encoder = XLSREncoder(
         model_name=params.xlsr_model_name,
-        pretrained=params.pretrained_encoder,
-        output_dim=params.encoder_dim,
-        is_streaming=params.is_streaming,
-        decode_chunk_size=params.decode_chunk_size if hasattr(params, 'decode_chunk_size') else 16,
-        use_attention_sink=params.use_attention_sink,
-        attention_sink_size=params.attention_sink_size,
-        left_context_chunks=params.left_context_chunks,
+        decode_chunk_size=decode_chunk_size,
+        use_attention_sink=use_attention_sink,
+        attention_sink_size=attention_sink_size
     )
     
     return encoder

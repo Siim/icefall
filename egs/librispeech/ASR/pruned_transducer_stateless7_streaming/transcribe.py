@@ -117,179 +117,246 @@ def get_transducer_model(params: AttributeDict) -> torch.nn.Module:
     return model
 
 def get_parser():
+    """Get argument parser."""
     parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    
+    # Add model arguments from train.py
+    add_model_arguments(parser)
+    
+    # Checkpoint and model file arguments
     parser.add_argument(
-        "--checkpoint",
-        type=str,
-        required=True,
-        help="Path to the model checkpoint",
+        "--checkpoint", 
+        type=str, 
+        required=True, 
+        help="Path to the model checkpoint file"
     )
-
+    
     parser.add_argument(
-        "--bpe-model",
-        type=str,
-        required=True,
-        help="Path to the BPE model",
+        "--bpe-model", 
+        type=str, 
+        required=True, 
+        help="Path to the sentencepiece model"
     )
-
+    
+    # Audio file argument
     parser.add_argument(
-        "--wav-file",
-        type=str,
-        required=True,
-        help="Path to the WAV file to transcribe",
+        "--wav-file", 
+        type=str, 
+        required=True, 
+        help="Path to the input WAV file"
     )
-
+    
+    # Beam search parameters
     parser.add_argument(
-        "--streaming",
-        type=bool,
-        default=False,
-        help="Whether to use streaming mode for transcription",
+        "--beam-size", 
+        type=int, 
+        default=4, 
+        help="Beam size for beam search"
     )
-
+    
+    # Streaming parameters
     parser.add_argument(
-        "--beam-size",
-        type=int,
-        default=4,
-        help="Beam size for beam search decoding",
+        "--streaming", 
+        action="store_true", 
+        help="Whether to use streaming mode"
     )
-
+    
     parser.add_argument(
-        "--max-states",
-        type=int,
-        default=32,
-        help="Max states for beam search",
+        "--chunk-size", 
+        type=str, 
+        default="1280ms", 
+        choices=["320ms", "640ms", "1280ms", "2560ms"], 
+        help="Chunk size for streaming inference"
     )
-
+    
     parser.add_argument(
-        "--max-contexts",
-        type=int,
-        default=4,
-        help="Max contexts for beam search",
+        "--attention-sink-size", 
+        type=int, 
+        default=16, 
+        help="Size of attention sink (number of frames)"
     )
-
+    
     parser.add_argument(
-        "--blank-penalty",
-        type=float,
-        default=0.9,
-        help="Penalty applied to blank symbol during decoding",
+        "--left-context-chunks", 
+        type=int, 
+        default=1, 
+        help="Number of left context chunks"
     )
-
+    
+    # Audio preprocessing parameters
     parser.add_argument(
-        "--chunk-size",
-        type=str,
-        default="320ms",
-        choices=["320ms", "640ms", "1280ms", "2560ms"],
-        help="Chunk size for streaming inference",
+        "--normalization", 
+        type=str, 
+        default="peak", 
+        choices=["none", "peak", "rms"], 
+        help="Audio normalization method"
     )
-
+    
     parser.add_argument(
-        "--attention-sink-size",
-        type=int,
-        default=16,
-        help="Number of frames for attention sink",
+        "--max-duration", 
+        type=float, 
+        default=20.0, 
+        help="Maximum audio duration in seconds"
     )
-
+    
+    # Experimental options
     parser.add_argument(
-        "--left-context-chunks",
-        type=int,
-        default=1,
-        help="Number of left context chunks for streaming inference",
+        "--try-penalties", 
+        action="store_true", 
+        help="Try different blank penalties and show all results"
     )
-
+    
     return parser
 
 
-def load_audio(audio_path: str, sample_rate: int = 16000) -> torch.Tensor:
-    """Load audio file and convert to the correct sample rate.
+def load_audio(file_path: str, target_sr: int = 16000) -> torch.Tensor:
+    """Load audio file and convert to target sample rate.
     
     Args:
-        audio_path: Path to the audio file
-        sample_rate: Target sample rate (default: 16000)
+        file_path: Path to audio file
+        target_sr: Target sample rate
         
     Returns:
-        torch.Tensor: Waveform tensor
+        Audio waveform as torch tensor
     """
+    logging.info(f"Loading audio from {file_path}")
+    
+    # Handle different possible path formats (especially for Windows paths)
+    if file_path.startswith('/C/'):
+        file_path = 'C:' + file_path[2:]
+    
     # Check if file exists
-    if not os.path.exists(audio_path):
-        raise FileNotFoundError(f"Audio file not found: {audio_path}")
-    
-    # Load audio
-    waveform, sr = torchaudio.load(audio_path)
-    
-    # Convert to mono if needed
-    if waveform.size(0) > 1:
-        waveform = torch.mean(waveform, dim=0, keepdim=True)
-    
-    # Resample if necessary
-    if sr != sample_rate:
-        logging.info(f"Resampling from {sr} to {sample_rate}")
-        resampler = torchaudio.transforms.Resample(sr, sample_rate)
-        waveform = resampler(waveform)
-    
-    return waveform
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"Audio file not found: {file_path}")
+        
+    try:
+        # Load audio with torchaudio
+        waveform, sample_rate = torchaudio.load(file_path)
+        
+        # Convert to mono if needed
+        if waveform.size(0) > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
+            
+        # Resample if needed
+        if sample_rate != target_sr:
+            logging.info(f"Resampling from {sample_rate} to {target_sr}")
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=sample_rate, 
+                new_freq=target_sr
+            )
+            waveform = resampler(waveform)
+            
+        return waveform
+        
+    except Exception as e:
+        logging.error(f"Error loading audio: {e}")
+        raise
 
-
-def verify_audio_length(waveform: torch.Tensor, sample_rate: int, 
-                      min_duration: float = 1.0, max_duration: float = 10.0) -> torch.Tensor:
-    """Verify and adjust audio length if needed.
+def normalize_audio(waveform: torch.Tensor, normalization_type: str = "peak") -> torch.Tensor:
+    """Normalize audio waveform.
     
     Args:
         waveform: Audio waveform
-        sample_rate: Sample rate
-        min_duration: Minimum duration in seconds
-        max_duration: Maximum duration in seconds
+        normalization_type: Type of normalization ("peak", "rms", or "none")
         
     Returns:
-        torch.Tensor: Adjusted waveform
+        Normalized waveform
     """
-    # Get duration
-    duration = waveform.size(1) / sample_rate
-    
-    # Check if audio exceeds max duration
-    if duration > max_duration:
-        logging.warning(f"Audio duration ({duration:.2f}s) exceeds max_duration ({max_duration}s), trimming")
-        max_samples = int(max_duration * sample_rate)
-        waveform = waveform[:, :max_samples]
-    
-    # Check if audio is below min duration
-    if duration < min_duration:
-        logging.warning(f"Audio duration ({duration:.2f}s) below min_duration ({min_duration}s)")
-        padding = int((min_duration - duration) * sample_rate)
-        waveform = torch.nn.functional.pad(waveform, (0, padding))
+    if normalization_type == "none":
+        return waveform
+        
+    elif normalization_type == "peak":
+        # Peak normalization to range [-1, 1]
+        peak = torch.max(torch.abs(waveform))
+        if peak > 0:
+            waveform = waveform / peak
+            
+    elif normalization_type == "rms":
+        # RMS normalization
+        rms = torch.sqrt(torch.mean(waveform ** 2))
+        if rms > 0:
+            waveform = waveform / (rms * 2)  # Scale to roughly [-1, 1]
+            
+    # Ensure we don't exceed bounds
+    waveform = torch.clamp(waveform, min=-1.0, max=1.0)
     
     return waveform
 
-
-def prepare_audio_features(audio_path: str, sample_rate: int = 16000) -> Dict[str, torch.Tensor]:
-    """Load and prepare audio features similar to EstonianDataset.__getitem__.
+def prepare_audio_features(wav_path: str, 
+                          min_duration: float = 0.5,
+                          max_duration: float = 20.0,
+                          normalization: str = "peak") -> Dict[str, torch.Tensor]:
+    """Prepare audio features for inference.
     
     Args:
-        audio_path: Path to audio file
-        sample_rate: Target sample rate
+        wav_path: Path to WAV file
+        min_duration: Minimum audio duration
+        max_duration: Maximum audio duration (increased to 20s)
+        normalization: Type of normalization to apply ("peak", "rms", or "none")
         
     Returns:
-        Dict containing audio features in batch format
+        Dict with preprocessed inputs and lengths
     """
-    # Load and process audio
-    waveform = load_audio(audio_path, sample_rate)
+    # Load audio file
+    waveform = load_audio(wav_path)
     
-    # Verify and adjust audio length
-    waveform = verify_audio_length(waveform, sample_rate)
+    # Apply normalization
+    waveform = normalize_audio(waveform, normalization_type=normalization)
     
-    # Create batch-like structure
-    features = {
-        "inputs": waveform,  # Shape: [1, time]
-        "input_lens": torch.tensor([waveform.size(1)]),
-        "supervisions": {
-            "text": [""],  # Empty text as we don't have reference
-            "audio_path": audio_path
-        }
+    # Verify audio length is within bounds
+    waveform = verify_audio_length(waveform, 
+                                  sample_rate=16000, 
+                                  min_duration=min_duration, 
+                                  max_duration=max_duration)
+    
+    # Create inputs tensor
+    inputs = waveform.squeeze(0).unsqueeze(0)  # [1, num_samples]
+    
+    # Get input length in samples
+    input_lens = torch.tensor([inputs.size(1)], dtype=torch.long)
+    
+    logging.info(f"Preprocessed audio: shape={inputs.shape}, duration={inputs.size(1)/16000:.2f}s")
+    logging.info(f"Audio stats - min: {inputs.min().item():.2f}, max: {inputs.max().item():.2f}, mean: {inputs.mean().item():.2f}")
+    
+    # Return features dict
+    return {
+        "inputs": inputs,
+        "input_lens": input_lens
     }
+
+
+def verify_audio_length(waveform: torch.Tensor, sample_rate: int, 
+                  min_duration: float = 0.5, max_duration: float = 20.0) -> torch.Tensor:
+    """Verify the audio is within the acceptable duration range.
     
-    return features
+    Args:
+        waveform: Audio tensor
+        sample_rate: Sample rate of the audio
+        min_duration: Minimum duration in seconds
+        max_duration: Maximum duration in seconds (increased to 20s)
+        
+    Returns:
+        Verified and possibly trimmed waveform
+    """
+    # Get audio duration in seconds
+    duration = waveform.size(1) / sample_rate
+    
+    # Check if duration is below minimum
+    if duration < min_duration:
+        logging.warning(f"Audio duration ({duration:.2f}s) is below min_duration ({min_duration}s)")
+        # Pad with zeros to reach minimum duration
+        padding_length = int((min_duration - duration) * sample_rate)
+        waveform = torch.nn.functional.pad(waveform, (0, padding_length))
+        
+    # Check if duration exceeds maximum
+    if duration > max_duration:
+        logging.warning(f"Audio duration ({duration:.2f}s) exceeds max_duration ({max_duration}s), trimming")
+        # Trim to maximum duration
+        max_samples = int(max_duration * sample_rate)
+        waveform = waveform[:, :max_samples]
+        
+    return waveform
 
 
 def transcribe_wav(wav_path: str, 
@@ -314,8 +381,16 @@ def transcribe_wav(wav_path: str,
     # Set model to evaluation mode
     model.eval()
     
-    # Load and prepare audio features
-    features = prepare_audio_features(wav_path)
+    # Load and prepare audio features with improved preprocessing
+    features = prepare_audio_features(
+        wav_path,
+        min_duration=0.5,
+        max_duration=20.0,
+        normalization="peak"  # Use peak normalization as default
+    )
+    
+    # Log detailed information about features
+    logging.info(f"Feature shapes - inputs: {features['inputs'].shape}, input_lens: {features['input_lens']}")
     
     # Move to device
     feature = features["inputs"].to(device)
@@ -340,16 +415,32 @@ def transcribe_wav(wav_path: str,
     else:
         logging.info(f"Using non-streaming mode")
         # Process with full context
+        logging.info("Passing features to encoder...")
+        start_encode = time.time()
         encoder_out, encoder_out_lens = model.encoder(
             x=feature,
             x_lens=feature_lens
         )
+        encode_time = time.time() - start_encode
+        logging.info(f"Encoder processing took {encode_time:.3f} seconds")
+        logging.info(f"Encoder output shape: {encoder_out.shape}, output_lens: {encoder_out_lens}")
     
     # Project encoder output if the model has a projection layer
     if hasattr(model, 'encoder_proj'):
+        logging.info("Applying encoder projection...")
         encoder_out = model.encoder_proj(encoder_out)
+        logging.info(f"After projection shape: {encoder_out.shape}")
+    
+    # Log tensor stats to help diagnose issues
+    logging.info(f"Encoder output stats - min: {encoder_out.min().item():.3f}, "
+                f"max: {encoder_out.max().item():.3f}, "
+                f"mean: {encoder_out.mean().item():.3f}, "
+                f"std: {encoder_out.std().item():.3f}")
     
     # Decode using beam search
+    logging.info(f"Starting beam search with beam size {params.beam_size}, "
+                f"blank penalty {params.blank_penalty}, "
+                f"temperature {params.temperature}")
     start_time = time.time()
     
     # Call modified_beam_search with the parameters it accepts
@@ -367,14 +458,28 @@ def transcribe_wav(wav_path: str,
     latency = end_time - start_time
     logging.info(f"Beam search took {latency:.3f} seconds")
     
+    # Log hypotheses for diagnosis
+    logging.info(f"Number of hypotheses returned: {len(hyps)}")
+    
     # Get the best hypothesis
     best_hyp = hyps[0][0]
+    logging.info(f"Best hypothesis tokens: {best_hyp}")
     
     # Convert tokens to text
     if isinstance(best_hyp, int):
         tokens = [best_hyp]
     else:
         tokens = best_hyp
+    
+    # Log individual tokens for diagnosis    
+    if len(tokens) <= 10:
+        token_texts = []
+        for token in tokens:
+            piece = sp.id_to_piece(token)
+            token_texts.append(f"{token} → '{piece}'")
+        logging.info(f"Token details: {', '.join(token_texts)}")
+    else:
+        logging.info(f"First 10 tokens: {tokens[:10]}")
         
     text = sp.decode(tokens)
     
@@ -451,18 +556,17 @@ def main():
     # Set XLSR specific streaming parameters
     params.is_streaming = params.streaming  # Convert boolean to attribute
     params.use_attention_sink = True
-    params.attention_sink_size = args.attention_sink_size
-    params.left_context_chunks = args.left_context_chunks
+    params.attention_sink_size = args.attention_sink_size if hasattr(args, 'attention_sink_size') else 16
+    params.left_context_chunks = args.left_context_chunks if hasattr(args, 'left_context_chunks') else 1
     
     # Set beam search parameters
-    params.beam_size = args.beam_size
-    params.blank_penalty = 0.0
+    params.beam_size = args.beam_size if hasattr(args, 'beam_size') else 4
+    params.blank_penalty = 0.5  # Increased from 0.0 to encourage more tokens
     params.temperature = 1.0
     
     # Set pretrained encoder configs
     params.pretrained_encoder = True
     params.xlsr_model_name = "facebook/wav2vec2-large-xlsr-53"
-    
     
     # Load sentencepiece model
     logging.info(f"Loading SentencePiece model from {params.bpe_model}")
@@ -483,17 +587,31 @@ def main():
     logging.info(f"Loading checkpoint from {params.checkpoint}")
     load_checkpoint_if_available(params=params, model=model)
     
-    # Transcribe
-    transcript = transcribe_wav(
-        wav_path=args.wav_file,
-        model=model,
-        sp=sp,
-        params=params,
-        device=device
-    )
-    
-    # Print the final result
-    print(f"\nFinal Transcript: {transcript}")
+    # Transcribe with different blank penalty values if requested
+    if hasattr(args, 'try_penalties') and args.try_penalties:
+        for penalty in [0.0, 0.3, 0.5, 0.8, 1.0]:
+            logging.info(f"\n======= Testing with blank_penalty={penalty} =======")
+            params.blank_penalty = penalty
+            transcript = transcribe_wav(
+                wav_path=args.wav_file,
+                model=model,
+                sp=sp,
+                params=params,
+                device=device
+            )
+            print(f"\nBlank penalty {penalty}: {transcript}")
+    else:
+        # Single transcription with current parameters
+        transcript = transcribe_wav(
+            wav_path=args.wav_file,
+            model=model,
+            sp=sp,
+            params=params,
+            device=device
+        )
+        
+        # Print the final result
+        print(f"\nFinal Transcript: {transcript}")
 
 
 if __name__ == "__main__":

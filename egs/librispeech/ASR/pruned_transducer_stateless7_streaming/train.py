@@ -1963,7 +1963,7 @@ def run(rank, world_size, args):
             data_file=params.train_txt,
             sp_model=params.bpe_model,
             is_training=True,
-            max_duration=params.max_duration,
+            max_duration=10,
         )
         train_dl = torch.utils.data.DataLoader(
             train_dataset,
@@ -1977,7 +1977,7 @@ def run(rank, world_size, args):
             data_file=params.val_txt,
             sp_model=params.bpe_model,
             is_training=False,
-            max_duration=params.max_duration,
+            max_duration=10,
         )
         valid_dl = torch.utils.data.DataLoader(
             valid_dataset,

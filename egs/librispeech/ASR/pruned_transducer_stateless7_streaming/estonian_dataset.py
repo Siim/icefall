@@ -46,8 +46,8 @@ class EstonianDataset(Dataset):
         sp_model: str,
         is_training: bool = True,
         sample_rate: int = 16000,
-        max_duration: float = 20.0,
-        min_duration: float = 0.5,
+        max_duration: float = 10.0,
+        min_duration: float = 1.0,
     ):
         super().__init__()
         

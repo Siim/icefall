@@ -399,12 +399,15 @@ def transcribe_wav(wav_path: str,
         left_context_chunks = getattr(params, 'left_context_chunks', 1)
         
         logging.info(f"Processing in streaming mode with chunk_size={chunk_size}, attention_sink_size={attention_sink_size}, left_context_chunks={left_context_chunks}")
-        encoder_out, encoder_out_lens = model.encoder.streaming_forward(
+        
+        # Initialize streaming state if necessary
+        streaming_state = None
+        
+        # Call streaming_forward with only the supported parameters
+        encoder_out, encoder_out_lens, streaming_state = model.encoder.streaming_forward(
             x=feature,
             x_lens=feature_lens,
-            chunk_size=chunk_size,
-            attention_sink_size=attention_sink_size,
-            left_context_chunks=left_context_chunks,
+            streaming_state=streaming_state,
         )
     else:
         # Non-streaming mode

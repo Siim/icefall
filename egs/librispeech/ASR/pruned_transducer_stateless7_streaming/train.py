@@ -650,9 +650,8 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
             attention_sink_size=params.attention_sink_size,  # 16 frames (paper's optimal)
             frame_duration=params.frame_duration,  # 25ms per frame
             frame_stride=params.frame_stride,    # 20ms stride
-            min_chunk_size=2560,   # 160ms at 16kHz (16 frames)
-            max_chunk_size=20480,  # 1280ms at 16kHz (128 frames)
-            left_context_chunks=params.left_context_chunks  # 1 chunk (paper's optimal)
+            context_frames=getattr(params, 'context_frames', 10),  # Default 10 additional context frames
+            transition_frames=getattr(params, 'transition_frames', 5)  # Default 5 frames for smooth transition
         )
         # Verify the encoder is properly initialized
         assert isinstance(encoder, XLSREncoder), f"Expected XLSREncoder, got {type(encoder)}"
@@ -947,7 +946,10 @@ def process_streaming_chunks(
     if is_pre_training:
         # During pre-training, use full context without chunking
         logging.info(f"Processing in pre-training mode (no chunking) for feature shape {feature.shape}")
-        encoder_out, _ = model.encoder(feature, None, is_pre_training=True)
+        # Create feature lengths for all sequences
+        batch_size = feature.shape[0]
+        feature_lens = torch.tensor([feature.shape[1]] * batch_size, device=feature.device)
+        encoder_out, _ = model.encoder(feature, feature_lens)
         return encoder_out
     
     # Log important streaming parameters
@@ -1010,9 +1012,7 @@ def process_streaming_chunks(
         # Process chunk with the encoder
         chunk_out, _ = encoder(
             with_context, 
-            chunk_lens,  # Provide length information
-            is_pre_training=False,  # Explicitly set to False for streaming mode
-            streaming_state=None   # Pass streaming_state=None to match the interface
+            chunk_lens  # Provide length information
         )
         
         # Apply attention sink if enabled
@@ -1110,8 +1110,7 @@ def compute_loss(
         # Pre-training phase: full sequence processing without chunking
         encoder_out, encoder_out_lens = model.encoder(
             x=feature,
-            x_lens=feature_lens,
-            is_pre_training=True
+            x_lens=feature_lens
         )
     else:
         # Determine chunk size based on training phase
@@ -1303,8 +1302,7 @@ def decode_one_batch_hyps(
                 logging.info("Using full sequence processing for decoding (pre-training mode)")
                 encoder_out, encoder_out_lens = model.encoder(
                     x=feature,
-                    x_lens=feature_lens,
-                    is_pre_training=True
+                    x_lens=feature_lens
                 )
             else:
                 # In streaming mode, add right context padding

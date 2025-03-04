@@ -54,6 +54,7 @@ from pathlib import Path
 from shutil import copyfile
 from typing import Any, Dict, Optional, Tuple, Union, List
 import random
+import os
 
 import k2
 import optim
@@ -1913,8 +1914,16 @@ def run(rank, world_size, args):
         register_inf_check_hooks(model)
 
     if params.dataset == "estonian":
+        # For Estonian dataset
+        import sys
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from estonian_dataset import EstonianASRDataset, collate_fn
-        logging.info("Using Estonian dataset")
+        
+        # Create a SentencePiece processor from the model
+        import sentencepiece as spm
+        sp = spm.SentencePieceProcessor()
+        sp.load(params.bpe_model)
+        logging.info(f"Loaded SentencePiece model from {params.bpe_model}")
         
         train_dataset = EstonianASRDataset(params.train_txt, base_path=params.audio_base_path, sp=sp)
         train_dl = torch.utils.data.DataLoader(

@@ -135,6 +135,9 @@ def load_checkpoint(
         "downsample_factor": 320, # For wav2vec2/XLSR models
         "context_frames": 10,     # Default 10 additional context frames
         "transition_frames": 5,   # Default 5 frames for smooth transition
+        
+        # Additional parameters required by the encoder
+        "attention_sink_size": 16,  # 16 frames (paper's optimal)
     }
     params.update(default_args)
 

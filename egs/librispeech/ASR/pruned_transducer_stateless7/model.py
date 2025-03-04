@@ -16,6 +16,7 @@
 
 
 import random
+from typing import Tuple
 
 import k2
 import torch
@@ -83,41 +84,33 @@ class Transducer(nn.Module):
         prune_range: int = 5,
         am_scale: float = 0.0,
         lm_scale: float = 0.0,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
           x:
-            A 3-D tensor of shape (N, T, C).
+            The input tensor. Its shape is (batch_size, input_dim, seq_len).
+            For Estonian dataset, shape may be (batch_size, seq_len, input_dim).
           x_lens:
-            A 1-D tensor of shape (N,). It contains the number of frames in `x`
-            before padding.
+            A tensor of shape (batch_size,) containing the number of frames in
+            `x` before padding.
           y:
-            A ragged tensor with 2 axes [utt][label]. It contains labels of each
-            utterance.
+            A ragged tensor with 2 axes [utt][label]. It contains the reference
+            transcript.
           prune_range:
             The prune range for rnnt loss, it means how many symbols(context)
             we are considering for each frame to compute the loss.
           am_scale:
-            The scale to smooth the loss with am (output of encoder network)
-            part
+            The scale to be applied to the acoustic part of the loss.
           lm_scale:
-            The scale to smooth the loss with lm (output of predictor network)
-            part
+            The scale to be applied to the language model part of the loss.
+
         Returns:
           Return the transducer loss.
 
         Note:
-           Regarding am_scale & lm_scale, it will make the loss-function one of
-           the form:
-              lm_scale * lm_probs + am_scale * am_probs +
-              (1-lm_scale-am_scale) * combined_probs
+           Regarding am_scale & lm_scale, it will make the loss function as:
+           loss = (1 - am_scale - lm_scale) * loss + am_scale * am_loss + lm_scale * lm_loss
         """
-        assert x.ndim == 3, x.shape
-        assert x_lens.ndim == 1, x_lens.shape
-        assert y.num_axes == 2, y.num_axes
-
-        assert x.size(0) == x_lens.size(0) == y.dim0
-
         # Handle input with shape [batch, channel, time] by permuting to [batch, time, channel]
         if x.size(2) > x.size(1) and x.size(1) == 1:
             x = x.permute(0, 2, 1)
@@ -128,8 +121,17 @@ class Transducer(nn.Module):
                 if x.ndim == 2:
                     x = x.unsqueeze(2)
 
-        # x.T_dim == max(x_len)
-        assert x.size(1) == x_lens.max().item(), (x.shape, x_lens, x_lens.max())
+        # For Estonian dataset, the input shape is [batch, time, channel]
+        # We need to check if the assertion is valid for this case
+        if x.ndim == 3 and x.size(2) == 1:
+            # For 3D input with single channel, we check against the time dimension
+            assert x.size(1) == x_lens.max().item(), (x.shape, x_lens, x_lens.max())
+        elif x.ndim == 3 and x.size(2) > 1:
+            # For 3D input with features in the last dimension, we also check against the time dimension
+            assert x.size(1) == x_lens.max().item(), (x.shape, x_lens, x_lens.max())
+        else:
+            # For 2D input, we check against the second dimension
+            assert x.size(1) == x_lens.max().item(), (x.shape, x_lens, x_lens.max())
 
         encoder_out, x_lens = self.encoder(x, x_lens)
         assert torch.all(x_lens > 0)

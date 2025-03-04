@@ -184,22 +184,22 @@ class XLSREncoder(EncoderInterface):
             
         return outputs, output_lengths, next_states
 
-    def forward(self, x: torch.Tensor, x_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Non-streaming forward pass or streaming pass depending on is_pre_training flag
+    def forward(self, x: torch.Tensor, x_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass of the XLSR encoder.
         
         Args:
-            x: Input tensor (batch, time) or (batch, time, 1)
-            x_lens: Length of each sequence in batch
+            x: Input tensor of shape (batch, time) or (batch, time, channel)
+            x_lens: Tensor of shape (batch,) containing the valid length of each sequence
             
         Returns:
-            (encoder_out, encoder_out_lens)
+            Tuple of (encoder_out, encoder_out_lens)
         """
-        # Regular non-streaming forward pass
-        # Ensure input is float and in correct shape
-        x = x.float()
-        
+        # Handle different input shapes
         if x.ndim == 3:  # (batch, time, channel)
-            x = x.squeeze(-1)
+            if x.size(2) == 1:
+                x = x.squeeze(-1)  # Remove channel dimension if it's 1
+            else:
+                raise ValueError(f"Expected channel dimension to be 1, got shape {x.shape}")
         elif x.ndim == 1:  # (time,)
             x = x.unsqueeze(0)  # Add batch dimension
         

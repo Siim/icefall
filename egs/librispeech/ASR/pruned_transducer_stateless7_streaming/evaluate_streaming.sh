@@ -6,7 +6,7 @@
 set -e  # Exit on error
 
 # Define directories
-WORKSPACE_DIR="/C/XLSR-Transducer"
+WORKSPACE_DIR="/C/XLSR-Transducer/pruned_transducer_stateless7_streaming"
 EXP_DIR="$WORKSPACE_DIR/exp/xlsr_transducer_estonian"
 DATA_DIR="$WORKSPACE_DIR/Data"
 

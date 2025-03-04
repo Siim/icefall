@@ -1257,9 +1257,9 @@ def compute_loss_with_amp(
     
     # Scale the loss for mixed precision training
     if is_training and params.use_fp16:
-        scaler.scale(loss).backward()
+        scaler.scale(loss).backward(retain_graph=True)
     elif is_training:
-        loss.backward()
+        loss.backward(retain_graph=True)
     
     return loss, info
 
@@ -1619,13 +1619,16 @@ def train_one_epoch(
             
             # Handle FP16 training with scaler
             if params.use_fp16 and scaler is not None:
-                scaler.scale(loss).backward(retain_graph=True)
+                # backward() was already called in compute_loss_with_amp
+                # scaler.scale(loss).backward(retain_graph=True)
                 scaler.unscale_(optimizer)
                 clip_grad_norm_(model.parameters(), 5.0, 2.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                loss.backward(retain_graph=True)
+                # Only call backward() if it wasn't called in compute_loss_with_amp
+                if not params.use_fp16:
+                    loss.backward(retain_graph=True)
                 clip_grad_norm_(model.parameters(), 5.0, 2.0)
                 optimizer.step()
             

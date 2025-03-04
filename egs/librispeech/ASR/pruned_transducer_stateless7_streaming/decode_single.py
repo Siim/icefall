@@ -126,6 +126,15 @@ def load_checkpoint(
         "decoder_dim": checkpoint.get("decoder_dim", 512),
         "joiner_dim": checkpoint.get("joiner_dim", 512),
         "use_xlsr": True,  # Default to using XLSR
+        
+        # XLSR specific parameters
+        "xlsr_model_name": "facebook/wav2vec2-xls-r-300m",
+        "decode_chunk_size": 5120,  # 320ms at 16kHz
+        "frame_duration": 0.025,  # 25ms per frame
+        "frame_stride": 0.020,    # 20ms stride
+        "downsample_factor": 320, # For wav2vec2/XLSR models
+        "context_frames": 10,     # Default 10 additional context frames
+        "transition_frames": 5,   # Default 5 frames for smooth transition
     }
     params.update(default_args)
 
@@ -133,7 +142,7 @@ def load_checkpoint(
     from train import get_transducer_model
     model = get_transducer_model(params)
     
-    # Load state dict
+    # Load state dict with weights_only=True to address the warning
     model.load_state_dict(model_state_dict)
     model.to(device)
     model.eval()

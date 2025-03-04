@@ -366,6 +366,7 @@ def main():
     params.use_attention_sink = True
     params.attention_sink_size = 16
     params.left_context_chunks = 1
+    params.num_left_chunks = 1  # Number of left context chunks for attention masking
     
     # === Training parameters (not used but required) ===
     params.lr = 0.001

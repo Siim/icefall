@@ -654,25 +654,25 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
         return encoder
     else:
         # Original Zipformer code...
-    def to_int_tuple(s: str):
-        return tuple(map(int, s.split(",")))
+        def to_int_tuple(s: str):
+            return tuple(map(int, s.split(",")))
 
-    encoder = Zipformer(
-        num_features=params.feature_dim,
-        output_downsampling_factor=2,
+        encoder = Zipformer(
+            num_features=params.feature_dim,
+            output_downsampling_factor=2,
             zipformer_downsampling_factors=to_int_tuple(params.zipformer_downsampling_factors),
-        encoder_dims=to_int_tuple(params.encoder_dims),
-        attention_dim=to_int_tuple(params.attention_dims),
-        encoder_unmasked_dims=to_int_tuple(params.encoder_unmasked_dims),
-        nhead=to_int_tuple(params.nhead),
-        feedforward_dim=to_int_tuple(params.feedforward_dims),
-        cnn_module_kernels=to_int_tuple(params.cnn_module_kernels),
-        num_encoder_layers=to_int_tuple(params.num_encoder_layers),
-        num_left_chunks=params.num_left_chunks,
-        short_chunk_size=params.short_chunk_size,
-        decode_chunk_size=params.decode_chunk_len // 2,
-    )
-    return encoder
+            encoder_dims=to_int_tuple(params.encoder_dims),
+            attention_dim=to_int_tuple(params.attention_dims),
+            encoder_unmasked_dims=to_int_tuple(params.encoder_unmasked_dims),
+            nhead=to_int_tuple(params.nhead),
+            feedforward_dim=to_int_tuple(params.feedforward_dims),
+            cnn_module_kernels=to_int_tuple(params.cnn_module_kernels),
+            num_encoder_layers=to_int_tuple(params.num_encoder_layers),
+            num_left_chunks=params.num_left_chunks,
+            short_chunk_size=params.short_chunk_size,
+            decode_chunk_size=params.decode_chunk_len // 2,
+        )
+        return encoder
 
 
 def get_decoder_model(params: AttributeDict) -> nn.Module:

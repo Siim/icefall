@@ -238,4 +238,9 @@ class EstonianDataset(Dataset):
             "text": texts,
             "text_lens": text_lens,
             "supervisions": supervisions
-        } 
+        }
+
+# Add a standalone collate_fn function that calls the static method
+def collate_fn(batch):
+    """Standalone collate function that calls the static method in EstonianDataset"""
+    return EstonianDataset.collate_fn(batch) 

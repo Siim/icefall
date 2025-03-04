@@ -271,6 +271,27 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         help="Penalty applied to blank symbol during decoding to reduce repetitions",
     )
 
+    parser.add_argument(
+        "--progressive-stage",
+        type=int,
+        default=0,
+        help="Progressive training stage (0: initial, 1: progressive unfreezing, 2: full fine-tuning)",
+    )
+
+    parser.add_argument(
+        "--unfreeze-layers",
+        type=int,
+        default=2,
+        help="Number of XLSR layers to unfreeze per epoch during progressive training",
+    )
+
+    parser.add_argument(
+        "--progressive-lr",
+        type=float,
+        default=1e-4,
+        help="Learning rate for progressive training stage",
+    )
+
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -930,7 +951,7 @@ def process_streaming_chunks(
     
     Args:
         model: The model to use
-        feature: Input features (batch, time)
+        feature: Input features (batch, time, channels) or (batch, time)
         chunk_size: Size of each chunk in samples (e.g., 5120 for 320ms)
         attention_sink_size: Number of frames for attention sink (16 as per paper)
         left_context_chunks: Number of left context chunks (1 as per paper)
@@ -954,7 +975,12 @@ def process_streaming_chunks(
                 f"left_context_chunks={left_context_chunks}")
     
     device = feature.device
-    batch_size, seq_len = feature.shape
+    
+    # Handle both 2D and 3D input tensors
+    if len(feature.shape) == 3:
+        batch_size, seq_len, channels = feature.shape
+    else:
+        batch_size, seq_len = feature.shape
     
     # Use encoder directly if model is wrapped in DDP
     if isinstance(model, DDP):
@@ -1601,7 +1627,6 @@ def train_one_epoch(
     2. Progressive streaming phase: Gradually decrease chunk size
     3. Final streaming phase: Fixed optimal chunk size
     """
-    import time
     start_epoch_time = time.time()  # Initialize timing at start of epoch
     model.train()
     tot_loss = MetricsTracker()
@@ -2239,12 +2264,75 @@ def find_optimal_chunk_size(
     return optimal[1]["size"]
 
 
+def setup_progressive_training(
+    model: nn.Module,
+    stage: int,
+    layers_to_unfreeze: int = 2,
+) -> None:
+    """Set up progressive training by freezing/unfreezing layers.
+    
+    Args:
+        model: The XLSR-Transducer model
+        stage: Training stage (0: initial, 1: progressive, 2: full fine-tuning)
+        layers_to_unfreeze: Number of layers to unfreeze per epoch
+    """
+    if not hasattr(model, "encoder") or not hasattr(model.encoder, "model"):
+        logging.warning("Model does not have XLSR encoder, skipping progressive setup")
+        return
+
+    # Get XLSR encoder
+    xlsr = model.encoder.model
+    
+    # First freeze all XLSR parameters
+    for param in xlsr.parameters():
+        param.requires_grad = False
+    
+    if stage == 0:
+        # Initial stage: Only train new components (decoder, joiner)
+        logging.info("Progressive Stage 0: Training only decoder and joiner")
+        return
+        
+    elif stage == 1:
+        # Progressive stage: Unfreeze layers from top to bottom
+        total_layers = len(xlsr.encoder.layers)
+        layers_to_unfreeze = min(layers_to_unfreeze, total_layers)
+        
+        # Calculate which layers to unfreeze based on current epoch
+        start_idx = max(0, total_layers - layers_to_unfreeze)
+        
+        logging.info(f"Progressive Stage 1: Unfreezing layers {start_idx} to {total_layers-1}")
+        
+        # Unfreeze specified layers
+        for i in range(start_idx, total_layers):
+            for param in xlsr.encoder.layers[i].parameters():
+                param.requires_grad = True
+                
+    elif stage == 2:
+        # Full fine-tuning: Unfreeze all layers
+        logging.info("Progressive Stage 2: Full model fine-tuning")
+        for param in xlsr.parameters():
+            param.requires_grad = True
+    
+    # Log trainable parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logging.info(f"Total parameters: {total_params:,}")
+    logging.info(f"Trainable parameters: {trainable_params:,} ({trainable_params/total_params*100:.1f}%)")
+
+
 def main():
     parser = get_parser()
-    LibriSpeechAsrDataModule.add_arguments(parser)
     args = parser.parse_args()
     args.exp_dir = Path(args.exp_dir)
-
+    
+    params = get_params()
+    params.update(vars(args))
+    
+    # Add progressive training parameters
+    params.progressive_stage = args.progressive_stage
+    params.unfreeze_layers = args.unfreeze_layers
+    params.progressive_lr = args.progressive_lr
+    
     world_size = args.world_size
     assert world_size >= 1
     if world_size > 1:

@@ -341,54 +341,59 @@ def main():
         # Import the modified_beam_search function directly from beam_search.py
         from beam_search import modified_beam_search
         
-        # Set a maximum output length to prevent repetitive outputs
-        # Typically, output length should be proportional to input length
-        # For speech, a reasonable ratio is around 1:5 (one token per 5 frames)
-        max_output_length = min(200, encoder_out.size(1) // 5)
-        logging.info(f"Setting maximum output length to {max_output_length} tokens")
+        # Create a custom function to post-process the beam search results
+        def post_process_tokens(token_list):
+            """Remove repetitive tokens from the output."""
+            if not token_list:
+                return token_list
+                
+            # Maximum number of consecutive repetitions allowed
+            max_repetitions = 2
+            
+            # Process the token list to remove excessive repetitions
+            result = []
+            prev_token = None
+            repeat_count = 0
+            
+            for token in token_list:
+                if token == prev_token:
+                    repeat_count += 1
+                    if repeat_count <= max_repetitions:
+                        result.append(token)
+                else:
+                    repeat_count = 1
+                    result.append(token)
+                    prev_token = token
+            
+            return result
         
-        # Create a custom HypothesisList class to limit output length
-        from beam_search import Hypothesis, HypothesisList
+        # Run beam search
+        hyp_tokens = modified_beam_search(
+            model=model,
+            encoder_out=encoder_out,
+            encoder_out_lens=encoder_out_lens,
+            beam=args.beam_size,
+            temperature=args.temperature,
+            blank_penalty=args.blank_penalty
+        )
         
-        class LengthConstrainedHypothesisList(HypothesisList):
-            def add(self, hyp: Hypothesis) -> None:
-                # Only add hypothesis if it's not too long
-                if len(hyp.ys) <= max_output_length:
-                    super().add(hyp)
-        
-        # Monkey patch the HypothesisList class in beam_search module
-        import sys
-        import types
-        
-        # Store the original class
-        original_HypothesisList = sys.modules['beam_search'].HypothesisList
-        
-        # Replace with our constrained version
-        sys.modules['beam_search'].HypothesisList = LengthConstrainedHypothesisList
-        
-        try:
-            # Run beam search with the patched class
-            hyp_tokens = modified_beam_search(
-                model=model,
-                encoder_out=encoder_out,
-                encoder_out_lens=encoder_out_lens,
-                beam=args.beam_size,
-                temperature=args.temperature,
-                blank_penalty=args.blank_penalty
-            )
-        finally:
-            # Restore the original class
-            sys.modules['beam_search'].HypothesisList = original_HypothesisList
-        
-        # Convert tokens to text
-        hyps = []
+        # Post-process to remove repetitions
+        processed_hyp_tokens = []
         for h in hyp_tokens:
             # Check if h is a tensor or a list
             if isinstance(h, torch.Tensor):
                 h_list = h.tolist()
             else:
                 h_list = h
-            hyps.append(sp.decode(h_list))
+            
+            # Apply post-processing to remove repetitions
+            processed_tokens = post_process_tokens(h_list)
+            processed_hyp_tokens.append(processed_tokens)
+        
+        # Convert tokens to text
+        hyps = []
+        for h in processed_hyp_tokens:
+            hyps.append(sp.decode(h))
         
         # Print the transcription
         print(f"\nTranscription: {hyps[0]}")

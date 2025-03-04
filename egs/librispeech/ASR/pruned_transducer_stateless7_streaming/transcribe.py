@@ -186,6 +186,21 @@ def get_parser():
         help="Maximum audio duration in seconds"
     )
     
+    # Add beam search parameters
+    parser.add_argument(
+        "--blank-penalty", 
+        type=float, 
+        default=0.8, 
+        help="Penalty applied to blank token to discourage early termination"
+    )
+    
+    parser.add_argument(
+        "--temperature", 
+        type=float, 
+        default=1.0, 
+        help="Softmax temperature for controlling randomness in generation"
+    )
+    
     # Experimental options
     parser.add_argument(
         "--try-penalties", 
@@ -436,8 +451,8 @@ def transcribe_wav(wav_path: str,
         encoder_out=encoder_out,
         encoder_out_lens=encoder_out_lens,
         beam=params.beam_size,
-        blank_penalty=getattr(params, 'blank_penalty', 0.0),
-        temperature=getattr(params, 'temperature', 1.0),
+        blank_penalty=params.blank_penalty,
+        temperature=params.temperature,
         return_timestamps=False,
     )
     
@@ -548,8 +563,8 @@ def main():
     
     # Set beam search parameters
     params.beam_size = args.beam_size if hasattr(args, 'beam_size') else 4
-    params.blank_penalty = 0.5  # Increased from 0.0 to encourage more tokens
-    params.temperature = 1.0
+    params.blank_penalty = args.blank_penalty if hasattr(args, 'blank_penalty') else 0.8
+    params.temperature = args.temperature if hasattr(args, 'temperature') else 1.0
     
     # Set pretrained encoder configs
     params.pretrained_encoder = True

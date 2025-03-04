@@ -319,18 +319,31 @@ def main():
         "2560ms": 40960,  # 2.56s at 16kHz
     }
     
-    # Add XLSR specific parameters
+    # Add required parameters for model creation
+    
+    # Encoder parameters
     params.encoder_type = "XLSR"
     params.encoder_dim = 1024  # XLSR output dimension is 1024
+    params.encoder_dims = "1024,1024,1024,1024,1024,1024"  # Add the missing encoder_dims
     params.joiner_dim = 512
     params.use_encoder_proj = True  # Enable projection layer from XLSR output to joiner
     
-    # Add necessary parameters to avoid AttributeError
+    # Decoder parameters
+    params.decoder_dim = 512
+    params.num_decoder_layers = 2
+    
+    # Joiner parameters
+    params.nonlinear_output = "relu"
+    
+    # Add necessary zipformer parameters to avoid AttributeError
     # These are not used for XLSR but needed by the model creation function
     params.zipformer_downsampling_factors = "1,2,4,8"
     params.use_zipformer = False
     params.attention_dim = 512
     params.num_encoder_layers = 24  # Not used for XLSR but required
+    
+    # Vocabulary parameters
+    params.vocab_size = 2500  # BPE vocabulary size
     
     # XLSR specific streaming parameters
     params.is_streaming = params.streaming  # Convert boolean to attribute

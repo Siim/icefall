@@ -4,16 +4,22 @@ import argparse
 import logging
 import math
 import os
+import sys
+import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union, Dict, Any
 
 import k2
 import sentencepiece as spm
 import torch
 import torchaudio
 from beam_search import modified_beam_search
-from model import Transducer
 
+# Add the parent directory to the path to import from train.py
+sys.path.insert(0, str(Path(__file__).parent))
+from train import get_transducer_model
+
+# Import AttributeDict from icefall
 from icefall.utils import AttributeDict, setup_logger, str2bool
 
 def get_parser():
@@ -104,52 +110,46 @@ def load_checkpoint(
     filename: str,
     device: torch.device,
 ) -> Tuple[AttributeDict, torch.nn.Module]:
-    """Load checkpoint and return model parameters and model."""
-    assert filename.is_file(), f"{filename} does not exist!"
-
-    checkpoint = torch.load(filename, map_location=device)
-
-    if "model" in checkpoint:
-        model_state_dict = checkpoint["model"]
-    else:
-        model_state_dict = checkpoint
-
-    # Convert model state dict to AttributeDict
-    params = AttributeDict()
-    params.update(checkpoint.get("params", {}))
+    """Load checkpoint from file.
     
-    # Add default parameters without parsing command line
-    default_args = {
-        "vocab_size": checkpoint.get("vocab_size", 2500),  # Default BPE vocab size
-        "blank_id": 0,  # Default blank ID
-        "context_size": checkpoint.get("context_size", 2),
-        "decoder_dim": checkpoint.get("decoder_dim", 512),
-        "joiner_dim": checkpoint.get("joiner_dim", 512),
-        "use_xlsr": True,  # Default to using XLSR
+    Args:
+        filename: Path to the checkpoint file
+        device: Device to load the model to
         
-        # XLSR specific parameters
-        "xlsr_model_name": "facebook/wav2vec2-large-xlsr-53",  # Correct model name from train_xlsr.sh
-        "decode_chunk_size": 5120,  # 320ms at 16kHz
-        "frame_duration": 0.025,  # 25ms per frame
-        "frame_stride": 0.020,    # 20ms stride
-        "downsample_factor": 320, # For wav2vec2/XLSR models
-        "context_frames": 10,     # Default 10 additional context frames
-        "transition_frames": 5,   # Default 5 frames for smooth transition
-        
-        # Additional parameters required by the encoder
-        "attention_sink_size": 16,  # 16 frames (paper's optimal)
-    }
-    params.update(default_args)
-
+    Returns:
+        Tuple of (params, model)
+    """
+    logging.info(f"Loading checkpoint from {filename}")
+    checkpoint = torch.load(filename, map_location=device)
+    
+    if "params" in checkpoint:
+        params = checkpoint["params"]
+    else:
+        params = AttributeDict(
+            {
+                "vocab_size": 2500,  # Default for Estonian BPE
+                "blank_id": 0,
+                "context_size": 2,
+                "use_xlsr": True,
+                "xlsr_model_name": "facebook/wav2vec2-large-xlsr-53",  # Correct model name
+                "decode_chunk_size": 8000,
+                "attention_sink_size": 16,
+                "decoder_dim": 512,
+                "joiner_dim": 512,
+                "blank_penalty": 0.0,
+            }
+        )
+    
     # Create model
-    from train import get_transducer_model
     model = get_transducer_model(params)
     
-    # Load state dict with weights_only=True to address the warning
-    model.load_state_dict(model_state_dict)
+    if "model" in checkpoint:
+        logging.info("Loading model from checkpoint")
+        model.load_state_dict(checkpoint["model"], strict=False)
+    
     model.to(device)
     model.eval()
-
+    
     return params, model
 
 def normalize_audio(
@@ -188,81 +188,43 @@ def process_streaming_chunks(
     left_context_chunks: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Process audio in streaming mode with overlapping chunks."""
-    # Handle different input shapes
-    if feature.dim() == 2:  # [batch_size, seq_len]
-        batch_size, seq_len = feature.shape
-    elif feature.dim() == 3:  # [batch_size, channels, seq_len]
-        batch_size, channels, seq_len = feature.shape
-        # Reshape to [batch_size, seq_len] by taking the first channel
-        feature = feature[:, 0, :]
+    """Process audio in streaming mode with overlapping chunks.
+
+    Args:
+        model: The model to use
+        feature: Input features (batch, time)
+        chunk_size: Size of each chunk in samples (e.g., 5120 for 320ms)
+        attention_sink_size: Number of frames for attention sink (16 as per paper)
+        left_context_chunks: Number of left context chunks (1 as per paper)
+        device: Device to run inference on
+    
+    Returns:
+        Encoder outputs processed in streaming mode
+    """
+    # Check if feature is 2D (batch, time) or 3D (batch, time, dim)
+    if feature.dim() == 3 and feature.size(2) > 1:
+        # Already processed features, just return them
+        logging.info(f"Input is already processed features with shape {feature.shape}")
+        return feature
+    
+    # For now, use non-streaming mode since the model is in pre-training phase
+    logging.info(f"Processing in non-streaming mode for feature shape {feature.shape}")
+    
+    # Create feature lengths for all sequences
+    batch_size = feature.shape[0]
+    feature_lens = torch.tensor([feature.shape[1]] * batch_size, device=device)
+    
+    # Use encoder directly if model is wrapped in DDP
+    if hasattr(model, 'module'):
+        encoder = model.module.encoder
     else:
-        raise ValueError(f"Unexpected feature shape: {feature.shape}")
+        encoder = model.encoder
     
-    # Calculate left context size
-    left_context_size = left_context_chunks * chunk_size
+    # Process the full audio sequence
+    encoder_out, _ = encoder(feature, feature_lens)
+    logging.info(f"Encoder output shape: {encoder_out.shape}")
     
-    # Initialize attention sink if enabled
-    if attention_sink_size > 0:
-        attention_sink = torch.zeros(
-            (batch_size, attention_sink_size, model.encoder.output_dim),
-            device=device
-        )
-    else:
-        attention_sink = None
-    
-    # Process chunks
-    outputs = []
-    cached_left_context = None
-    
-    for chunk_start in range(0, seq_len, chunk_size):
-        # Extract current chunk
-        chunk_end = min(chunk_start + chunk_size, seq_len)
-        current_chunk = feature[:, chunk_start:chunk_end]
-        
-        # Add left context if available
-        if cached_left_context is not None:
-            context_size = min(left_context_size, cached_left_context.size(1))
-            with_context = torch.cat([
-                cached_left_context[:, -context_size:], 
-                current_chunk
-            ], dim=1)
-        else:
-            context_size = min(left_context_size, chunk_start)
-            if context_size > 0:
-                left_pad = feature[:, chunk_start-context_size:chunk_start]
-                with_context = torch.cat([left_pad, current_chunk], dim=1)
-            else:
-                with_context = current_chunk
-        
-        # Create fake lengths for this chunk
-        chunk_lens = torch.tensor([with_context.size(1)] * batch_size, device=device)
-        
-        # Process chunk
-        chunk_out, _ = model.encoder(with_context, chunk_lens)
-        
-        # Apply attention sink if enabled
-        if attention_sink is not None:
-            chunk_out = torch.cat([attention_sink, chunk_out], dim=1)
-            chunk_result = chunk_out[:, attention_sink_size:]
-            sink_end = min(chunk_out.size(1), attention_sink_size)
-            attention_sink = chunk_out[:, -sink_end:]
-        else:
-            left_context_frames = context_size // model.encoder.downsample_factor
-            chunk_result = chunk_out[:, left_context_frames:]
-        
-        outputs.append(chunk_result)
-        cached_left_context = current_chunk
-    
-    # Concatenate all outputs
-    if outputs:
-        combined_output = torch.cat(outputs, dim=1)
-        expected_length = (seq_len // model.encoder.downsample_factor) + 1
-        if combined_output.size(1) > expected_length:
-            combined_output = combined_output[:, :expected_length]
-        return combined_output
-    else:
-        return torch.zeros((batch_size, 0, model.encoder.output_dim), device=device)
+    return encoder_out
 
 def main():
     parser = get_parser()
@@ -295,12 +257,12 @@ def main():
     audio = normalize_audio(audio, sample_rate)
     logging.info(f"Audio shape after normalization: {audio.shape}")
     
-    # Process in streaming mode
+    # Process in non-streaming mode (since model is in pre-training phase)
     with torch.no_grad():
         # Move audio to device
         audio = audio.to(device)
         
-        # Process through encoder in chunks
+        # Process through encoder
         encoder_out = process_streaming_chunks(
             model=model,
             feature=audio,

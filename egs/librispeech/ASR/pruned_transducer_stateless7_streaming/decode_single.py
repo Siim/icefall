@@ -187,6 +187,9 @@ def normalize_audio(
     if audio.dim() == 1:
         audio = audio.unsqueeze(0)  # Add channel dimension
     
+    # Log initial shape
+    logging.info(f"Initial audio shape: {audio.shape}")
+    
     # Resample if needed
     if sample_rate != target_sample_rate:
         logging.info(f"Resampling audio from {sample_rate}Hz to {target_sample_rate}Hz")
@@ -213,14 +216,9 @@ def normalize_audio(
     if audio.std() < 1e-6:
         logging.warning(f"Audio has very low variance (possibly silent or DC): std={audio.std():.8f}")
     
-    # Ensure shape is (batch=1, time)
-    if audio.shape[0] == 1:
-        # Shape is already (1, time), make it (1, time, 1) for consistency with EstonianDataset
-        audio = audio.transpose(1, 2)  # Now (1, 1, time)
-        audio = audio.squeeze(2)       # Now (1, time)
-    else:
-        # Reshape to (1, time)
-        audio = audio.reshape(1, -1)
+    # Ensure shape is (batch=1, time) without using transpose
+    # At this point, audio should be (channels=1, time)
+    audio = audio.reshape(1, -1)  # Safely reshape to (1, time) regardless of input shape
     
     logging.info(f"Normalized audio shape: {audio.shape}, range: [{audio.min().item():.2f}, {audio.max().item():.2f}], std: {audio.std().item():.6f}")
     

@@ -1917,7 +1917,8 @@ def run(rank, world_size, args):
         # For Estonian dataset
         import sys
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from estonian_dataset import EstonianDataset, collate_fn
+        from estonian_dataset import EstonianDataset
+        from estonian_dataset import collate_fn
         
         # Create a SentencePiece processor from the model
         sp = spm.SentencePieceProcessor()

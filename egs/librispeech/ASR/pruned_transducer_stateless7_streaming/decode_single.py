@@ -301,24 +301,39 @@ def main():
         # Move audio to device
         audio = audio.to(device)
         
-        # Process through encoder in non-streaming mode
-        logging.info("Using non-streaming mode for decoding since model is in pre-training phase")
-        encoder_out = process_streaming_chunks(
-            model=model,
-            feature=audio,
-            chunk_size=args.chunk_size,
-            attention_sink_size=args.attention_sink_size,
-            left_context_chunks=args.left_context_chunks,
-            device=device
+        # Create feature lengths tensor for batch processing
+        feature_lens = torch.tensor([audio.size(1)], device=device)
+        
+        # Process directly through encoder in non-streaming mode (matching train.py validation)
+        logging.info("Using non-streaming mode for decoding (pre-training phase)")
+        
+        # Use encoder directly if model is wrapped in DDP
+        if hasattr(model, 'module'):
+            encoder = model.module.encoder
+        else:
+            encoder = model.encoder
+            
+        # Get encoder output directly (no chunking)
+        encoder_out, encoder_out_lens = encoder(
+            x=audio,
+            x_lens=feature_lens
         )
+        
         logging.info(f"Encoder output shape: {encoder_out.shape}")
         
-        # Create encoder output lengths
-        encoder_out_lens = torch.tensor(
-            [encoder_out.size(1)],
-            device=device,
-            dtype=torch.int64
-        )
+        # Check if model has encoder_proj attribute and apply if available
+        has_encoder_proj = False
+        if hasattr(model, 'module'):
+            has_encoder_proj = hasattr(model.module, 'encoder_proj')
+        else:
+            has_encoder_proj = hasattr(model, 'encoder_proj')
+        
+        # Apply projection if available
+        if has_encoder_proj:
+            if hasattr(model, 'module'):
+                encoder_out = model.module.encoder_proj(encoder_out)
+            else:
+                encoder_out = model.encoder_proj(encoder_out)
         
         # Decode with beam search
         logging.info(f"Decoding with beam size: {args.beam_size}")

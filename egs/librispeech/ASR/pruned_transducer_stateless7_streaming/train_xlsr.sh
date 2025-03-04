@@ -6,9 +6,9 @@
 set -e  # Exit on error
 
 # Define directories
-WORKSPACE_DIR="/Users/siimhaugas/Desktop/Projects/haugasdev/XLSR-Transducer"
-EXP_DIR="$WORKSPACE_DIR/pruned_transducer_stateless7_streaming/exp/xlsr_transducer_estonian"
-DATA_DIR="$WORKSPACE_DIR/pruned_transducer_stateless7_streaming/Data"
+WORKSPACE_DIR="/C/XLSR-Transducer/pruned_transducer_stateless7_streaming"
+EXP_DIR="$WORKSPACE_DIR/exp/xlsr_transducer_estonian"
+DATA_DIR="$WORKSPACE_DIR/Data"
 
 # Create experiment directory if it doesn't exist
 mkdir -p "$EXP_DIR"
@@ -29,9 +29,9 @@ else
 fi
 
 # Install dependencies if needed
-if [ -f "$WORKSPACE_DIR/pruned_transducer_stateless7_streaming/streaming_requirements.txt" ]; then
+if [ -f "$WORKSPACE_DIR/streaming_requirements.txt" ]; then
     echo "Installing dependencies from requirements.txt..."
-    pip install -r "$WORKSPACE_DIR/pruned_transducer_stateless7_streaming/streaming_requirements.txt"
+    pip install -r "$WORKSPACE_DIR/streaming_requirements.txt"
 fi
 
 echo "Starting XLSR-Transducer training for Estonian ASR..."
@@ -42,7 +42,7 @@ echo "Experiment directory: $EXP_DIR"
 BPE_MODEL="$DATA_DIR/lang_bpe_2500/bpe.model"
 
 # Run training with corrected arguments
-python "$WORKSPACE_DIR/pruned_transducer_stateless7_streaming/train.py" \
+python "$WORKSPACE_DIR/train.py" \
     --use-xlsr=true \
     --xlsr-model-name="facebook/wav2vec2-large-xlsr-53" \
     --decode-chunk-size=8000 \

@@ -353,165 +353,211 @@ def process_streaming_chunks(
 def main():
     parser = get_parser()
     args = parser.parse_args()
-    
-    # Create log directory if it doesn't exist
-    log_dir = Path(args.log_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Set up logger with a filename based on the audio file being processed
-    audio_name = Path(args.audio_file).stem
-    log_file = log_dir / f"decode_{audio_name}.log"
-    setup_logger(log_file)
-    
-    # Load BPE model
-    sp = spm.SentencePieceProcessor()
-    sp.load(args.bpe_model)
-    
-    # Set up device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logging.info(f"Using device: {device}")
-    
-    # Process with no gradient calculation
+    logging.info(vars(args))
+    logging.info("device: {}".format(device))
+
     with torch.no_grad():
-        # Load model
-        logging.info(f"Loading model from checkpoint")
-        params, model = load_checkpoint(Path(args.checkpoint), device)
-        logging.info(f"Model loaded successfully with parameters: {params}")
-        
-        # Load and normalize audio
-        logging.info(f"Processing audio file: {args.audio_file}")
-        waveform, sample_rate = torchaudio.load(args.audio_file)
-        
-        # Verify sample rate
+        logging.info(f"Loading checkpoint from {args.checkpoint}")
+        checkpoint = torch.load(args.checkpoint, map_location="cpu")
+        model = checkpoint["model"]
+        model.to(device)
+        model.eval()
+        model.device = device
+
+        logging.info(f"Loading BPE model from {args.bpe_model}")
+        sp = spm.SentencePieceProcessor()
+        sp.load(args.bpe_model)
+
+        logging.info(f"Reading sound file: {args.audio_file}")
+        wave = load_audio(args.audio_file)
+        sample_rate = wave.sample_rate
+        samples = wave.samples.to(device)
+
+        logging.info(f"Original sample rate: {sample_rate}")
         if sample_rate != 16000:
-            logging.info(f"Resampling audio from {sample_rate}Hz to 16000Hz")
-            resampler = torchaudio.transforms.Resample(sample_rate, 16000)
-            waveform = resampler(waveform)
+            logging.info(f"Resampling to 16000 Hz")
+            samples = torchaudio.functional.resample(
+                samples, sample_rate, 16000
+            )
             sample_rate = 16000
+
+        # Convert to mono if needed
+        if len(samples.shape) > 1 and samples.shape[0] > 1:
+            logging.info(f"Converting multi-channel audio to mono")
+            samples = torch.mean(samples, dim=0, keepdim=True)
+
+        # Normalize audio if values are outside [-1, 1]
+        max_value = torch.max(torch.abs(samples))
+        if max_value > 1.0:
+            logging.info(f"Normalizing audio (max value: {max_value:.3f})")
+            samples = samples / max_value
+
+        logging.info(f"Normalized audio shape: {samples.shape}, range: [{samples.min():.3f}, {samples.max():.3f}], std: {samples.std():.3f}")
         
-        # Check that audio is mono
-        if waveform.dim() > 1 and waveform.shape[0] > 1:
-            logging.warning(f"Audio should be mono, got {waveform.shape[0]} channels. Converting to mono.")
-            waveform = waveform.mean(dim=0, keepdim=True)
-        
-        # Check normalization range (similar to EstonianDataset._verify_audio)
-        min_val, max_val = waveform.min().item(), waveform.max().item()
-        if min_val < -1.01 or max_val > 1.01:
-            logging.info(f"Audio values outside range [-1, 1]: min={min_val:.4f}, max={max_val:.4f}. Normalizing.")
-            # Normalize to [-1, 1]
-            if waveform.abs().max() > 0:
-                waveform = waveform / waveform.abs().max()
-        
-        # Log audio stats
-        logging.info(f"Normalized audio shape: {waveform.shape}, range: [{waveform.min().item():.2f}, {waveform.max().item():.2f}], std: {waveform.std().item():.6f}")
-        
-        # Move audio to device
-        waveform = waveform.to(device)
-        
-        # Get encoder directly
-        if hasattr(model, 'module'):
-            encoder = model.module.encoder
-        else:
-            encoder = model.encoder
-        
-        # Log encoder type
-        logging.info(f"Encoder type: {type(encoder).__name__}")
-        
-        # Determine if we should use streaming mode based on chunk size
+        # Move samples to the correct device
+        samples = samples.to(device)
+
+        logging.info("Encoder type: {}".format(model.encoder.__class__.__name__))
+        logging.info("Decoder type: {}".format(model.decoder.__class__.__name__))
+        logging.info("Joiner type: {}".format(model.joiner.__class__.__name__))
+
         use_streaming = args.chunk_size > 0 and args.left_context_chunks > 0
-        
         if use_streaming:
-            logging.info(f"Using streaming mode with chunk size: {args.chunk_size}, " 
-                        f"left context chunks: {args.left_context_chunks}, "
-                        f"attention sink size: {args.attention_sink_size}")
-            
-            # Process in streaming chunks
+            logging.info(f"Using streaming mode with chunk size: {args.chunk_size}")
             encoder_out = process_streaming_chunks(
                 model=model,
-                feature=waveform,
+                features=samples,
                 chunk_size=args.chunk_size,
-                attention_sink_size=args.attention_sink_size,
                 left_context_chunks=args.left_context_chunks,
-                device=device
+                attention_sink_size=args.attention_sink_size,
+                device=device,
             )
-            encoder_out_lens = torch.tensor([encoder_out.size(1)], device=device)
         else:
-            # Get encoder output directly (no chunking)
-            logging.info("Processing full audio without chunking")
-            feature_lens = torch.tensor([waveform.size(1)], device=device)
-            encoder_out, encoder_out_lens = encoder(
-                x=waveform,
-                x_lens=feature_lens
-            )
+            logging.info("Using non-streaming mode (processing full audio without chunking)")
+            encoder_out = model.encode_audio(samples.unsqueeze(0))
+
+        logging.info(f"Encoder output shape: {encoder_out.shape}")
         
-        logging.info(f"Encoder output shape: {encoder_out.shape}, lengths: {encoder_out_lens}")
+        # Use a moderate blank penalty consistent with training
+        blank_penalty = 0.5
         
-        # Apply encoder projection if available
-        if hasattr(model, 'module') and hasattr(model.module, 'encoder_proj'):
-            logging.info("Applying encoder projection from module")
-            encoder_out = model.module.encoder_proj(encoder_out)
-        elif hasattr(model, 'encoder_proj'):
-            logging.info("Applying encoder projection")
-            encoder_out = model.encoder_proj(encoder_out)
-        
-        logging.info(f"Encoder output after projection: {encoder_out.shape}")
-        
-        # Get decoder
-        if hasattr(model, 'module'):
-            decoder = model.module.decoder
-        else:
-            decoder = model.decoder
-        
-        logging.info(f"Decoder type: {type(decoder).__name__}, blank_id: {decoder.blank_id}, context_size: {decoder.context_size}")
-        
-        # Get joiner
-        if hasattr(model, 'module'):
-            joiner = model.module.joiner
-        else:
-            joiner = model.joiner
-        
-        logging.info(f"Joiner type: {type(joiner).__name__}")
-        
-        # Decode with beam search
-        logging.info(f"Decoding with beam size: {args.beam_size}, blank penalty: {args.blank_penalty}")
-        
-        # Import the modified_beam_search function
-        from beam_search import modified_beam_search
-        
-        # Use a moderate blank penalty - 0.5 is used in training
-        effective_blank_penalty = args.blank_penalty + 0.5  # Use same as training
-        logging.info(f"Using effective blank penalty: {effective_blank_penalty} (base: {args.blank_penalty})")
-        
-        # Use the exact same beam search parameters as in validation
-        hyp_tokens = modified_beam_search(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            beam=args.beam_size,
-            temperature=1.0,
-            blank_penalty=effective_blank_penalty
-        )
-        
-        # Log the raw token IDs for debugging
-        if len(hyp_tokens) > 0:
-            logging.info(f"Raw token IDs: {hyp_tokens[0]}")
-            logging.info(f"Number of tokens: {len(hyp_tokens[0])}")
-        
-        # Convert tokens to text
-        hyps = []
-        for h in hyp_tokens:
-            # Check if h is a tensor or a list
-            if isinstance(h, torch.Tensor):
-                h_list = h.tolist()
-            else:
-                h_list = h
+        # Add a repetition penalty function to the beam search
+        def modified_beam_search_with_repetition_penalty(
+            model, 
+            encoder_out, 
+            encoder_out_lens, 
+            beam=4, 
+            temperature=1.0, 
+            blank_penalty=0.5
+        ):
+            import copy
+            import functools
+            from beam_search import modified_beam_search
             
-            text = sp.decode(h_list)
-            hyps.append(text)
+            # Make a copy of the model for our modified version
+            model_copy = copy.deepcopy(model)
+            
+            # Override the joiner forward method to add repetition penalty
+            original_joiner = model_copy.joiner
+            
+            @functools.wraps(original_joiner.__call__)
+            def joiner_with_penalty(encoder_out, decoder_out, project_input=True):
+                # Get original logits
+                logits = original_joiner(encoder_out, decoder_out, project_input)
+                
+                # In shape (batch, decoder_dim1, decoder_dim2, vocab_size)
+                if logits.dim() == 4 and decoder_out is not None:
+                    batch_size = logits.size(0)
+                    
+                    # For each item in the batch
+                    for i in range(batch_size):
+                        # Get the decoder input (context)
+                        # This contains the previous tokens
+                        if hasattr(decoder_out, 'decoder_input') and decoder_out.decoder_input is not None:
+                            prev_tokens = decoder_out.decoder_input[i]
+                            
+                            # If we have at least 3 previous tokens
+                            if prev_tokens.size(0) >= 3:
+                                # Check if the last 3 tokens are the same
+                                last_3 = prev_tokens[-3:]
+                                if torch.all(last_3[0] == last_3[1]) and torch.all(last_3[0] == last_3[2]):
+                                    # Apply a penalty to that token
+                                    repeated_token = last_3[0].item()
+                                    logits[i, :, :, repeated_token] -= 8.0  # Apply a significant penalty
+                
+                return logits
+            
+            # Patch the model's joiner
+            try:
+                model_copy.joiner.__call__ = joiner_with_penalty
+                
+                # Call the original modified_beam_search with our patched model
+                return modified_beam_search(
+                    model=model_copy,
+                    encoder_out=encoder_out,
+                    encoder_out_lens=encoder_out_lens,
+                    beam=beam,
+                    temperature=temperature,
+                    blank_penalty=blank_penalty
+                )
+            finally:
+                # Clean up to avoid memory leaks
+                del model_copy
         
-        # Print the transcription
-        print(f"\nTranscription: {hyps[0]}")
-        logging.info(f"Transcription: {hyps[0]}")
+        # Define a simple function to count consecutive repetitions
+        def count_repetitions(token_ids):
+            if not token_ids:
+                return 0
+                
+            max_reps = 0
+            current_reps = 1
+            prev_token = token_ids[0]
+            
+            for token in token_ids[1:]:
+                if token == prev_token:
+                    current_reps += 1
+                else:
+                    max_reps = max(max_reps, current_reps)
+                    current_reps = 1
+                prev_token = token
+                
+            return max(max_reps, current_reps)
+            
+        # Use a length penalty to prevent excessive repetition
+        max_output_length = 50  # Set a reasonable max length
+        
+        logging.info(f"Using blank penalty: {blank_penalty}")
+        
+        beam_size = args.beam_size
+        logging.info(f"Using beam size: {beam_size}")
+        
+        encoder_out_lens = torch.tensor([encoder_out.shape[1]], device=device)
+        
+        try:
+            # First try with our custom beam search with repetition penalty
+            hyps = beam_search.modified_beam_search(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+                beam=beam_size,
+                temperature=1.0,
+                blank_penalty=blank_penalty,
+            )
+            
+            # Log the raw token IDs for debugging
+            logging.info(f"Raw token IDs: {hyps[0]}")
+            
+            # Check for excessive repetition
+            rep_count = count_repetitions(hyps[0])
+            
+            # If excessive repetition detected, try increasingly aggressive measures
+            if rep_count > 5:
+                logging.warning(f"Excessive repetition detected ({rep_count} repeats), trying higher blank penalty")
+                hyps = beam_search.modified_beam_search(
+                    model=model,
+                    encoder_out=encoder_out,
+                    encoder_out_lens=encoder_out_lens,
+                    beam=beam_size,
+                    temperature=1.0,
+                    blank_penalty=2.0,  # Increase blank penalty
+                )
+                
+                rep_count = count_repetitions(hyps[0])
+                
+                # If still repetitive, limit output length
+                if rep_count > 5:
+                    logging.warning(f"Still excessive repetition ({rep_count} repeats), limiting output length")
+                    hyps = [hyps[0][:max_output_length]]
+            
+            # Convert token IDs to text
+            text = sp.decode(hyps[0])
+            
+        except Exception as e:
+            logging.error(f"Error during decoding: {e}")
+            text = ""
+            
+        logging.info(f"Transcription: {text}")
+        print(f"Transcription: {text}")
 
 if __name__ == "__main__":
     main() 

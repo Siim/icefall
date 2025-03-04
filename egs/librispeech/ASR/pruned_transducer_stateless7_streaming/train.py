@@ -1423,30 +1423,59 @@ def extract_validation_sample(
     """
     batch_size = batch["inputs"].size(0)
     
-    # First try to find a sample of sufficient length
-    candidates = []
-    for i in range(batch_size):
-        length = batch["supervisions"]["num_frames"][i].item()
-        if length >= min_frames:
-            candidates.append((i, length))
-    
-    # If we found candidates, pick the one with median length
-    if candidates:
-        candidates.sort(key=lambda x: x[1])  # Sort by length
-        idx = candidates[len(candidates) // 2][0]  # Pick the median length
-    else:
-        # If no candidates, pick the longest available
-        lengths = batch["supervisions"]["num_frames"].tolist()
-        idx = lengths.index(max(lengths))
-    
-    # Extract the sample
-    single_sample = {
-        "inputs": batch["inputs"][idx:idx+1],
-        "supervisions": {
-            "num_frames": batch["supervisions"]["num_frames"][idx:idx+1],
-            "text": [batch["supervisions"]["text"][idx]],
+    # Handle different batch structures
+    if isinstance(batch["supervisions"], list):
+        # Estonian dataset structure - supervisions is a list of dicts
+        # First try to find a sample of sufficient length
+        candidates = []
+        for i in range(batch_size):
+            length = batch["input_lens"][i].item()
+            if length >= min_frames:
+                candidates.append((i, length))
+        
+        # If we found candidates, pick the one with median length
+        if candidates:
+            candidates.sort(key=lambda x: x[1])  # Sort by length
+            idx = candidates[len(candidates) // 2][0]  # Pick the median length
+        else:
+            # If no candidates, pick the longest available
+            lengths = batch["input_lens"].tolist()
+            idx = lengths.index(max(lengths))
+        
+        # Extract the sample
+        single_sample = {
+            "inputs": batch["inputs"][idx:idx+1],
+            "input_lens": batch["input_lens"][idx:idx+1],
+            "supervisions": [batch["supervisions"][idx]],
+            "text": batch["text"][idx:idx+1] if "text" in batch else None,
+            "text_lens": batch["text_lens"][idx:idx+1] if "text_lens" in batch else None
         }
-    }
+    else:
+        # Original structure - supervisions is a dict
+        # First try to find a sample of sufficient length
+        candidates = []
+        for i in range(batch_size):
+            length = batch["supervisions"]["num_frames"][i].item()
+            if length >= min_frames:
+                candidates.append((i, length))
+        
+        # If we found candidates, pick the one with median length
+        if candidates:
+            candidates.sort(key=lambda x: x[1])  # Sort by length
+            idx = candidates[len(candidates) // 2][0]  # Pick the median length
+        else:
+            # If no candidates, pick the longest available
+            lengths = batch["supervisions"]["num_frames"].tolist()
+            idx = lengths.index(max(lengths))
+        
+        # Extract the sample
+        single_sample = {
+            "inputs": batch["inputs"][idx:idx+1],
+            "supervisions": {
+                "num_frames": batch["supervisions"]["num_frames"][idx:idx+1],
+                "text": [batch["supervisions"]["text"][idx]],
+            }
+        }
     
     return single_sample, idx
 
@@ -1496,60 +1525,55 @@ def compute_validation_loss(
         min_frames = model.encoder.downsample_factor * 2
         
         # Extract a validation sample with sufficient length
-        single_sample, sample_idx = extract_validation_sample(random_batch, min_frames)
-        
-        # Log selected sample info
-        batch_size = random_batch["inputs"].size(0)
-        sample_len = single_sample["supervisions"]["num_frames"][0].item()
-        
-        logging.info(f"Validating with sample from batch with size {batch_size}, " 
-                    f"using index {sample_idx} (length: {sample_len} frames, "
-                    f"text: '{single_sample['supervisions']['text'][0]}')")
-        
-        with torch.no_grad():
-            try:
-                # Get hypothesis and prediction
-                hyps, preds = decode_one_batch_hyps(params, model, sp, single_sample)
+        try:
+            single_sample, sample_idx = extract_validation_sample(random_batch, min_frames)
+            
+            # Log selected sample info
+            if isinstance(random_batch["supervisions"], list):
+                # Estonian dataset structure
+                logging.info(f"Validation sample: {sample_idx}, frames: {single_sample['input_lens'][0].item()}")
+                if "text" in single_sample and single_sample["text"] is not None:
+                    logging.info(f"Text: {single_sample['supervisions'][0]['text']}")
+            else:
+                # Original structure
+                logging.info(f"Validation sample: {sample_idx}, frames: {single_sample['supervisions']['num_frames'][0].item()}")
+                logging.info(f"Text: {single_sample['supervisions']['text'][0]}")
+            
+            # Compute loss on the single sample
+            with torch.cuda.amp.autocast(enabled=params.use_fp16):
+                loss, loss_info = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
+                    batch=single_sample,
+                    is_training=False,
+                    is_pre_training=is_pre_training,
+                )
+            
+            # Update metrics
+            tot_loss["loss"] = loss.detach().cpu().item()
+            for k, v in loss_info.items():
+                tot_loss[k] = v
+            
+            # Log to tensorboard if available
+            if tb_writer is not None:
+                tb_writer.add_scalar("validation/loss", tot_loss["loss"], params.batch_idx_train)
                 
-                # Make sure we have results before accessing them
-                if len(hyps) > 0 and len(preds) > 0:
-                    # Log sample comparison
-                    hyp_text = hyps[0]
-                    pred_text = preds[0]
-                    
-                    logging.info(f"Validation sample comparison:")
-                    logging.info(f"  Reference: {hyp_text}")
-                    logging.info(f"  Predicted: {pred_text}")
-                    
-                    # Calculate word error rate for this sample if both are non-empty
-                    if hyp_text and pred_text:
-                        error_count, word_count = calculate_errors(hyp_text, pred_text)
-                        wer = error_count / max(1, word_count)
-                        logging.info(f"  Word error rate: {wer:.2%} ({error_count}/{word_count})")
-                        
-                        # Update tracker with WER
-                        tot_loss["wer"] = wer
-                        
-                        # Add to tensorboard if available
-                        if tb_writer is not None:
-                            tb_writer.add_scalar('validation/wer', wer, params.batch_idx_train)
-                else:
-                    logging.warning("No results returned from decode_one_batch_hyps")
-            except Exception as e:
-                logging.error(f"Error during validation decoding: {str(e)}")
-                import traceback
-                logging.error(f"Exception details:\n{traceback.format_exc()}")
-                # Return empty placeholder
-                hyps, preds = [""], [""]
+            # Reduce metrics across distributed processes
+            if world_size > 1:
+                tot_loss = reduce_metrics(tot_loss, model.device)
+                
+        except Exception as e:
+            logging.warning(f"Error during validation: {str(e)}")
+            logging.warning("Exception details:")
+            logging.warning(traceback.format_exc())
+            
     except Exception as e:
-        logging.warning(f"Error during validation: {str(e)}")
-        import traceback
-        logging.warning(f"Exception details:\n{traceback.format_exc()}")
+        logging.warning(f"Error during validation batch selection: {str(e)}")
+        logging.warning("Exception details:")
+        logging.warning(traceback.format_exc())
     
-    # Memory cleanup
-    torch.cuda.empty_cache()
-    logging.info(f"Validation complete. Memory used: {torch.cuda.max_memory_allocated() // 1024 // 1024}MB")
-    
+    model.train()
     return tot_loss
 
 

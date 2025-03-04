@@ -174,6 +174,10 @@ def normalize_audio(
     if audio.abs().max() > 1.0:
         audio = audio / audio.abs().max()
 
+    # Ensure audio is in the format [channels, samples]
+    if audio.dim() == 1:
+        audio = audio.unsqueeze(0)  # Add channel dimension
+        
     return audio
 
 def process_streaming_chunks(
@@ -185,7 +189,15 @@ def process_streaming_chunks(
     device: torch.device,
 ) -> torch.Tensor:
     """Process audio in streaming mode with overlapping chunks."""
-    batch_size, seq_len = feature.shape
+    # Handle different input shapes
+    if feature.dim() == 2:  # [batch_size, seq_len]
+        batch_size, seq_len = feature.shape
+    elif feature.dim() == 3:  # [batch_size, channels, seq_len]
+        batch_size, channels, seq_len = feature.shape
+        # Reshape to [batch_size, seq_len] by taking the first channel
+        feature = feature[:, 0, :]
+    else:
+        raise ValueError(f"Unexpected feature shape: {feature.shape}")
     
     # Calculate left context size
     left_context_size = left_context_chunks * chunk_size
@@ -285,8 +297,8 @@ def main():
     
     # Process in streaming mode
     with torch.no_grad():
-        # Add batch dimension
-        audio = audio.unsqueeze(0).to(device)
+        # Move audio to device
+        audio = audio.to(device)
         
         # Process through encoder in chunks
         encoder_out = process_streaming_chunks(

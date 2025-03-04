@@ -1529,10 +1529,14 @@ def compute_validation_loss(
                 logging.info(f"Validation sample: {sample_idx}, frames: {single_sample['input_lens'][0].item()}")
                 if "text" in single_sample and single_sample["text"] is not None:
                     logging.info(f"Text: {single_sample['supervisions'][0]['text']}")
+                    reference_text = single_sample['supervisions'][0]['text']
+                else:
+                    reference_text = ""
             else:
                 # Original structure
                 logging.info(f"Validation sample: {sample_idx}, frames: {single_sample['supervisions']['num_frames'][0].item()}")
                 logging.info(f"Text: {single_sample['supervisions']['text'][0]}")
+                reference_text = single_sample['supervisions']['text'][0]
             
             # Compute loss on the single sample
             with torch.amp.autocast('cuda', enabled=params.use_fp16):
@@ -1550,6 +1554,41 @@ def compute_validation_loss(
             for k, v in loss_info.items():
                 tot_loss[k] = v
             
+            # Decode the sample to get WER/CER
+            with torch.no_grad():
+                try:
+                    # Get hypothesis and reference
+                    hyps, _ = decode_one_batch_hyps(params, model, sp, single_sample)
+                    
+                    if len(hyps) > 0:
+                        hypothesis_text = hyps[0]
+                        
+                        # Calculate WER
+                        errors, total_words = calculate_errors(reference_text, hypothesis_text)
+                        wer = errors / max(1, total_words)
+                        
+                        # Calculate CER (character level)
+                        char_errors, total_chars = editdistance.eval(list(reference_text), list(hypothesis_text)), len(reference_text)
+                        cer = char_errors / max(1, total_chars)
+                        
+                        # Log results
+                        logging.info(f"Reference: '{reference_text}'")
+                        logging.info(f"Hypothesis: '{hypothesis_text}'")
+                        logging.info(f"WER: {wer:.2%} ({errors}/{total_words})")
+                        logging.info(f"CER: {cer:.2%} ({char_errors}/{total_chars})")
+                        
+                        # Add to metrics
+                        tot_loss["wer"] = wer
+                        tot_loss["cer"] = cer
+                        
+                        # Log to tensorboard if available
+                        if tb_writer is not None:
+                            tb_writer.add_scalar("validation/wer", wer, params.batch_idx_train)
+                            tb_writer.add_scalar("validation/cer", cer, params.batch_idx_train)
+                except Exception as e:
+                    logging.warning(f"Error during decoding: {str(e)}")
+                    logging.warning(traceback.format_exc())
+            
             # Log to tensorboard if available
             if tb_writer is not None:
                 tb_writer.add_scalar("validation/loss", tot_loss["loss"], params.batch_idx_train)
@@ -1560,12 +1599,10 @@ def compute_validation_loss(
                 
         except Exception as e:
             logging.warning(f"Error during validation: {str(e)}")
-            logging.warning("Exception details:")
             logging.warning(traceback.format_exc())
             
     except Exception as e:
         logging.warning(f"Error during validation batch selection: {str(e)}")
-        logging.warning("Exception details:")
         logging.warning(traceback.format_exc())
     
     model.train()

@@ -364,6 +364,7 @@ def main():
     # Additional encoder parameters
     params.short_chunk_size = 50
     params.decode_chunk_size = 16
+    params.decode_chunk_len = 32
     params.subsampling_factor = 4
     params.vgg_frontend = False
     params.use_dynamic_chunk = True

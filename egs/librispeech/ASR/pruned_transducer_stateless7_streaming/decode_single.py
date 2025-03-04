@@ -201,19 +201,28 @@ def normalize_audio(
         logging.info(f"Converting {audio.size(0)} channels to mono")
         audio = torch.mean(audio, dim=0, keepdim=True)
     
-    # Normalize to [-1, 1]
-    if audio.abs().max() > 0:
-        audio = audio / audio.abs().max()
+    # Verify audio meets requirements (similar to EstonianDataset._verify_audio)
+    min_val, max_val = audio.min().item(), audio.max().item()
+    if min_val < -1.01 or max_val > 1.01:
+        logging.info(f"Audio values outside range [-1, 1]: min={min_val:.4f}, max={max_val:.4f}. Normalizing.")
+        # Normalize to [-1, 1]
+        if audio.abs().max() > 0:
+            audio = audio / audio.abs().max()
+    
+    # Check for silent or constant audio
+    if audio.std() < 1e-6:
+        logging.warning(f"Audio has very low variance (possibly silent or DC): std={audio.std():.8f}")
     
     # Ensure shape is (batch=1, time)
-    if audio.dim() == 2 and audio.size(0) == 1:
-        # Shape is already (1, time)
-        pass
+    if audio.shape[0] == 1:
+        # Shape is already (1, time), make it (1, time, 1) for consistency with EstonianDataset
+        audio = audio.transpose(1, 2)  # Now (1, 1, time)
+        audio = audio.squeeze(2)       # Now (1, time)
     else:
         # Reshape to (1, time)
         audio = audio.reshape(1, -1)
     
-    logging.info(f"Normalized audio shape: {audio.shape}, range: [{audio.min():.2f}, {audio.max():.2f}]")
+    logging.info(f"Normalized audio shape: {audio.shape}, range: [{audio.min().item():.2f}, {audio.max().item():.2f}], std: {audio.std().item():.6f}")
     
     return audio
 
@@ -225,19 +234,22 @@ def process_streaming_chunks(
     left_context_chunks: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Process audio in non-streaming mode since model is in pre-training phase.
+    """Process audio in streaming mode with chunks.
     
     Args:
         model: The model to use
         feature: Input features (batch, time)
-        chunk_size: Size of each chunk in samples (not used in non-streaming mode)
-        attention_sink_size: Number of frames for attention sink (not used in non-streaming mode)
-        left_context_chunks: Number of left context chunks (not used in non-streaming mode)
+        chunk_size: Size of each chunk in samples
+        attention_sink_size: Number of frames for attention sink
+        left_context_chunks: Number of left context chunks
         device: Device to run inference on
     
     Returns:
-        Encoder outputs processed in non-streaming mode
+        Encoder outputs processed in streaming mode
     """
+    # Ensure feature is on the correct device
+    feature = feature.to(device)
+    
     # Check if feature is 2D (batch, time) or 3D (batch, time, dim)
     if feature.dim() == 3 and feature.size(2) > 1:
         # Already processed features, just return them
@@ -254,14 +266,70 @@ def process_streaming_chunks(
     else:
         encoder = model.encoder
     
-    # Process in non-streaming mode (since model is in pre-training phase)
-    logging.info("Using non-streaming mode for decoding (pre-training phase)")
-    encoder_out, _ = encoder(
-        x=feature,
-        x_lens=feature_lens
-    )
+    # Calculate number of chunks
+    total_frames = feature.size(1)
+    num_chunks = (total_frames + chunk_size - 1) // chunk_size
+    logging.info(f"Processing audio in {num_chunks} chunks of size {chunk_size}")
     
-    logging.info(f"Encoder output shape: {encoder_out.shape}")
+    # Set up chunk-based processing
+    # Each chunk will have left_context_chunks * chunk_size frames of left context
+    left_context_size = left_context_chunks * chunk_size
+    
+    # Initialize array to store encoder outputs
+    encoder_out_chunks = []
+    
+    # Process each chunk
+    for i in range(num_chunks):
+        start_idx = max(0, i * chunk_size - left_context_size)
+        end_idx = min(total_frames, (i + 1) * chunk_size)
+        
+        # Extract chunk with left context
+        chunk = feature[:, start_idx:end_idx]
+        chunk_len = torch.tensor([chunk.size(1)], device=device)
+        
+        logging.info(f"Processing chunk {i+1}/{num_chunks}: frames {start_idx}:{end_idx}, shape {chunk.shape}")
+        
+        # Add attention sink if specified
+        if attention_sink_size > 0:
+            # Create attention sink (first few frames)
+            if i > 0 and start_idx > 0:
+                sink_start = 0
+                sink_end = min(attention_sink_size, total_frames)
+                attention_sink = feature[:, sink_start:sink_end]
+                
+                # Prepend attention sink to the chunk
+                chunk = torch.cat([attention_sink, chunk], dim=1)
+                chunk_len = torch.tensor([chunk.size(1)], device=device)
+                logging.info(f"Added attention sink of size {attention_sink.size(1)}")
+        
+        # Process through encoder
+        with torch.no_grad():
+            chunk_out, _ = encoder(x=chunk, x_lens=chunk_len)
+        
+        # If this is the first chunk, keep everything
+        # Otherwise, only keep the portion corresponding to the current chunk
+        if i == 0:
+            # Keep the full output for the first chunk
+            encoder_out_chunks.append(chunk_out)
+        else:
+            # For subsequent chunks, ignore the left context portion
+            left_ctx_frames = left_context_size // 4  # Assuming 4x downsampling in encoder
+            attn_sink_frames = attention_sink_size // 4 if attention_sink_size > 0 else 0
+            
+            # Calculate start index in encoder output
+            # This depends on the encoder's downsampling ratio
+            start_offset = left_ctx_frames + attn_sink_frames
+            
+            if start_offset < chunk_out.size(1):
+                encoder_out_chunks.append(chunk_out[:, start_offset:])
+            else:
+                logging.warning(f"Start offset {start_offset} exceeds chunk output size {chunk_out.size(1)}")
+                # Use the last frame as a fallback
+                encoder_out_chunks.append(chunk_out[:, -1:])
+    
+    # Concatenate all chunks
+    encoder_out = torch.cat(encoder_out_chunks, dim=1)
+    logging.info(f"Combined encoder output shape: {encoder_out.shape}")
     
     return encoder_out
 
@@ -296,14 +364,11 @@ def main():
     audio = normalize_audio(audio, sample_rate)
     logging.info(f"Audio shape after normalization: {audio.shape}, sample rate: {sample_rate}")
     
-    # Process in non-streaming mode (since model is in pre-training phase)
+    # Move audio to device
+    audio = audio.to(device)
+    
+    # Process with no gradient calculation
     with torch.no_grad():
-        # Move audio to device
-        audio = audio.to(device)
-        
-        # Create feature lengths tensor for batch processing
-        feature_lens = torch.tensor([audio.size(1)], device=device)
-        
         # Process directly through encoder in non-streaming mode
         logging.info("Using non-streaming mode for decoding")
         
@@ -316,11 +381,32 @@ def main():
         # Log encoder type
         logging.info(f"Encoder type: {type(encoder).__name__}")
         
-        # Get encoder output directly (no chunking)
-        encoder_out, encoder_out_lens = encoder(
-            x=audio,
-            x_lens=feature_lens
-        )
+        # Determine if we should use streaming mode based on chunk size
+        use_streaming = args.chunk_size > 0 and args.left_context_chunks > 0
+        
+        if use_streaming:
+            logging.info(f"Using streaming mode with chunk size: {args.chunk_size}, " 
+                        f"left context chunks: {args.left_context_chunks}, "
+                        f"attention sink size: {args.attention_sink_size}")
+            
+            # Process in streaming chunks
+            encoder_out = process_streaming_chunks(
+                model=model,
+                feature=audio,
+                chunk_size=args.chunk_size,
+                attention_sink_size=args.attention_sink_size,
+                left_context_chunks=args.left_context_chunks,
+                device=device
+            )
+            encoder_out_lens = torch.tensor([encoder_out.size(1)], device=device)
+        else:
+            # Get encoder output directly (no chunking)
+            logging.info("Processing full audio without chunking")
+            feature_lens = torch.tensor([audio.size(1)], device=device)
+            encoder_out, encoder_out_lens = encoder(
+                x=audio,
+                x_lens=feature_lens
+            )
         
         logging.info(f"Encoder output shape: {encoder_out.shape}, lengths: {encoder_out_lens}")
         
@@ -356,8 +442,8 @@ def main():
         # Import the modified_beam_search function
         from beam_search import modified_beam_search
         
-        # Use a higher blank penalty to discourage repetitions
-        effective_blank_penalty = args.blank_penalty + 1.0  # Increase the blank penalty significantly
+        # Use a much higher blank penalty to strongly discourage repetitions
+        effective_blank_penalty = args.blank_penalty + 3.0  # Use a very high penalty
         logging.info(f"Using effective blank penalty: {effective_blank_penalty} (base: {args.blank_penalty})")
         
         # Use the exact same beam search parameters as in validation, but with higher blank penalty

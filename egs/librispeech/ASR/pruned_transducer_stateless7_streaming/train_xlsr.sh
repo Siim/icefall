@@ -6,7 +6,7 @@
 set -e  # Exit on error
 
 # Define directories
-WORKSPACE_DIR="/Users/siimhaugas/Desktop/Projects/haugasdev/XLSR-Transducer/icefall/egs/librispeech/ASR/pruned_transducer_stateless7_streaming"
+WORKSPACE_DIR="/C/XLSR-Transducer"
 EXP_DIR="$WORKSPACE_DIR/exp/xlsr_transducer_estonian"
 DATA_DIR="$WORKSPACE_DIR/Data"
 
@@ -31,20 +31,17 @@ else
 fi
 
 # Install dependencies if needed
-if [ -f "requirements.txt" ]; then
+if [ -f "$WORKSPACE_DIR/requirements.txt" ]; then
     echo "Installing dependencies from requirements.txt..."
-    pip install -r requirements.txt
+    pip install -r "$WORKSPACE_DIR/requirements.txt"
 fi
-
-# Change to workspace directory
-cd "$WORKSPACE_DIR" || { echo "Failed to change to workspace directory"; exit 1; }
 
 echo "Starting XLSR-Transducer training for Estonian ASR..."
 echo "Data directory: $DATA_DIR"
 echo "Experiment directory: $EXP_DIR"
 
 # Run training
-python train.py \
+python "$WORKSPACE_DIR/train.py" \
     --use-xlsr=true \
     --xlsr-model-name="facebook/wav2vec2-large-xlsr-53" \
     --xlsr-chunk-size=8000 \

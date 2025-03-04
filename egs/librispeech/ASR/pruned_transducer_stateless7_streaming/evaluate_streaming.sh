@@ -6,7 +6,7 @@
 set -e  # Exit on error
 
 # Define directories
-WORKSPACE_DIR="/Users/siimhaugas/Desktop/Projects/haugasdev/XLSR-Transducer/icefall/egs/librispeech/ASR/pruned_transducer_stateless7_streaming"
+WORKSPACE_DIR="/C/XLSR-Transducer"
 EXP_DIR="$WORKSPACE_DIR/exp/xlsr_transducer_estonian"
 DATA_DIR="$WORKSPACE_DIR/Data"
 
@@ -23,9 +23,6 @@ if [ ! -f "$CHECKPOINT" ]; then
     CHECKPOINT="$CUSTOM_CHECKPOINT"
 fi
 
-# Change to workspace directory
-cd "$WORKSPACE_DIR" || { echo "Failed to change to workspace directory"; exit 1; }
-
 echo "Starting XLSR-Transducer evaluation in streaming mode..."
 echo "Data directory: $DATA_DIR"
 echo "Experiment directory: $EXP_DIR"
@@ -33,7 +30,7 @@ echo "Using checkpoint: $CHECKPOINT"
 
 # Evaluate with different chunk sizes
 echo "Evaluating with different chunk sizes..."
-python evaluate_streaming.py \
+python "$WORKSPACE_DIR/evaluate_streaming.py" \
     --checkpoint="$CHECKPOINT" \
     --test-list="$DATA_DIR/val_list.txt" \
     --sp-model="$DATA_DIR/lang_bpe_2500/bpe.model" \
@@ -48,7 +45,7 @@ python evaluate_streaming.py \
 echo "Evaluating with different attention sink sizes..."
 for sink_size in 4 8 16 32; do
     echo "Testing attention sink size: $sink_size"
-    python evaluate_streaming.py \
+    python "$WORKSPACE_DIR/evaluate_streaming.py" \
         --checkpoint="$CHECKPOINT" \
         --test-list="$DATA_DIR/val_list.txt" \
         --sp-model="$DATA_DIR/lang_bpe_2500/bpe.model" \
@@ -64,7 +61,7 @@ done
 echo "Evaluating with different left context sizes..."
 for context_size in 0 1 2 4; do
     echo "Testing left context size: $context_size chunks"
-    python evaluate_streaming.py \
+    python "$WORKSPACE_DIR/evaluate_streaming.py" \
         --checkpoint="$CHECKPOINT" \
         --test-list="$DATA_DIR/val_list.txt" \
         --sp-model="$DATA_DIR/lang_bpe_2500/bpe.model" \
@@ -78,7 +75,7 @@ done
 
 # Evaluate with attention sink disabled
 echo "Evaluating with attention sink disabled..."
-python evaluate_streaming.py \
+python "$WORKSPACE_DIR/evaluate_streaming.py" \
     --checkpoint="$CHECKPOINT" \
     --test-list="$DATA_DIR/val_list.txt" \
     --sp-model="$DATA_DIR/lang_bpe_2500/bpe.model" \

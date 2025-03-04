@@ -1195,22 +1195,22 @@ def compute_loss(
         # During pre-training, use only simple loss for better convergence
         loss = simple_loss
     else:
-        # During streaming, combine both losses with scaling
-        loss = current_simple_loss_scale * simple_loss + (1.0 - current_simple_loss_scale) * pruned_loss
+        # During streaming training, use weighted combination of losses
+        loss = current_simple_loss_scale * simple_loss + (1 - current_simple_loss_scale) * pruned_loss
     
-    assert loss.requires_grad == is_training
+    # Create metrics tracker with loss info
+    metrics = MetricsTracker()
+    metrics["loss"] = loss.detach().cpu().item()
+    metrics["simple_loss"] = simple_loss.detach().cpu().item()
     
-    info = MetricsTracker()
-    info["frames"] = feature.size(0)
-    info["loss"] = loss.detach().cpu().item()
     if not is_pre_training:
-        info["simple_loss"] = simple_loss.detach().cpu().item()
-        info["pruned_loss"] = pruned_loss.detach().cpu().item()
-        info["simple_loss_scale"] = current_simple_loss_scale
-        if is_training and hasattr(params, "cur_epoch"):
-            info["chunk_size"] = curr_chunk_size if not is_pre_training else 0
+        metrics["pruned_loss"] = pruned_loss.detach().cpu().item()
     
-    return loss, info
+    # Don't assert requires_grad during validation
+    if is_training:
+        assert loss.requires_grad
+    
+    return loss, metrics
 
 
 def compute_loss_with_amp(

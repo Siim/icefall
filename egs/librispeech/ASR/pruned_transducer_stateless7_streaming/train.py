@@ -1664,6 +1664,7 @@ def train_one_epoch(
             
             tot_loss = tot_loss + loss_info
             
+            # Log training progress
             if batch_idx % params.log_interval == 0:
                 current_lr = list(optimizer.param_groups)[0]['lr']
                 logging.info(
@@ -1673,52 +1674,15 @@ def train_one_epoch(
                     f'memory used: {torch.cuda.max_memory_allocated() // 1024 // 1024}MB'
                 )
                 
+                # Log to tensorboard if available
                 if tb_writer is not None:
+                    tb_writer.add_scalar('train/learning_rate', current_lr, params.batch_idx_train)
                     tb_writer.add_scalar('train/loss', loss, params.batch_idx_train)
-                    tb_writer.add_scalar('train/lr', current_lr, params.batch_idx_train)
-                    tb_writer.add_scalar('train/batch_size', curr_batch_size, params.batch_idx_train)
-            
-                    # Add streaming specific metrics
-                    if not is_pre_training:
-                        tb_writer.add_scalar(
-                            'train/chunk_size',
-                            loss_info["chunk_size"],
-                            params.batch_idx_train
-                        )
-                        
-                        # Compare streaming vs non-streaming every 10 log intervals
-                        if batch_idx % (params.log_interval * 10) == 0:
-                            device = next(model.parameters()).device
-                            with torch.no_grad():
-                                # Get non-streaming output for comparison
-                                non_streaming_out, _ = model.encoder(
-                                    x=batch["inputs"].to(device),
-                                    x_lens=batch["supervisions"]["num_frames"].to(device),
-                                    is_pre_training=True
-                                )
-                                
-                                # Get streaming output
-                                streaming_out = process_streaming_chunks(
-                                    model=model,
-                                    feature=batch["inputs"].to(device),
-                                    chunk_size=params.chunk_sizes["320ms"],
-                                    attention_sink_size=params.attention_sink_size,
-                                    left_context_chunks=params.left_context_chunks
-                                )
-                                
-                                # Compare outputs
-                                output_diff = (streaming_out - non_streaming_out).abs()
-                                tb_writer.add_scalar(
-                                    'train/streaming_max_diff',
-                                    output_diff.max().item(),
-                                    params.batch_idx_train
-                                )
-                                tb_writer.add_scalar(
-                                    'train/streaming_mean_diff',
-                                    output_diff.mean().item(),
-                                    params.batch_idx_train
-                                )
                     
+                # Save batch for debugging if needed
+                if params.save_every_n > 0 and batch_idx % params.save_every_n == 0:
+                    display_and_save_batch(batch, params, sp)
+            
             # Run validation less frequently to save memory - validate every 100 batches
             # or only at specific batch indices during early training
             should_validate = (
@@ -1773,7 +1737,22 @@ def train_one_epoch(
             else:
                 raise e
     
-    logging.info(f'Mean loss: {tot_loss["loss"] / tot_loss["frames"]:.4f}')
+    # Ensure frames is at least 1 to avoid division by zero
+    frames = max(1, tot_loss["frames"])
+    logging.info(f'Mean loss: {tot_loss["loss"] / frames:.4f}')
+    
+    # Run validation if needed
+    if valid_dl is not None and params.valid_interval > 0 and batch_idx % params.valid_interval == 0:
+        logging.info("Running quick validation (single random sample)")
+        valid_info = compute_validation_loss(
+            params=params,
+            model=model,
+            sp=sp,
+            valid_dl=valid_dl,
+            world_size=world_size,
+            tb_writer=tb_writer,
+        )
+        logging.info(f"Validation complete. Memory used: {torch.cuda.max_memory_allocated() // 1024 // 1024}MB")
     
     # After pre-training phase, evaluate with different chunk sizes
     if params.cur_epoch == params.pretrain_epochs:
@@ -1805,6 +1784,19 @@ def train_one_epoch(
         scaler=scaler,
         rank=rank,
     )
+
+    # Log epoch summary
+    if rank == 0:
+        logging.info(f'Epoch {params.cur_epoch} summary:')
+        logging.info(f'Batch count: {batch_idx}')
+        logging.info(f'Epoch time: {time.time() - start_epoch_time:.2f} seconds')
+        # Avoid division by zero
+        frames = max(1, tot_loss["frames"])  # Ensure frames is at least 1
+        logging.info(f'Mean loss: {tot_loss["loss"] / frames:.4f}')
+        
+        # Log to tensorboard if available
+        if tb_writer is not None:
+            tb_writer.add_scalar('train/epoch_loss', tot_loss["loss"] / frames, params.cur_epoch)
 
 
 def run(rank, world_size, args):
@@ -1963,7 +1955,7 @@ def run(rank, world_size, args):
             data_file=params.train_txt,
             sp_model=params.bpe_model,
             is_training=True,
-            max_duration=10,
+            max_duration=params.max_duration,
         )
         train_dl = torch.utils.data.DataLoader(
             train_dataset,
@@ -1977,7 +1969,7 @@ def run(rank, world_size, args):
             data_file=params.val_txt,
             sp_model=params.bpe_model,
             is_training=False,
-            max_duration=10,
+            max_duration=params.max_duration,
         )
         valid_dl = torch.utils.data.DataLoader(
             valid_dataset,

@@ -321,39 +321,71 @@ def main():
     
     # Add required parameters for model creation
     
-    # Encoder parameters
+    # === XLSR Encoder parameters ===
     params.encoder_type = "XLSR"
     params.encoder_dim = 1024  # XLSR output dimension is 1024
-    params.encoder_dims = "1024,1024,1024,1024,1024,1024"  # Add the missing encoder_dims
-    params.encoder_unmasked_dims = "1024,1024,1024,1024,1024,1024"  # Add encoder_unmasked_dims
+    params.encoder_dims = "1024,1024,1024,1024,1024,1024"
+    params.encoder_unmasked_dims = "1024,1024,1024,1024,1024,1024"
     params.joiner_dim = 512
     params.use_encoder_proj = True  # Enable projection layer from XLSR output to joiner
+    params.is_streaming = params.streaming  # Convert boolean to attribute
     
-    # Decoder parameters
+    # === Decoder parameters ===
     params.decoder_dim = 512
     params.num_decoder_layers = 2
     
-    # Joiner parameters
+    # === Joiner parameters ===
     params.nonlinear_output = "relu"
     
-    # Add necessary zipformer parameters to avoid AttributeError
-    # These are not used for XLSR but needed by the model creation function
-    params.zipformer_downsampling_factors = "1,2,4,8"
-    params.use_zipformer = False
-    params.attention_dim = 512
-    params.attention_dims = "512,512,512,512,512,512"
-    params.num_encoder_layers = 24  # Not used for XLSR but required
-    
-    # Vocabulary parameters
+    # === Vocabulary parameters ===
     params.vocab_size = 2500  # BPE vocabulary size
     
-    # XLSR specific streaming parameters
-    params.is_streaming = params.streaming  # Convert boolean to attribute
-    params.use_attention_sink = True
-    
-    # Set pretrained encoder configs
+    # === Set pretrained encoder configs ===
     params.pretrained_encoder = True
     params.xlsr_model_name = "facebook/wav2vec2-large-xlsr-53"
+    
+    # === All required parameters for Zipformer (even though we're not using it) ===
+    params.use_zipformer = False
+    params.zipformer_downsampling_factors = "1,2,4,8"
+    params.attention_dim = 512
+    params.attention_dims = "512,512,512,512,512,512"
+    params.num_encoder_layers = 24
+    params.nhead = "8,8,8,8,8,8"
+    params.feedforward_dim = "2048,2048,2048,2048,2048,2048"
+    params.feedforward_dims = "2048,2048,2048,2048,2048,2048"
+    params.cnn_module_kernels = "31,31,31,31,31,31"
+    params.transformer_dropout = 0.1
+    params.encoder_layer_dropout = 0.1
+    params.left_context_frames = 64
+    params.chunk_length = 32
+    params.right_context_frames = 8
+    params.memory_size = 32
+    params.causal = False
+    
+    # === Streaming parameters ===
+    params.use_attention_sink = True
+    params.attention_sink_size = 16
+    params.left_context_chunks = 1
+    
+    # === Training parameters (not used but required) ===
+    params.lr = 0.001
+    params.weight_decay = 1e-6
+    params.warm_step = 2000
+    params.best_train_loss = float("inf")
+    params.best_valid_loss = float("inf")
+    params.best_train_epoch = -1
+    params.best_valid_epoch = -1
+    params.batch_idx_train = 0
+    params.valid_average_period = 1
+    params.prune_range = 5
+    params.beam = 4
+    params.max_contexts = 4
+    params.max_states = 8
+    params.am_scale = 0.0
+    params.lm_scale = 0.0
+    params.blank_penalty = 0.0
+    params.eos_threshold = -3.4
+    params.simple_loss_scale = 0.5
     
     # Load sentencepiece model
     logging.info(f"Loading SentencePiece model from {params.bpe_model}")

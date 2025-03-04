@@ -170,13 +170,6 @@ def get_parser():
         help="Chunk size for streaming inference"
     )
     
-    parser.add_argument(
-        "--left-context-chunks", 
-        type=int, 
-        default=1, 
-        help="Number of left context chunks"
-    )
-    
     # Audio preprocessing parameters
     parser.add_argument(
         "--normalization", 

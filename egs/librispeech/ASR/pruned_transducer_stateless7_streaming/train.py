@@ -1099,11 +1099,18 @@ def compute_loss(
     """
     device = next(model.parameters()).device
     feature = batch["inputs"].to(device)
-    feature_lens = batch["supervisions"]["num_frames"].to(device)
     
-    # Get supervisions
-    supervisions = batch["supervisions"]
-    texts = supervisions["text"]
+    # Handle different batch structures
+    if isinstance(batch["supervisions"], list):
+        # Estonian dataset structure - supervisions is a list of dicts
+        feature_lens = batch["input_lens"].to(device)
+        texts = [supervision["text"] for supervision in batch["supervisions"]]
+    else:
+        # Original structure - supervisions is a dict
+        feature_lens = batch["supervisions"]["num_frames"].to(device)
+        texts = batch["supervisions"]["text"]
+    
+    # Encode texts to token IDs
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
     
@@ -1221,15 +1228,23 @@ def compute_loss_with_amp(
     is_pre_training: bool = True,
     chunk_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, MetricsTracker]:
-    """Compute loss with automatic mixed precision.
+    """Compute loss with automatic mixed precision (AMP).
     
     Args:
-        Same as compute_loss with additional scaler
-        
+        params: Model parameters
+        model: The model to train
+        sp: Sentence piece processor
+        batch: A batch of data
+        is_training: Whether this is a training batch
+        scaler: The GradScaler to use for mixed precision training
+        is_pre_training: Whether this is pre-training phase
+        chunk_size: Optional override for chunk size
+    
     Returns:
-        Same as compute_loss
+        (loss, MetricsTracker) containing loss and statistics
     """
-    with torch.cuda.amp.autocast(enabled=params.use_fp16):
+    # Use autocast for mixed precision training
+    with torch.amp.autocast('cuda', enabled=params.use_fp16):
         loss, info = compute_loss(
             params=params,
             model=model,
@@ -1237,12 +1252,14 @@ def compute_loss_with_amp(
             batch=batch,
             is_training=is_training,
             is_pre_training=is_pre_training,
-            chunk_size=chunk_size
+            chunk_size=chunk_size,
         )
     
-    # Scale loss for mixed precision training
-    if is_training and params.use_fp16 and scaler is not None:
-        return loss, info  # Return unscaled loss - scaler.scale will be applied in training loop
+    # Scale the loss for mixed precision training
+    if is_training and params.use_fp16:
+        scaler.scale(loss).backward()
+    elif is_training:
+        loss.backward()
     
     return loss, info
 
@@ -1253,53 +1270,37 @@ def decode_one_batch_hyps(
     sp: spm.SentencePieceProcessor,
     batch: dict,
 ) -> Tuple[List[str], List[str]]:
-    """Get hypotheses and predictions for one batch.
+    """Decode one batch and return the result in a list of strings.
     
     Args:
         params: Model parameters
         model: The model to use for decoding
-        sp: SentencePieceProcessor for converting ids to text
+        sp: The sentence piece processor
         batch: A batch of data
         
     Returns:
-        (hyps, preds): Lists of ground truth and predicted texts
+        (reference, hypothesis) where reference and hypothesis are lists of strings
     """
-    # Determine if we're in pre-training mode based on current epoch
-    is_pre_training = params.cur_epoch <= params.pretrain_epochs
-    
     device = next(model.parameters()).device
     feature = batch["inputs"].to(device)
-    supervisions = batch["supervisions"]
-    feature_lens = supervisions["num_frames"].to(device)
     
-    # Initialize hyp_tokens to an empty list to avoid NameError
-    hyp_tokens = []
+    # Handle different batch structures
+    if isinstance(batch["supervisions"], list):
+        # Estonian dataset structure - supervisions is a list of dicts
+        feature_lens = batch["input_lens"].to(device)
+        texts = [supervision["text"] for supervision in batch["supervisions"]]
+    else:
+        # Original structure - supervisions is a dict
+        feature_lens = batch["supervisions"]["num_frames"].to(device)
+        texts = batch["supervisions"]["text"]
     
-    # Verify that we have valid feature lengths
-    if torch.any(feature_lens <= 0):
-        logging.warning("Encountered zero or negative feature length. Skipping decoding.")
-        return supervisions["text"], [""] * len(supervisions["text"])
+    # Determine if we're in pre-training or streaming mode
+    is_pre_training = params.cur_epoch <= params.pretrain_epochs
     
-    # Skip very short samples that might cause issues
-    min_audio_len = model.encoder.downsample_factor * 2  # At least 2 frames after downsampling
-    if torch.any(feature_lens < min_audio_len):
-        logging.warning(f"Sample too short (length {feature_lens.item()} < minimum {min_audio_len})")
-        return supervisions["text"], [""] * len(supervisions["text"])
-    
-    # Normalize feature inputs
-    if torch.isnan(feature).any() or torch.isinf(feature).any():
-        logging.warning("NaN or Inf values detected in feature. Normalizing.")
-        feature = torch.nan_to_num(feature, nan=0.0, posinf=1.0, neginf=-1.0)
-    
-    encoder_out = None
-    encoder_out_lens = None
-    
-    # Get encoder output
     try:
         with torch.no_grad():
-            # Different handling for pre-training vs streaming mode
+            # In pre-training phase, use full sequence processing without chunking
             if is_pre_training:
-                # In pre-training phase, use full sequence processing without chunking
                 logging.info("Using full sequence processing for decoding (pre-training mode)")
                 encoder_out, encoder_out_lens = model.encoder(
                     x=feature,
@@ -2067,25 +2068,24 @@ def display_and_save_batch(
     logging.info(f"Saving batch to {filename}")
     torch.save(batch, filename)
 
-    supervisions = batch["supervisions"]
     features = batch["inputs"]
-
     logging.info(f"features shape: {features.shape}")
 
     # Handle different dataset structures
-    if isinstance(supervisions, list):
-        # Original Lhotse dataset structure
-        num_utterances = len(supervisions)
-        logging.info(f"Number of utterances: {num_utterances}")
-        y = sp.encode(supervisions["text"], out_type=int)
-        num_tokens = sum(len(i) for i in y)
-        logging.info(f"num tokens: {num_tokens}")
-    else:
+    if isinstance(batch["supervisions"], list):
         # Estonian dataset structure
-        texts = supervisions["text"]
+        texts = [supervision["text"] for supervision in batch["supervisions"]]
         num_utterances = len(texts)
         logging.info(f"Number of utterances: {num_utterances}")
         y = sp.encode(texts, out_type=int)
+        num_tokens = sum(len(i) for i in y)
+        logging.info(f"num tokens: {num_tokens}")
+    else:
+        # Original Lhotse dataset structure
+        supervisions = batch["supervisions"]
+        num_utterances = len(supervisions["text"])
+        logging.info(f"Number of utterances: {num_utterances}")
+        y = sp.encode(supervisions["text"], out_type=int)
         num_tokens = sum(len(i) for i in y)
         logging.info(f"num tokens: {num_tokens}")
 
@@ -2102,11 +2102,17 @@ def scan_pessimistic_batches_for_oom(
     logging.info(
         "Sanity check -- see if any of the batches in epoch 1 would cause OOM."
     )
+    
+    # For Estonian dataset, we don't have a sampler with find_pessimistic_batches
+    if params.dataset == "estonian":
+        logging.info("Skipping pessimistic batch check for Estonian dataset")
+        return
+        
     batches, crit_values = find_pessimistic_batches(train_dl.sampler)
     for criterion, cuts in batches.items():
         batch = train_dl.dataset[cuts]
         try:
-            with torch.cuda.amp.autocast(enabled=params.use_fp16):
+            with torch.amp.autocast('cuda', enabled=params.use_fp16):
                     loss, _ = compute_loss(
                         params=params,
                         model=model,
@@ -2120,17 +2126,18 @@ def scan_pessimistic_batches_for_oom(
         except Exception as e:
             if "CUDA out of memory" in str(e):
                 logging.error(
-                    "Your GPU ran out of memory with the current "
-                    "max_duration setting. We recommend decreasing "
-                    "max_duration and trying again.\n"
-                    f"Failing criterion: {criterion} "
-                    f"(={crit_values[criterion]}) ..."
+                    f"Your GPU ran out of memory with the current setting. "
+                    f"Criterion: {criterion}, "
+                    f"Cuts: {cuts}. "
+                    f"Error message: {e}"
                 )
-            display_and_save_batch(batch, params=params, sp=sp)
+                raise
+            logging.error(
+                f"Caught exception: {e}\n"
+                f"Criterion: {criterion}, "
+                f"Cuts: {cuts}"
+            )
             raise
-        logging.info(
-            f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
-        )
 
 
 def reduce_metrics(metrics: Dict[str, float], device: torch.device) -> Dict[str, float]:

@@ -410,12 +410,17 @@ def transcribe_wav(wav_path: str,
         logging.info(f"Using non-streaming mode")
         # Process with full context
         logging.info("Passing features to encoder...")
-        start_encode = time.time()
+        encoder_start = time.time()
+        
+        # Set model to evaluation mode
+        model.eval()
+        
+        # Forward pass through the encoder
         encoder_out, encoder_out_lens = model.encoder(
             x=feature,
             x_lens=feature_lens
         )
-        encode_time = time.time() - start_encode
+        encode_time = time.time() - encoder_start
         logging.info(f"Encoder processing took {encode_time:.3f} seconds")
         logging.info(f"Encoder output shape: {encoder_out.shape}, output_lens: {encoder_out_lens}")
     
@@ -434,9 +439,10 @@ def transcribe_wav(wav_path: str,
     # Decode using beam search
     logging.info(f"Starting beam search with beam size {params.beam_size}, blank penalty {params.blank_penalty}, temperature {params.temperature}")
     
-    # Set a higher blank penalty to discourage stopping early
-    params.blank_penalty = 2.0  # Try an even higher value
-    params.temperature = 1.0  # Default temperature
+    # Set a higher blank penalty to discourage early termination if needed
+    if params.blank_penalty < 1.0:
+        logging.info(f"Increasing blank_penalty from {params.blank_penalty} to 2.0 to encourage more tokens")
+        params.blank_penalty = 2.0
     
     # Log the parameters being used
     logging.info(f"Starting beam search with beam size {params.beam_size}, blank penalty {params.blank_penalty}, temperature {params.temperature}")
@@ -444,15 +450,17 @@ def transcribe_wav(wav_path: str,
     # Time the beam search
     start_time = time.time()
     
-    # Call beam search with all the parameters
-    hyps = beam_search(
-        model=model,
-        encoder_out=encoder_out,
-        beam=params.beam_size,
-        temperature=params.temperature,
-        blank_penalty=params.blank_penalty,
-        return_timestamps=False,
-    )
+    # Disable gradient tracking during inference
+    with torch.no_grad():
+        # Call beam search with all the parameters
+        hyps = beam_search(
+            model=model,
+            encoder_out=encoder_out,
+            beam=params.beam_size,
+            temperature=params.temperature,
+            blank_penalty=params.blank_penalty,
+            return_timestamps=False,
+        )
     
     end_time = time.time()
     logging.info(f"Beam search took {end_time - start_time:.3f} seconds")

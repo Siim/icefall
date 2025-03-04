@@ -1121,6 +1121,9 @@ def run(rank, world_size, args):
     if params.inf_check:
         register_inf_check_hooks(model)
 
+    # Define a flag to track which dataset we're using
+    using_estonian_dataset = False
+
     # Check if we're using Estonian dataset
     if args.train_data is not None and args.val_data is not None and args.sp_model is not None:
         logging.info(f"Using Estonian dataset with train data: {args.train_data}")
@@ -1172,6 +1175,9 @@ def run(rank, world_size, args):
         # Update vocabulary size in params
         params.vocab_size = sp.get_piece_size()
         
+        # Set the flag to true
+        using_estonian_dataset = True
+        
     else:
         # Original LibriSpeech data loading
         librispeech = LibriSpeechAsrDataModule(args)
@@ -1181,62 +1187,64 @@ def run(rank, world_size, args):
         else:
             train_cuts = librispeech.train_clean_100_cuts()
 
-    def remove_short_and_long_utt(c: Cut):
-        # Keep only utterances with duration between 1 second and 20 seconds
-        #
-        # Caution: There is a reason to select 20.0 here. Please see
-        # ../local/display_manifest_statistics.py
-        #
-        # You should use ../local/display_manifest_statistics.py to get
-        # an utterance duration distribution for your dataset to select
-        # the threshold
-        if c.duration < 1.0 or c.duration > 20.0:
-            logging.warning(
-                f"Exclude cut with ID {c.id} from training. Duration: {c.duration}"
+        def remove_short_and_long_utt(c: Cut):
+            # Keep only utterances with duration between 1 second and 20 seconds
+            #
+            # Caution: There is a reason to select 20.0 here. Please see
+            # ../local/display_manifest_statistics.py
+            #
+            # You should use ../local/display_manifest_statistics.py to get
+            # an utterance duration distribution for your dataset to select
+            # the threshold
+            if c.duration < 1.0 or c.duration > 20.0:
+                logging.warning(
+                    f"Exclude cut with ID {c.id} from training. Duration: {c.duration}"
+                )
+                return False
+
+            # In pruned RNN-T, we require that T >= S
+            # where T is the number of feature frames after subsampling
+            # and S is the number of tokens in the utterance
+
+            # In ./zipformer.py, the conv module uses the following expression
+            # for subsampling
+            T = ((c.num_frames - 7) // 2 + 1) // 2
+            tokens = sp.encode(c.supervisions[0].text, out_type=str)
+
+            if T < len(tokens):
+                logging.warning(
+                    f"Exclude cut with ID {c.id} from training. "
+                    f"Number of frames (before subsampling): {c.num_frames}. "
+                    f"Number of frames (after subsampling): {T}. "
+                    f"Text: {c.supervisions[0].text}. "
+                    f"Tokens: {tokens}. "
+                    f"Number of tokens: {len(tokens)}"
+                )
+                return False
+
+            return True
+
+        # train_cuts = train_cuts.filter(remove_short_and_long_utt)
+
+        if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
+            # We only load the sampler's state dict when it loads a checkpoint
+            # saved in the middle of an epoch
+            sampler_state_dict = checkpoints["sampler"]
+        else:
+            sampler_state_dict = None
+
+        # Only create LibriSpeech dataloaders if we're not using Estonian dataset
+        if not using_estonian_dataset:
+            train_dl = librispeech.train_dataloaders(
+                train_cuts, sampler_state_dict=sampler_state_dict
             )
-            return False
 
-        # In pruned RNN-T, we require that T >= S
-        # where T is the number of feature frames after subsampling
-        # and S is the number of tokens in the utterance
-
-        # In ./zipformer.py, the conv module uses the following expression
-        # for subsampling
-        T = ((c.num_frames - 7) // 2 + 1) // 2
-        tokens = sp.encode(c.supervisions[0].text, out_type=str)
-
-        if T < len(tokens):
-            logging.warning(
-                f"Exclude cut with ID {c.id} from training. "
-                f"Number of frames (before subsampling): {c.num_frames}. "
-                f"Number of frames (after subsampling): {T}. "
-                f"Text: {c.supervisions[0].text}. "
-                f"Tokens: {tokens}. "
-                f"Number of tokens: {len(tokens)}"
-            )
-            return False
-
-        return True
-
-    # train_cuts = train_cuts.filter(remove_short_and_long_utt)
-
-    if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
-        # We only load the sampler's state dict when it loads a checkpoint
-        # saved in the middle of an epoch
-        sampler_state_dict = checkpoints["sampler"]
-    else:
-        sampler_state_dict = None
-
-    train_dl = librispeech.train_dataloaders(
-        train_cuts, sampler_state_dict=sampler_state_dict
-    )
-
-    if params.mini_libri:
-        valid_cuts = librispeech.dev_clean_2_cuts()
-    else:
-        valid_cuts = librispeech.dev_clean_cuts()
-        valid_cuts += librispeech.dev_other_cuts()
-    valid_dl = librispeech.valid_dataloaders(valid_cuts)
+            if params.mini_libri:
+                valid_cuts = librispeech.dev_clean_2_cuts()
+            else:
+                valid_cuts = librispeech.dev_clean_cuts()
+                valid_cuts += librispeech.dev_other_cuts()
+            valid_dl = librispeech.valid_dataloaders(valid_cuts)
 
     # if not params.print_diagnostics:
     #     scan_pessimistic_batches_for_oom(

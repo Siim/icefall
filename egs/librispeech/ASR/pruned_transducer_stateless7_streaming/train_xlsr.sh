@@ -38,6 +38,9 @@ echo "Starting XLSR-Transducer training for Estonian ASR..."
 echo "Data directory: $DATA_DIR"
 echo "Experiment directory: $EXP_DIR"
 
+# Define BPE model path
+BPE_MODEL="$DATA_DIR/lang_bpe_2500/bpe.model"
+
 # Run training with corrected arguments
 python "$WORKSPACE_DIR/train.py" \
     --use-xlsr=true \
@@ -51,7 +54,8 @@ python "$WORKSPACE_DIR/train.py" \
     --base-lr=3e-5 \
     --train-data="$DATA_DIR/train_list.txt" \
     --val-data="$DATA_DIR/val_list.txt" \
-    --sp-model="$DATA_DIR/lang_bpe_2500/bpe.model" \
+    --bpe-model="$BPE_MODEL" \
+    --sp-model="$BPE_MODEL" \
     --exp-dir="$EXP_DIR" \
     --tensorboard=true \
     --save-every-n=1000 \

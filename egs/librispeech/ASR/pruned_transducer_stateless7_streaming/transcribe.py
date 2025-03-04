@@ -411,42 +411,21 @@ def transcribe_wav(wav_path: str,
         )
     else:
         # Non-streaming mode
-        logging.info("Using non-streaming mode")
-        # Pass features to the encoder
-        logging.info("Passing features to encoder...")
-        encoder_start = time.time()
-        
-        # Set model to evaluation mode
-        model.eval()
-        
-        # Forward pass through the encoder
-        encoder_out, encoder_out_lens = model.encoder(
-            x=feature,
-            x_lens=feature_lens
-        )
-        encode_time = time.time() - encoder_start
-        logging.info(f"Encoder processing took {encode_time:.3f} seconds")
-        logging.info(f"Encoder output shape: {encoder_out.shape}, output_lens: {encoder_out_lens}")
+        logging.info("Using non-streaming mode (full context)")
+        encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
     
-    # Project encoder output if the model has a projection layer
-    if hasattr(model, 'encoder_proj'):
-        logging.info("Applying encoder projection...")
-        encoder_out = model.encoder_proj(encoder_out)
-        logging.info(f"After projection shape: {encoder_out.shape}")
+    # Log encoder output stats for debugging
+    logging.info(f"Encoder output stats - min: {encoder_out.min().item():.3f}, max: {encoder_out.max().item():.3f}, mean: {encoder_out.mean().item():.3f}, std: {encoder_out.std().item():.3f}")
     
-    # Log tensor stats to help diagnose issues
-    logging.info(f"Encoder output stats - min: {encoder_out.min().item():.3f}, "
-                f"max: {encoder_out.max().item():.3f}, "
-                f"mean: {encoder_out.mean().item():.3f}, "
-                f"std: {encoder_out.std().item():.3f}")
-    
-    # Decode using beam search
-    logging.info(f"Starting beam search with beam size {params.beam_size}, blank penalty {params.blank_penalty}, temperature {params.temperature}")
-    
-    # Set a moderate blank penalty to discourage early termination if needed
-    if params.blank_penalty < 0.5:
-        logging.info(f"Increasing blank_penalty from {params.blank_penalty} to 1.0 to encourage more tokens")
-        params.blank_penalty = 1.0
+    # Force higher blank_penalty in streaming mode to encourage non-blank tokens
+    if hasattr(params, 'streaming') and params.streaming:
+        # Use a higher blank penalty for streaming mode
+        params.blank_penalty = 1.5
+        # Use the modified_beam_search function directly, which tends to work better for streaming
+        search_method = modified_beam_search
+        logging.info(f"Using modified_beam_search with increased blank_penalty={params.blank_penalty}")
+    else:
+        search_method = beam_search
     
     # Log the parameters being used
     logging.info(f"Starting beam search with beam size {params.beam_size}, blank penalty {params.blank_penalty}, temperature {params.temperature}")
@@ -456,27 +435,37 @@ def transcribe_wav(wav_path: str,
     
     # Disable gradient tracking during inference
     with torch.no_grad():
-        # If we're getting stuck in beam search, try modified_beam_search instead
         try:
-            # Call beam_search with a timeout to avoid getting stuck
-            hyps = beam_search(
-                model=model,
-                encoder_out=encoder_out,
-                beam=params.beam_size,
-                temperature=params.temperature,
-                blank_penalty=params.blank_penalty,
-                return_timestamps=False,
-            )
+            # Use the selected search method
+            if search_method == modified_beam_search:
+                hyps = modified_beam_search(
+                    model=model,
+                    encoder_out=encoder_out,
+                    encoder_out_lens=encoder_out_lens,
+                    beam=params.beam_size,
+                    temperature=params.temperature,
+                    blank_penalty=params.blank_penalty,
+                )
+            else:
+                hyps = beam_search(
+                    model=model,
+                    encoder_out=encoder_out,
+                    beam=params.beam_size,
+                    temperature=params.temperature,
+                    blank_penalty=params.blank_penalty,
+                    return_timestamps=False,
+                )
         except Exception as e:
-            logging.warning(f"beam_search failed with error: {e}")
-            logging.info("Falling back to modified_beam_search")
+            logging.warning(f"Search method failed with error: {e}")
+            logging.info("Falling back to modified_beam_search with higher blank penalty")
+            # Last resort fallback with even higher blank penalty
             hyps = modified_beam_search(
                 model=model,
                 encoder_out=encoder_out,
                 encoder_out_lens=encoder_out_lens,
                 beam=params.beam_size,
                 temperature=params.temperature,
-                blank_penalty=params.blank_penalty,
+                blank_penalty=2.0,  # Use even higher blank penalty as fallback
             )
     
     end_time = time.time()

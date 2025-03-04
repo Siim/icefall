@@ -209,8 +209,9 @@ def load_audio(file_path: str, target_sr: int = 16000) -> torch.Tensor:
     logging.info(f"Loading audio from {file_path}")
     
     # Handle different possible path formats (especially for Windows paths)
-    if file_path.startswith('/C/'):
-        file_path = 'C:' + file_path[2:]
+    # Commenting out this conversion since /C/ is a directory in root, not a Windows drive
+    # if file_path.startswith('/C/'):
+    #     file_path = 'C:' + file_path[2:]
     
     # Check if file exists
     if not os.path.isfile(file_path):

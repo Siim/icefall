@@ -171,13 +171,6 @@ def get_parser():
     )
     
     parser.add_argument(
-        "--attention-sink-size", 
-        type=int, 
-        default=16, 
-        help="Size of attention sink (number of frames)"
-    )
-    
-    parser.add_argument(
         "--left-context-chunks", 
         type=int, 
         default=1, 

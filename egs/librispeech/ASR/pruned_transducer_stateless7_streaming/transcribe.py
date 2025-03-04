@@ -361,6 +361,23 @@ def main():
     params.right_context_frames = 8
     params.memory_size = 32
     params.causal = False
+    # Additional encoder parameters
+    params.short_chunk_size = 50
+    params.decode_chunk_size = 16
+    params.subsampling_factor = 4
+    params.vgg_frontend = False
+    params.use_dynamic_chunk = True
+    params.dynamic_chunk_training = True
+    params.short_chunk_threshold = 20
+    params.num_features = 80
+    params.feature_dim = 80
+    params.conv_module_kernel_size = 31
+    params.cnn_module_kernel = 31
+    params.tie_weights = False
+    params.dynamic_left_context = False
+    params.max_left_context = 128
+    params.max_left_context_frames = 128
+    params.finetune_wav_extractor = False
     
     # === Streaming parameters ===
     params.use_attention_sink = True

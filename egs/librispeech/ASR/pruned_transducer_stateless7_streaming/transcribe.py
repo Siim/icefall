@@ -65,22 +65,55 @@ def get_transducer_model(params: AttributeDict) -> torch.nn.Module:
     """Build a transducer model with XLSR encoder.
     
     Args:
-        params: Configuration parameters
+        params: Model configuration parameters.
         
     Returns:
-        A Transducer model
+        A Transducer model.
     """
+    from model import Transducer
+    
     logging.info("Creating transducer model with XLSR encoder")
     
+    # Create encoder
     encoder = get_encoder_model(params)
-    decoder = get_decoder_model(params)
-    joiner = get_joiner_model(params)
     
-    return Transducer(
+    # Get the decoder model
+    try:
+        # First try direct import from train
+        from pruned_transducer_stateless7_streaming.train import get_decoder_model, get_joiner_model
+        decoder = get_decoder_model(params)
+        joiner = get_joiner_model(params)
+    except (ImportError, AttributeError):
+        # Fallback to direct implementation if train import fails
+        from decoder import Decoder
+        from joiner import Joiner
+        
+        decoder = Decoder(
+            vocab_size=params.vocab_size,
+            decoder_dim=params.decoder_dim,
+            blank_id=params.blank_id,
+            context_size=2,
+        )
+        
+        joiner = Joiner(
+            encoder_dim=params.encoder_dim,
+            decoder_dim=params.decoder_dim,
+            joiner_dim=params.joiner_dim,
+            vocab_size=params.vocab_size,
+        )
+        
+    # Create the transducer model
+    model = Transducer(
         encoder=encoder,
         decoder=decoder,
         joiner=joiner,
+        encoder_dim=params.encoder_dim,
+        decoder_dim=params.decoder_dim,
+        joiner_dim=params.joiner_dim,
+        vocab_size=params.vocab_size,
     )
+    
+    return model
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -395,6 +428,11 @@ def main():
     logging.info(f"Loading SentencePiece model from {params.bpe_model}")
     sp = spm.SentencePieceProcessor()
     sp.load(params.bpe_model)
+    
+    # Set blank_id and update vocab_size from the loaded model
+    params.blank_id = sp.piece_to_id("<blk>")
+    params.vocab_size = sp.get_piece_size()
+    logging.info(f"Vocabulary size: {params.vocab_size}, blank_id: {params.blank_id}")
     
     # Create model
     logging.info("Creating model with XLSR encoder")

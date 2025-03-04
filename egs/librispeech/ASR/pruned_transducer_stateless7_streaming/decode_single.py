@@ -336,15 +336,49 @@ def main():
                 encoder_out = model.encoder_proj(encoder_out)
         
         # Decode with beam search
-        logging.info(f"Decoding with beam size: {args.beam_size}")
-        hyp_tokens = modified_beam_search(
-            model=model,
-            encoder_out=encoder_out,
-            encoder_out_lens=encoder_out_lens,
-            beam=args.beam_size,
-            temperature=args.temperature,
-            blank_penalty=args.blank_penalty
-        )
+        logging.info(f"Decoding with beam size: {args.beam_size}, blank penalty: {args.blank_penalty}")
+        
+        # Import the modified_beam_search function directly from beam_search.py
+        from beam_search import modified_beam_search
+        
+        # Set a maximum output length to prevent repetitive outputs
+        # Typically, output length should be proportional to input length
+        # For speech, a reasonable ratio is around 1:5 (one token per 5 frames)
+        max_output_length = min(200, encoder_out.size(1) // 5)
+        logging.info(f"Setting maximum output length to {max_output_length} tokens")
+        
+        # Create a custom HypothesisList class to limit output length
+        from beam_search import Hypothesis, HypothesisList
+        
+        class LengthConstrainedHypothesisList(HypothesisList):
+            def add(self, hyp: Hypothesis) -> None:
+                # Only add hypothesis if it's not too long
+                if len(hyp.ys) <= max_output_length:
+                    super().add(hyp)
+        
+        # Monkey patch the HypothesisList class in beam_search module
+        import sys
+        import types
+        
+        # Store the original class
+        original_HypothesisList = sys.modules['beam_search'].HypothesisList
+        
+        # Replace with our constrained version
+        sys.modules['beam_search'].HypothesisList = LengthConstrainedHypothesisList
+        
+        try:
+            # Run beam search with the patched class
+            hyp_tokens = modified_beam_search(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+                beam=args.beam_size,
+                temperature=args.temperature,
+                blank_penalty=args.blank_penalty
+            )
+        finally:
+            # Restore the original class
+            sys.modules['beam_search'].HypothesisList = original_HypothesisList
         
         # Convert tokens to text
         hyps = []

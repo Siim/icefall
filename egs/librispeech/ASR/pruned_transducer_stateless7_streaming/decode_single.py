@@ -350,154 +350,63 @@ def main():
         
         logging.info(f"Joiner type: {type(joiner).__name__}")
         
-        # Define a custom HypothesisList class to limit output length
-        from beam_search import Hypothesis
-        
-        class LengthConstrainedHypothesisList:
-            def __init__(self, max_len=50):
-                self.hypotheses = []
-                self.max_len = max_len
-                
-            def add(self, hyp):
-                # Only add hypothesis if it's not too long or if it's a blank token
-                if len(hyp.ys) <= self.max_len:
-                    self.hypotheses.append(hyp)
-                
-            def get_most_probable(self, length_norm=False):
-                if len(self.hypotheses) == 0:
-                    return Hypothesis(ys=[], log_prob=0.0, timestamp=[])
-                    
-                if length_norm:
-                    return max(
-                        self.hypotheses,
-                        key=lambda hyp: hyp.log_prob / max(1, len(hyp.ys)),
-                    )
-                else:
-                    return max(self.hypotheses, key=lambda hyp: hyp.log_prob)
-        
-        # Create a custom beam search function with length constraints
-        def length_constrained_beam_search(
-            model,
-            encoder_out,
-            encoder_out_lens=None,
-            beam=4,
-            temperature=1.0,
-            blank_penalty=0.0,
-            max_len=50
-        ):
-            from beam_search import Hypothesis
-            
-            # Get model components
-            if hasattr(model, 'module'):
-                decoder = model.module.decoder
-                joiner = model.module.joiner
-            else:
-                decoder = model.decoder
-                joiner = model.joiner
-                
-            context_size = decoder.context_size
-            blank_id = decoder.blank_id
-            
-            # Initialize hypothesis with blank tokens
-            hyp = Hypothesis(ys=[blank_id] * context_size, log_prob=0.0, timestamp=[])
-            hyps = [hyp]
-            
-            # Process each frame
-            for t in range(encoder_out.size(1)):
-                # Get encoder output for current frame
-                encoder_out_t = encoder_out[:, t:t+1, :]
-                
-                # Create a length-constrained hypothesis list
-                A = LengthConstrainedHypothesisList(max_len=max_len)
-                for hyp in hyps:
-                    A.add(hyp)
-                
-                # Create a new hypothesis list for next frame
-                B = LengthConstrainedHypothesisList(max_len=max_len)
-                
-                # Get top-k hypotheses
-                hyps = []
-                for i in range(min(beam, len(A.hypotheses))):
-                    hyp = A.hypotheses[i]
-                    
-                    # Get decoder output
-                    decoder_input = torch.tensor(
-                        hyp.ys[-context_size:], device=encoder_out.device, dtype=torch.int64
-                    ).unsqueeze(0)
-                    decoder_out = decoder(decoder_input, need_pad=False)
-                    
-                    # Get joiner output
-                    current_encoder_out = encoder_out_t.unsqueeze(1)
-                    current_decoder_out = decoder_out.unsqueeze(1)
-                    logits = joiner(current_encoder_out, current_decoder_out)
-                    
-                    # Apply temperature and blank penalty
-                    logits = logits / temperature
-                    if blank_penalty > 0:
-                        logits[:, :, :, blank_id] -= blank_penalty
-                    
-                    # Get log probabilities
-                    log_probs = logits.log_softmax(dim=-1)
-                    log_probs = log_probs.squeeze(1).squeeze(1)
-                    
-                    # Add current hypothesis log probability
-                    log_probs = log_probs + hyp.log_prob
-                    
-                    # Get top-k tokens
-                    topk_log_probs, topk_indexes = log_probs.topk(beam)
-                    
-                    # Create new hypotheses
-                    for j in range(beam):
-                        new_token = topk_indexes[j].item()
-                        new_log_prob = topk_log_probs[j].item()
-                        
-                        new_ys = hyp.ys[:]
-                        new_timestamp = hyp.timestamp[:]
-                        
-                        if new_token != blank_id:
-                            new_ys.append(new_token)
-                            new_timestamp.append(t)
-                            
-                        new_hyp = Hypothesis(
-                            ys=new_ys, log_prob=new_log_prob, timestamp=new_timestamp
-                        )
-                        B.add(new_hyp)
-                
-                # Get best hypotheses for next frame
-                hyps = B.hypotheses[:beam]
-                
-                # Early stopping if all hypotheses end with blank
-                if all(h.ys[-1] == blank_id for h in hyps if len(h.ys) > context_size):
-                    break
-            
-            # Get best hypothesis
-            best_hyp = max(hyps, key=lambda h: h.log_prob / max(1, len(h.ys) - context_size))
-            return best_hyp.ys[context_size:]  # Remove context
-        
-        # Decode with custom beam search
+        # Decode with beam search
         logging.info(f"Decoding with beam size: {args.beam_size}, blank penalty: {args.blank_penalty}")
-        logging.info(f"Using length-constrained beam search with max length: 50")
         
-        # Run custom beam search
-        hyp_tokens = length_constrained_beam_search(
+        # Import the modified_beam_search function
+        from beam_search import modified_beam_search
+        
+        # Set a higher blank penalty to discourage repetitions
+        effective_blank_penalty = args.blank_penalty + 0.5
+        logging.info(f"Using effective blank penalty: {effective_blank_penalty}")
+        
+        # Run beam search with increased blank penalty
+        hyp_tokens = modified_beam_search(
             model=model,
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
             beam=args.beam_size,
             temperature=args.temperature,
-            blank_penalty=args.blank_penalty,
-            max_len=50
+            blank_penalty=effective_blank_penalty
         )
         
+        # Post-process to limit output length
+        max_output_length = 50  # Maximum number of tokens to keep
+        
+        # Function to limit token sequence length and remove repetitions
+        def limit_output_length(tokens, max_len=max_output_length):
+            if len(tokens) <= max_len:
+                return tokens
+            
+            # Keep only the first max_len tokens
+            return tokens[:max_len]
+        
+        # Apply length limiting to all hypotheses
+        processed_hyp_tokens = []
+        for h in hyp_tokens:
+            # Check if h is a tensor or a list
+            if isinstance(h, torch.Tensor):
+                h_list = h.tolist()
+            else:
+                h_list = h
+            
+            # Limit the length
+            limited_tokens = limit_output_length(h_list)
+            processed_hyp_tokens.append(limited_tokens)
+        
         # Log the raw token IDs for debugging
-        logging.info(f"Raw token IDs: {hyp_tokens}")
+        logging.info(f"Raw token IDs (original): {hyp_tokens[0]}")
+        logging.info(f"Raw token IDs (limited): {processed_hyp_tokens[0]}")
         
         # Convert tokens to text
-        text = sp.decode(hyp_tokens)
+        hyps = []
+        for h in processed_hyp_tokens:
+            text = sp.decode(h)
+            hyps.append(text)
         
         # Print the transcription
-        print(f"\nTranscription: {text}")
-        logging.info(f"Transcription: {text}")
+        print(f"\nTranscription: {hyps[0]}")
+        logging.info(f"Transcription: {hyps[0]}")
 
 if __name__ == "__main__":
     main() 

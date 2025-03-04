@@ -319,6 +319,27 @@ def main():
         "2560ms": 40960,  # 2.56s at 16kHz
     }
     
+    # Add XLSR specific parameters
+    params.encoder_type = "XLSR"
+    params.encoder_dim = 1024  # XLSR output dimension is 1024
+    params.joiner_dim = 512
+    params.use_encoder_proj = True  # Enable projection layer from XLSR output to joiner
+    
+    # Add necessary parameters to avoid AttributeError
+    # These are not used for XLSR but needed by the model creation function
+    params.zipformer_downsampling_factors = "1,2,4,8"
+    params.use_zipformer = False
+    params.attention_dim = 512
+    params.num_encoder_layers = 24  # Not used for XLSR but required
+    
+    # XLSR specific streaming parameters
+    params.is_streaming = params.streaming  # Convert boolean to attribute
+    params.use_attention_sink = True
+    
+    # Set pretrained encoder configs
+    params.pretrained_encoder = True
+    params.xlsr_model_name = "facebook/wav2vec2-large-xlsr-53"
+    
     # Load sentencepiece model
     logging.info(f"Loading SentencePiece model from {params.bpe_model}")
     sp = spm.SentencePieceProcessor()

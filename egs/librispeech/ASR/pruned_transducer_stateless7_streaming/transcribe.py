@@ -16,17 +16,70 @@ from torch.nn.utils.rnn import pad_sequence
 from icefall.utils import AttributeDict, setup_logger
 import sentencepiece as spm
 
-# These are used for loading the model
+# Import train functions except for get_transducer_model and get_encoder_model
 from train import (
     add_model_arguments,
     get_params,
-    get_transducer_model,
     load_checkpoint_if_available,
-    process_streaming_chunks
+    process_streaming_chunks,
+    get_joiner_model,
+    get_decoder_model
 )
 
+# Import XLSR encoder and other components
+from encoder_interface import EncoderInterface
+from xlsr_encoder import XLSREncoder
+from model import Transducer
 from beam_search import modified_beam_search
 
+# Override get_encoder_model to create XLSR encoder directly
+def get_encoder_model(params: AttributeDict):
+    """Create an XLSR encoder model.
+    
+    Args:
+        params: Configuration parameters.
+        
+    Returns:
+        An instance of XLSREncoder.
+    """
+    from icefall.xlsr_encoder import XLSREncoder
+    
+    logging.info(f"Creating XLSR encoder with model name: {params.xlsr_model_name}")
+    
+    encoder = XLSREncoder(
+        model_name=params.xlsr_model_name,
+        pretrained=params.pretrained_encoder,
+        output_dim=params.encoder_dim,
+        is_streaming=params.is_streaming,
+        decode_chunk_size=params.decode_chunk_size if hasattr(params, 'decode_chunk_size') else 16,
+        use_attention_sink=params.use_attention_sink,
+        attention_sink_size=params.attention_sink_size,
+        left_context_chunks=params.left_context_chunks,
+    )
+    
+    return encoder
+
+# Override get_transducer_model to use our custom encoder
+def get_transducer_model(params: AttributeDict) -> torch.nn.Module:
+    """Build a transducer model with XLSR encoder.
+    
+    Args:
+        params: Configuration parameters
+        
+    Returns:
+        A Transducer model
+    """
+    logging.info("Creating transducer model with XLSR encoder")
+    
+    encoder = get_encoder_model(params)
+    decoder = get_decoder_model(params)
+    joiner = get_joiner_model(params)
+    
+    return Transducer(
+        encoder=encoder,
+        decoder=decoder,
+        joiner=joiner,
+    )
 
 def get_parser():
     parser = argparse.ArgumentParser(
@@ -305,7 +358,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
     
-    # Get model parameters
+    # Get basic model parameters
     params = get_params()
     
     # Update with command line args
@@ -319,92 +372,23 @@ def main():
         "2560ms": 40960,  # 2.56s at 16kHz
     }
     
-    # Add required parameters for model creation
-    
-    # === XLSR Encoder parameters ===
+    # Set essential XLSR parameters
     params.encoder_type = "XLSR"
-    params.encoder_dim = 1024  # XLSR output dimension is 1024
-    params.encoder_dims = "1024,1024,1024,1024,1024,1024"
-    params.encoder_unmasked_dims = "1024,1024,1024,1024,1024,1024"
-    params.joiner_dim = 512
-    params.use_encoder_proj = True  # Enable projection layer from XLSR output to joiner
-    params.is_streaming = params.streaming  # Convert boolean to attribute
-    
-    # === Decoder parameters ===
+    params.encoder_dim = 1024  # XLSR output dimension
     params.decoder_dim = 512
-    params.num_decoder_layers = 2
-    
-    # === Joiner parameters ===
-    params.nonlinear_output = "relu"
-    
-    # === Vocabulary parameters ===
+    params.joiner_dim = 512
     params.vocab_size = 2500  # BPE vocabulary size
+    params.use_encoder_proj = True
     
-    # === Set pretrained encoder configs ===
+    # Set XLSR specific streaming parameters
+    params.is_streaming = params.streaming  # Convert boolean to attribute
+    params.use_attention_sink = True
+    params.attention_sink_size = args.attention_sink_size
+    params.left_context_chunks = args.left_context_chunks
+    
+    # Set pretrained encoder configs
     params.pretrained_encoder = True
     params.xlsr_model_name = "facebook/wav2vec2-large-xlsr-53"
-    
-    # === All required parameters for Zipformer (even though we're not using it) ===
-    params.use_zipformer = False
-    params.zipformer_downsampling_factors = "1,2,4,8"
-    params.attention_dim = 512
-    params.attention_dims = "512,512,512,512,512,512"
-    params.num_encoder_layers = "6,6,6,6,6,6"
-    params.nhead = "8,8,8,8,8,8"
-    params.feedforward_dim = "2048,2048,2048,2048,2048,2048"
-    params.feedforward_dims = "2048,2048,2048,2048,2048,2048"
-    params.cnn_module_kernels = "31,31,31,31,31,31"
-    params.transformer_dropout = 0.1
-    params.encoder_layer_dropout = 0.1
-    params.left_context_frames = 64
-    params.chunk_length = 32
-    params.right_context_frames = 8
-    params.memory_size = 32
-    params.causal = False
-    # Additional encoder parameters
-    params.short_chunk_size = 50
-    params.decode_chunk_size = 16
-    params.decode_chunk_len = 32
-    params.subsampling_factor = 4
-    params.vgg_frontend = False
-    params.use_dynamic_chunk = True
-    params.dynamic_chunk_training = True
-    params.short_chunk_threshold = 20
-    params.num_features = 80
-    params.feature_dim = 80
-    params.conv_module_kernel_size = 31
-    params.cnn_module_kernel = 31
-    params.tie_weights = False
-    params.dynamic_left_context = False
-    params.max_left_context = 128
-    params.max_left_context_frames = 128
-    params.finetune_wav_extractor = False
-    
-    # === Streaming parameters ===
-    params.use_attention_sink = True
-    params.attention_sink_size = 16
-    params.left_context_chunks = 1
-    params.num_left_chunks = 1  # Number of left context chunks for attention masking
-    
-    # === Training parameters (not used but required) ===
-    params.lr = 0.001
-    params.weight_decay = 1e-6
-    params.warm_step = 2000
-    params.best_train_loss = float("inf")
-    params.best_valid_loss = float("inf")
-    params.best_train_epoch = -1
-    params.best_valid_epoch = -1
-    params.batch_idx_train = 0
-    params.valid_average_period = 1
-    params.prune_range = 5
-    params.beam = 4
-    params.max_contexts = 4
-    params.max_states = 8
-    params.am_scale = 0.0
-    params.lm_scale = 0.0
-    params.blank_penalty = 0.0
-    params.eos_threshold = -3.4
-    params.simple_loss_scale = 0.5
     
     # Load sentencepiece model
     logging.info(f"Loading SentencePiece model from {params.bpe_model}")
@@ -412,7 +396,7 @@ def main():
     sp.load(params.bpe_model)
     
     # Create model
-    logging.info("Creating model")
+    logging.info("Creating model with XLSR encoder")
     model = get_transducer_model(params)
     model.to(device)
     

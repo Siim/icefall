@@ -1920,7 +1920,6 @@ def run(rank, world_size, args):
         from estonian_dataset import EstonianASRDataset, collate_fn
         
         # Create a SentencePiece processor from the model
-        import sentencepiece as spm
         sp = spm.SentencePieceProcessor()
         sp.load(params.bpe_model)
         logging.info(f"Loaded SentencePiece model from {params.bpe_model}")

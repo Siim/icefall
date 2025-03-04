@@ -157,9 +157,9 @@ def get_parser():
     
     # Streaming parameters
     parser.add_argument(
-        "--streaming", 
-        action="store_true", 
-        help="Whether to use streaming mode"
+        "--streaming",
+        action="store_true",
+        help="Use streaming mode for transcription (matches training parameters)"
     )
     
     parser.add_argument(
@@ -390,25 +390,26 @@ def transcribe_wav(wav_path: str,
     feature = features["inputs"].to(device)
     feature_lens = features["input_lens"].to(device)
     
-    # Process according to streaming/non-streaming mode
-    if params.streaming:
-        logging.info(f"Using streaming mode with chunk size {params.chunk_sizes[params.chunk_size]}")
+    # Determine processing mode
+    if hasattr(params, 'streaming') and params.streaming:
+        logging.info("Using streaming mode with matching training parameters")
+        # Use the same streaming parameters as in training
+        chunk_size = getattr(params, 'chunk_size', 26624)
+        attention_sink_size = getattr(params, 'attention_sink_size', 16)
+        left_context_chunks = getattr(params, 'left_context_chunks', 1)
         
-        # Get chunk size in samples
-        chunk_size = params.chunk_sizes[params.chunk_size]
-        
-        # Process in streaming chunks with attention sink
-        encoder_out, encoder_out_lens = process_streaming_chunks(
-            model=model,
-            feature=feature,
+        logging.info(f"Processing in streaming mode with chunk_size={chunk_size}, attention_sink_size={attention_sink_size}, left_context_chunks={left_context_chunks}")
+        encoder_out, encoder_out_lens = model.encoder.streaming_forward(
+            x=feature,
+            x_lens=feature_lens,
             chunk_size=chunk_size,
-            attention_sink_size=params.attention_sink_size,
-            left_context_chunks=params.left_context_chunks,
-            is_pre_training=False
+            attention_sink_size=attention_sink_size,
+            left_context_chunks=left_context_chunks,
         )
     else:
-        logging.info(f"Using non-streaming mode")
-        # Process with full context
+        # Non-streaming mode
+        logging.info("Using non-streaming mode")
+        # Pass features to the encoder
         logging.info("Passing features to encoder...")
         encoder_start = time.time()
         
@@ -439,10 +440,10 @@ def transcribe_wav(wav_path: str,
     # Decode using beam search
     logging.info(f"Starting beam search with beam size {params.beam_size}, blank penalty {params.blank_penalty}, temperature {params.temperature}")
     
-    # Set a higher blank penalty to discourage early termination if needed
-    if params.blank_penalty < 1.0:
-        logging.info(f"Increasing blank_penalty from {params.blank_penalty} to 2.0 to encourage more tokens")
-        params.blank_penalty = 2.0
+    # Set a moderate blank penalty to discourage early termination if needed
+    if params.blank_penalty < 0.5:
+        logging.info(f"Increasing blank_penalty from {params.blank_penalty} to 1.0 to encourage more tokens")
+        params.blank_penalty = 1.0
     
     # Log the parameters being used
     logging.info(f"Starting beam search with beam size {params.beam_size}, blank penalty {params.blank_penalty}, temperature {params.temperature}")
@@ -452,15 +453,28 @@ def transcribe_wav(wav_path: str,
     
     # Disable gradient tracking during inference
     with torch.no_grad():
-        # Call beam search with all the parameters
-        hyps = beam_search(
-            model=model,
-            encoder_out=encoder_out,
-            beam=params.beam_size,
-            temperature=params.temperature,
-            blank_penalty=params.blank_penalty,
-            return_timestamps=False,
-        )
+        # If we're getting stuck in beam search, try modified_beam_search instead
+        try:
+            # Call beam_search with a timeout to avoid getting stuck
+            hyps = beam_search(
+                model=model,
+                encoder_out=encoder_out,
+                beam=params.beam_size,
+                temperature=params.temperature,
+                blank_penalty=params.blank_penalty,
+                return_timestamps=False,
+            )
+        except Exception as e:
+            logging.warning(f"beam_search failed with error: {e}")
+            logging.info("Falling back to modified_beam_search")
+            hyps = modified_beam_search(
+                model=model,
+                encoder_out=encoder_out,
+                encoder_out_lens=encoder_out_lens,
+                beam=params.beam_size,
+                temperature=params.temperature,
+                blank_penalty=params.blank_penalty,
+            )
     
     end_time = time.time()
     logging.info(f"Beam search took {end_time - start_time:.3f} seconds")
@@ -561,71 +575,68 @@ def load_checkpoint_if_available(params: AttributeDict, model: torch.nn.Module):
     
     return None
 
+def convert_args_to_params(args):
+    """Convert command line args to AttributeDict params."""
+    from lhotse.utils import AttributeDict
+    params = AttributeDict()
+    # Convert all args to AttributeDict
+    params.update(vars(args))
+    return params
 
 def main():
     # Parse arguments
-    parser = get_parser()
-    args = parser.parse_args()
-    
+    args = get_parser().parse_args()
+
     # Create logs directory if it doesn't exist
-    log_dir = Path("pruned_transducer_stateless7_streaming/logs")
-    log_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
     
     # Setup logger with proper file path
     log_filename = log_dir / f"transcribe_{Path(args.wav_file).stem}.log"
     setup_logger(log_filename)
+    logging.info("Starting speech transcription")
     
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
+
+    # Create params from args
+    params = convert_args_to_params(args)
     
-    # Get basic model parameters
-    params = get_params()
+    # Set streaming mode
+    if not hasattr(params, 'streaming'):
+        params.streaming = args.streaming
     
-    # Update with command line args
-    params.update(vars(args))
+    # Set beam search parameters
+    if not hasattr(params, 'beam_size'):
+        params.beam_size = 4
     
-    # Define chunk sizes
-    params.chunk_sizes = {
-        "320ms": 5120,    # 320ms at 16kHz
-        "640ms": 10240,   # 640ms at 16kHz
-        "1280ms": 20480,  # 1.28s at 16kHz
-        "2560ms": 40960,  # 2.56s at 16kHz
-    }
+    # Define chunk sizes if not already present
+    if not hasattr(params, 'chunk_sizes'):
+        params.chunk_sizes = {
+            "320ms": 5120,    # 320ms at 16kHz
+            "640ms": 10240,   # 640ms at 16kHz
+            "1280ms": 20480,  # 1.28s at 16kHz
+            "2560ms": 40960,  # 2.56s at 16kHz
+        }
+        
+    # Set default streaming parameters
+    params.chunk_size = getattr(params, 'chunk_size', '640ms')
+    params.attention_sink_size = getattr(params, 'attention_sink_size', 16)
+    params.left_context_chunks = getattr(params, 'left_context_chunks', 1)
     
     # Set essential XLSR parameters
+    params.pretrained_encoder = True
+    params.xlsr_model_name = "facebook/wav2vec2-large-xlsr-53"
     params.encoder_type = "XLSR"
     params.encoder_dim = 1024  # XLSR output dimension
     params.decoder_dim = 512
     params.joiner_dim = 512
-    params.vocab_size = 2500  # BPE vocabulary size
     params.use_encoder_proj = True
     
-    # Set XLSR specific streaming parameters
-    params.is_streaming = params.streaming  # Convert boolean to attribute
-    params.use_attention_sink = True
-    params.attention_sink_size = args.attention_sink_size if hasattr(args, 'attention_sink_size') else 16
-    params.left_context_chunks = args.left_context_chunks if hasattr(args, 'left_context_chunks') else 1
-    
-    # Set beam search parameters
-    params.beam_size = args.beam_size if hasattr(args, 'beam_size') else 4
-    
-    # Use command line blank_penalty from args if specified
-    if hasattr(args, 'blank_penalty'):
-        params.blank_penalty = args.blank_penalty
-    else:
-        # Otherwise use a higher default value
-        params.blank_penalty = 1.5  # Higher value to encourage more tokens
-        
-    # Use command line temperature from args if specified
-    if hasattr(args, 'temperature'):
-        params.temperature = args.temperature
-    else:
-        params.temperature = 1.0
-    
-    # Set pretrained encoder configs
-    params.pretrained_encoder = True
-    params.xlsr_model_name = "facebook/wav2vec2-large-xlsr-53"
+    # Set blank_penalty and temperature with defaults if not specified
+    params.blank_penalty = getattr(params, 'blank_penalty', 1.0)
+    params.temperature = getattr(params, 'temperature', 1.0)
     
     # Load sentencepiece model
     logging.info(f"Loading SentencePiece model from {params.bpe_model}")

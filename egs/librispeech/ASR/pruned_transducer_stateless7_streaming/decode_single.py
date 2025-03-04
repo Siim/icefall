@@ -288,13 +288,13 @@ def main():
     
     # Load model
     params, model = load_checkpoint(Path(args.checkpoint), device)
-    logging.info("Model loaded successfully")
+    logging.info(f"Model loaded successfully with parameters: {params}")
     
     # Load and normalize audio
     logging.info(f"Processing audio file: {args.audio_file}")
     audio, sample_rate = torchaudio.load(args.audio_file)
     audio = normalize_audio(audio, sample_rate)
-    logging.info(f"Audio shape after normalization: {audio.shape}")
+    logging.info(f"Audio shape after normalization: {audio.shape}, sample rate: {sample_rate}")
     
     # Process in non-streaming mode (since model is in pre-training phase)
     with torch.no_grad():
@@ -304,81 +304,82 @@ def main():
         # Create feature lengths tensor for batch processing
         feature_lens = torch.tensor([audio.size(1)], device=device)
         
-        # Process directly through encoder in non-streaming mode (matching train.py validation)
-        logging.info("Using non-streaming mode for decoding (pre-training phase)")
+        # Process directly through encoder in non-streaming mode
+        logging.info("Using non-streaming mode for decoding")
         
-        # Use encoder directly if model is wrapped in DDP
+        # Get encoder directly
         if hasattr(model, 'module'):
             encoder = model.module.encoder
         else:
             encoder = model.encoder
-            
+        
+        # Log encoder type
+        logging.info(f"Encoder type: {type(encoder).__name__}")
+        
         # Get encoder output directly (no chunking)
         encoder_out, encoder_out_lens = encoder(
             x=audio,
             x_lens=feature_lens
         )
         
-        logging.info(f"Encoder output shape: {encoder_out.shape}")
+        logging.info(f"Encoder output shape: {encoder_out.shape}, lengths: {encoder_out_lens}")
         
-        # Check if model has encoder_proj attribute and apply if available
-        has_encoder_proj = False
+        # Apply encoder projection if available
+        if hasattr(model, 'module') and hasattr(model.module, 'encoder_proj'):
+            logging.info("Applying encoder projection from module")
+            encoder_out = model.module.encoder_proj(encoder_out)
+        elif hasattr(model, 'encoder_proj'):
+            logging.info("Applying encoder projection")
+            encoder_out = model.encoder_proj(encoder_out)
+        
+        logging.info(f"Encoder output after projection: {encoder_out.shape}")
+        
+        # Get decoder
         if hasattr(model, 'module'):
-            has_encoder_proj = hasattr(model.module, 'encoder_proj')
+            decoder = model.module.decoder
         else:
-            has_encoder_proj = hasattr(model, 'encoder_proj')
+            decoder = model.decoder
         
-        # Apply projection if available
-        if has_encoder_proj:
-            if hasattr(model, 'module'):
-                encoder_out = model.module.encoder_proj(encoder_out)
-            else:
-                encoder_out = model.encoder_proj(encoder_out)
+        logging.info(f"Decoder type: {type(decoder).__name__}, blank_id: {decoder.blank_id}, context_size: {decoder.context_size}")
+        
+        # Get joiner
+        if hasattr(model, 'module'):
+            joiner = model.module.joiner
+        else:
+            joiner = model.joiner
+        
+        logging.info(f"Joiner type: {type(joiner).__name__}")
         
         # Decode with beam search
         logging.info(f"Decoding with beam size: {args.beam_size}, blank penalty: {args.blank_penalty}")
         
-        # Import the modified_beam_search function directly from beam_search.py
+        # Import the modified_beam_search function
         from beam_search import modified_beam_search
         
-        # Create a custom function to post-process the beam search results
-        def post_process_tokens(token_list):
-            """Remove repetitive tokens from the output."""
-            if not token_list:
-                return token_list
-                
-            # Maximum number of consecutive repetitions allowed
-            max_repetitions = 2
-            
-            # Process the token list to remove excessive repetitions
-            result = []
-            prev_token = None
-            repeat_count = 0
-            
-            for token in token_list:
-                if token == prev_token:
-                    repeat_count += 1
-                    if repeat_count <= max_repetitions:
-                        result.append(token)
-                else:
-                    repeat_count = 1
-                    result.append(token)
-                    prev_token = token
-            
-            return result
+        # Set a higher blank penalty to discourage repetitions
+        effective_blank_penalty = args.blank_penalty + 0.5
+        logging.info(f"Using effective blank penalty: {effective_blank_penalty}")
         
-        # Run beam search
+        # Run beam search with increased blank penalty
         hyp_tokens = modified_beam_search(
             model=model,
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
             beam=args.beam_size,
             temperature=args.temperature,
-            blank_penalty=args.blank_penalty
+            blank_penalty=effective_blank_penalty
         )
         
-        # Post-process to remove repetitions
-        processed_hyp_tokens = []
+        # Log the raw token IDs for debugging
+        if isinstance(hyp_tokens[0], torch.Tensor):
+            token_list = hyp_tokens[0].tolist()
+        else:
+            token_list = hyp_tokens[0]
+        
+        logging.info(f"Raw token IDs: {token_list}")
+        
+        # Convert tokens to text
+        hyps = []
         for h in hyp_tokens:
             # Check if h is a tensor or a list
             if isinstance(h, torch.Tensor):
@@ -386,14 +387,9 @@ def main():
             else:
                 h_list = h
             
-            # Apply post-processing to remove repetitions
-            processed_tokens = post_process_tokens(h_list)
-            processed_hyp_tokens.append(processed_tokens)
-        
-        # Convert tokens to text
-        hyps = []
-        for h in processed_hyp_tokens:
-            hyps.append(sp.decode(h))
+            # Decode to text
+            text = sp.decode(h_list)
+            hyps.append(text)
         
         # Print the transcription
         print(f"\nTranscription: {hyps[0]}")

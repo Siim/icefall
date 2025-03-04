@@ -17,6 +17,7 @@
 from typing import Optional, List, Tuple
 import torch
 from encoder_interface import EncoderInterface  # Import the encoder interface
+import logging
 
 class XLSREncoder(EncoderInterface):
     def __init__(
@@ -188,18 +189,30 @@ class XLSREncoder(EncoderInterface):
         """Forward pass of the XLSR encoder.
         
         Args:
-            x: Input tensor of shape (batch, time) or (batch, time, channel)
+            x: Input tensor of shape (batch, time) or (batch, time, channel) or (batch, time, features)
             x_lens: Tensor of shape (batch,) containing the valid length of each sequence
             
         Returns:
             Tuple of (encoder_out, encoder_out_lens)
         """
-        # Handle different input shapes
+        # Check if input is already processed features
+        if x.ndim == 3 and x.size(2) > 1:
+            # Input is already processed features, skip wav2vec processing
+            logging.info(f"Input is already processed features with shape {x.shape}, skipping wav2vec processing")
+            
+            # Calculate output lengths based on the encoder's downsampling factor
+            output_lengths = torch.div(x_lens, self.downsample_factor, rounding_mode='floor') + 1
+            
+            # Ensure output lengths are valid
+            output_lengths = torch.clamp(output_lengths, min=1)
+            
+            # Return the features directly
+            return x, output_lengths
+        
+        # Handle different raw audio input shapes
         if x.ndim == 3:  # (batch, time, channel)
             if x.size(2) == 1:
                 x = x.squeeze(-1)  # Remove channel dimension if it's 1
-            else:
-                raise ValueError(f"Expected channel dimension to be 1, got shape {x.shape}")
         elif x.ndim == 1:  # (time,)
             x = x.unsqueeze(0)  # Add batch dimension
         

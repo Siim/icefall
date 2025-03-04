@@ -1917,14 +1917,14 @@ def run(rank, world_size, args):
         # For Estonian dataset
         import sys
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from estonian_dataset import EstonianASRDataset, collate_fn
+        from estonian_dataset import EstonianDataset, collate_fn
         
         # Create a SentencePiece processor from the model
         sp = spm.SentencePieceProcessor()
         sp.load(params.bpe_model)
         logging.info(f"Loaded SentencePiece model from {params.bpe_model}")
         
-        train_dataset = EstonianASRDataset(params.train_txt, base_path=params.audio_base_path, sp=sp)
+        train_dataset = EstonianDataset(params.train_txt, base_path=params.audio_base_path, sp=sp)
         train_dl = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=params.batch_size,
@@ -1933,7 +1933,7 @@ def run(rank, world_size, args):
             num_workers=2,
         )
         
-        valid_dataset = EstonianASRDataset(params.val_txt, base_path=params.audio_base_path, sp=sp)
+        valid_dataset = EstonianDataset(params.val_txt, base_path=params.audio_base_path, sp=sp)
         valid_dl = torch.utils.data.DataLoader(
             valid_dataset,
             batch_size=params.batch_size,

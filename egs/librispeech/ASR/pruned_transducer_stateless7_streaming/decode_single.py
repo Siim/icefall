@@ -356,33 +356,22 @@ def main():
         # Import the modified_beam_search function
         from beam_search import modified_beam_search
         
-        # Set a higher blank penalty to discourage repetitions
-        effective_blank_penalty = args.blank_penalty + 0.5
-        logging.info(f"Using effective blank penalty: {effective_blank_penalty}")
-        
-        # Run beam search with increased blank penalty
+        # Use the exact same beam search parameters as in validation
         hyp_tokens = modified_beam_search(
             model=model,
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
             beam=args.beam_size,
-            temperature=args.temperature,
-            blank_penalty=effective_blank_penalty
+            temperature=1.0,  # Use fixed temperature of 1.0 as in validation
+            blank_penalty=args.blank_penalty  # Use the provided blank penalty without modification
         )
         
-        # Post-process to limit output length
-        max_output_length = 50  # Maximum number of tokens to keep
+        # Log the raw token IDs for debugging
+        if len(hyp_tokens) > 0:
+            logging.info(f"Raw token IDs: {hyp_tokens[0]}")
         
-        # Function to limit token sequence length and remove repetitions
-        def limit_output_length(tokens, max_len=max_output_length):
-            if len(tokens) <= max_len:
-                return tokens
-            
-            # Keep only the first max_len tokens
-            return tokens[:max_len]
-        
-        # Apply length limiting to all hypotheses
-        processed_hyp_tokens = []
+        # Convert tokens to text
+        hyps = []
         for h in hyp_tokens:
             # Check if h is a tensor or a list
             if isinstance(h, torch.Tensor):
@@ -390,18 +379,7 @@ def main():
             else:
                 h_list = h
             
-            # Limit the length
-            limited_tokens = limit_output_length(h_list)
-            processed_hyp_tokens.append(limited_tokens)
-        
-        # Log the raw token IDs for debugging
-        logging.info(f"Raw token IDs (original): {hyp_tokens[0]}")
-        logging.info(f"Raw token IDs (limited): {processed_hyp_tokens[0]}")
-        
-        # Convert tokens to text
-        hyps = []
-        for h in processed_hyp_tokens:
-            text = sp.decode(h)
+            text = sp.decode(h_list)
             hyps.append(text)
         
         # Print the transcription

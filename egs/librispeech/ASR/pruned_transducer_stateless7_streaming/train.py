@@ -1527,12 +1527,12 @@ def compute_validation_loss(
             
             # Compute loss on the single sample
             with torch.amp.autocast('cuda', enabled=params.use_fp16):
-        loss, loss_info = compute_loss(
-            params=params,
-            model=model,
-            sp=sp,
+                loss, loss_info = compute_loss(
+                    params=params,
+                    model=model,
+                    sp=sp,
                     batch=single_sample,
-            is_training=False,
+                    is_training=False,
                     is_pre_training=is_pre_training,
                 )
             

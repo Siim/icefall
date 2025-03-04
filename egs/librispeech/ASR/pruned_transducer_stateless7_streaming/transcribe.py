@@ -304,7 +304,7 @@ def prepare_audio_features(wav_path: str,
                                   min_duration=min_duration, 
                                   max_duration=max_duration)
     
-    # Create inputs tensor
+    # Create inputs tensor - keep it as [batch, time] for XLSR processing
     inputs = waveform.squeeze(0).unsqueeze(0)  # [1, num_samples]
     
     # Get input length in samples
@@ -313,7 +313,6 @@ def prepare_audio_features(wav_path: str,
     logging.info(f"Preprocessed audio: shape={inputs.shape}, duration={inputs.size(1)/16000:.2f}s")
     logging.info(f"Audio stats - min: {inputs.min().item():.2f}, max: {inputs.max().item():.2f}, mean: {inputs.mean().item():.2f}")
     
-    # Return features dict
     return {
         "inputs": inputs,
         "input_lens": input_lens
@@ -358,11 +357,12 @@ def transcribe_wav(wav_path: str,
                   sp: spm.SentencePieceProcessor, 
                   params: AttributeDict, 
                   device: torch.device) -> str:
-    """Transcribe a WAV file using the XLSR-Transducer model.
+    """
+    Transcribe a WAV file using the given model.
     
     Args:
         wav_path: Path to WAV file
-        model: Loaded XLSR-Transducer model
+        model: ASR model
         sp: SentencePiece processor
         params: Model parameters
         device: Device to run inference on
@@ -370,12 +370,9 @@ def transcribe_wav(wav_path: str,
     Returns:
         Transcription text
     """
-    logging.info(f"Transcribing: {wav_path}")
+    logging.info(f"Loading audio from {wav_path}")
     
-    # Set model to evaluation mode
-    model.eval()
-    
-    # Load and prepare audio features with improved preprocessing
+    # Prepare audio features
     features = prepare_audio_features(
         wav_path,
         min_duration=0.5,
@@ -393,8 +390,11 @@ def transcribe_wav(wav_path: str,
     # Determine processing mode
     if hasattr(params, 'streaming') and params.streaming:
         logging.info("Using streaming mode with matching training parameters")
+        # Set a higher blank penalty in streaming mode to encourage more diverse outputs
+        params.blank_penalty = 1.5
+        
         # Use the same streaming parameters as in training
-        chunk_size = getattr(params, 'chunk_size', 26624)
+        chunk_size = params.chunk_sizes.get(params.chunk_size, 10240)  # Default to 640ms if not found
         attention_sink_size = getattr(params, 'attention_sink_size', 16)
         left_context_chunks = getattr(params, 'left_context_chunks', 1)
         
@@ -409,26 +409,26 @@ def transcribe_wav(wav_path: str,
             x_lens=feature_lens,
             streaming_state=streaming_state,
         )
+        
+        # Use modified_beam_search in streaming mode, which works better
+        search_method = modified_beam_search
     else:
         # Non-streaming mode
         logging.info("Using non-streaming mode (full context)")
+        # Keep default blank penalty in non-streaming mode
+        params.blank_penalty = getattr(params, 'blank_penalty', 0.9)
+        
+        # Directly pass raw audio to the encoder, which will handle the feature extraction
         encoder_out, encoder_out_lens = model.encoder(feature, feature_lens)
+        
+        # Use regular beam search in non-streaming mode
+        search_method = beam_search
     
     # Log encoder output stats for debugging
     logging.info(f"Encoder output stats - min: {encoder_out.min().item():.3f}, max: {encoder_out.max().item():.3f}, mean: {encoder_out.mean().item():.3f}, std: {encoder_out.std().item():.3f}")
     
-    # Force higher blank_penalty in streaming mode to encourage non-blank tokens
-    if hasattr(params, 'streaming') and params.streaming:
-        # Use a higher blank penalty for streaming mode
-        params.blank_penalty = 1.5
-        # Use the modified_beam_search function directly, which tends to work better for streaming
-        search_method = modified_beam_search
-        logging.info(f"Using modified_beam_search with increased blank_penalty={params.blank_penalty}")
-    else:
-        search_method = beam_search
-    
     # Log the parameters being used
-    logging.info(f"Starting beam search with beam size {params.beam_size}, blank penalty {params.blank_penalty}, temperature {params.temperature}")
+    logging.info(f"Starting beam search with method={search_method.__name__}, beam size={params.beam_size}, blank penalty={params.blank_penalty}, temperature={params.temperature}")
     
     # Time the beam search
     start_time = time.time()

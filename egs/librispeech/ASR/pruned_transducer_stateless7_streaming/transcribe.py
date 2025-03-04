@@ -461,7 +461,7 @@ def main():
     
     # Set pretrained encoder configs
     params.pretrained_encoder = True
-    params.xlsr_model_name = "facebook/wav2vec2-xls-r-300m"
+    params.xlsr_model_name = "facebook/wav2vec2-large-xlsr-53"
     
     
     # Load sentencepiece model

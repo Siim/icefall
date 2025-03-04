@@ -1601,6 +1601,8 @@ def train_one_epoch(
     2. Progressive streaming phase: Gradually decrease chunk size
     3. Final streaming phase: Fixed optimal chunk size
     """
+    import time
+    start_epoch_time = time.time()  # Initialize timing at start of epoch
     model.train()
     tot_loss = MetricsTracker()
     

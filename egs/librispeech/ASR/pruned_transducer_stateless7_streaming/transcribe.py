@@ -26,7 +26,7 @@ from train import (
 )
 
 # Import beam search functions
-from beam_search import modified_beam_search
+from beam_search import beam_search, modified_beam_search, DecodingResults
 
 # Import XLSR encoder and other components
 from encoder_interface import EncoderInterface
@@ -432,49 +432,66 @@ def transcribe_wav(wav_path: str,
                 f"std: {encoder_out.std().item():.3f}")
     
     # Decode using beam search
-    logging.info(f"Starting beam search with beam size {params.beam_size}, "
-                f"blank penalty {params.blank_penalty}, "
-                f"temperature {params.temperature}")
+    logging.info(f"Starting beam search with beam size {params.beam_size}, blank penalty {params.blank_penalty}, temperature {params.temperature}")
+    
+    # Set a higher blank penalty to discourage stopping early
+    params.blank_penalty = 2.0  # Try an even higher value
+    params.temperature = 1.0  # Default temperature
+    
+    # Log the parameters being used
+    logging.info(f"Starting beam search with beam size {params.beam_size}, blank penalty {params.blank_penalty}, temperature {params.temperature}")
+    
+    # Time the beam search
     start_time = time.time()
     
-    # Call modified_beam_search with the parameters it accepts
-    hyps = modified_beam_search(
+    # Call beam search with all the parameters
+    hyps = beam_search(
         model=model,
         encoder_out=encoder_out,
-        encoder_out_lens=encoder_out_lens,
         beam=params.beam_size,
-        blank_penalty=params.blank_penalty,
         temperature=params.temperature,
+        blank_penalty=params.blank_penalty,
         return_timestamps=False,
     )
     
     end_time = time.time()
-    latency = end_time - start_time
-    logging.info(f"Beam search took {latency:.3f} seconds")
+    logging.info(f"Beam search took {end_time - start_time:.3f} seconds")
     
     # Log hypotheses for diagnosis
-    logging.info(f"Number of hypotheses returned: {len(hyps)}")
+    logging.info(f"Number of hypotheses returned: {len(hyps) if isinstance(hyps, list) else (1 if isinstance(hyps, DecodingResults) else 'unknown')}")
     
-    # Detailed debug info for all hypotheses
-    for i, (hyp, score) in enumerate(hyps[:2]):  # Show top 2 hypotheses with scores
-        logging.info(f"Hypothesis {i+1}:")
-        if isinstance(hyp, int):
-            tokens = [hyp]
+    # Debug the top hypotheses if available
+    # Different handling based on what the beam_search returns
+    if isinstance(hyps, DecodingResults):
+        # DecodingResults format
+        logging.info(f"Result type: DecodingResults")
+        for i, hyp in enumerate(hyps.hyps[:2]):
+            logging.info(f"Hypothesis {i+1}:")
+            logging.info(f"  Tokens: {hyp}")
+            text = sp.decode(hyp)
+            logging.info(f"  Text: {text}")
+    elif isinstance(hyps, list):
+        # List format
+        logging.info(f"Result type: List")
+        # Check if the list contains tuples (hyp, score) or just hyp
+        if hyps and isinstance(hyps[0], tuple) and len(hyps[0]) == 2:
+            # (hyp, score) format
+            for i, (hyp, score) in enumerate(hyps[:2]):
+                logging.info(f"Hypothesis {i+1} (score: {score:.2f}):")
+                logging.info(f"  Tokens: {hyp}")
+                text = sp.decode(hyp)
+                logging.info(f"  Text: {text}")
         else:
-            tokens = hyp
-            
-        if len(tokens) <= 10:
-            token_texts = []
-            for token in tokens:
-                piece = sp.id_to_piece(token)
-                token_texts.append(f"{token} → '{piece}'")
-            logging.info(f"  Tokens: {', '.join(token_texts)}")
-        else:
-            logging.info(f"  First 10 tokens: {tokens[:10]}")
-            logging.info(f"  Last 5 tokens: {tokens[-5:]}")
-            
-        logging.info(f"  Score: {score}")
-        logging.info(f"  Text: {sp.decode(tokens)}")
+            # Just list of hyps
+            for i, hyp in enumerate(hyps[:2]):
+                logging.info(f"Hypothesis {i+1}:")
+                logging.info(f"  Tokens: {hyp}")
+                text = sp.decode(hyp)
+                logging.info(f"  Text: {text}")
+    else:
+        # Single hypothesis as an integer or other format
+        logging.info(f"Result type: {type(hyps)}")
+        logging.info(f"Raw result: {hyps}")
     
     # Check if hyps is a DecodingResults object or list of hypotheses
     if hasattr(hyps, 'hyps'):
@@ -482,7 +499,7 @@ def transcribe_wav(wav_path: str,
         best_hyp = hyps.hyps[0]
     else:
         # Handle list of hypotheses format
-        best_hyp = hyps[0][0] if isinstance(hyps[0], tuple) else hyps[0]
+        best_hyp = hyps[0][0] if isinstance(hyps, list) and hyps and isinstance(hyps[0], tuple) else hyps
     
     logging.info(f"Best hypothesis: {best_hyp}")
     logging.info(f"Type of best hypothesis: {type(best_hyp)}")
@@ -502,7 +519,7 @@ def transcribe_wav(wav_path: str,
         logging.info(f"Token details:\n" + "\n".join(token_details))
     
     # Print total number of tokens
-    logging.info(f"Total tokens: {len(tokens)}")
+    logging.info(f"Total tokens: {len(tokens) if hasattr(tokens, '__len__') else 1}")
         
     text = sp.decode(tokens)
     

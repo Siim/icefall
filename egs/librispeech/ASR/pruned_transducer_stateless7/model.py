@@ -64,6 +64,10 @@ class Transducer(nn.Module):
         self.encoder = encoder
         self.decoder = decoder
         self.joiner = joiner
+        self.encoder_dim = encoder_dim
+        self.decoder_dim = decoder_dim
+        self.joiner_dim = joiner_dim
+        self.vocab_size = vocab_size
 
         self.simple_am_proj = nn.Linear(
             encoder_dim,
@@ -113,6 +117,16 @@ class Transducer(nn.Module):
         assert y.num_axes == 2, y.num_axes
 
         assert x.size(0) == x_lens.size(0) == y.dim0
+
+        # Handle input with shape [batch, channel, time] by permuting to [batch, time, channel]
+        if x.size(2) > x.size(1) and x.size(1) == 1:
+            x = x.permute(0, 2, 1)
+            # If it's a single channel, we can squeeze it out
+            if x.size(2) == 1:
+                x = x.squeeze(2)
+                # Add a dummy feature dimension if needed
+                if x.ndim == 2:
+                    x = x.unsqueeze(2)
 
         # x.T_dim == max(x_len)
         assert x.size(1) == x_lens.max().item(), (x.shape, x_lens, x_lens.max())

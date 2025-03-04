@@ -212,7 +212,7 @@ class EstonianDataset(Dataset):
         max_text_len = max(item["text_lens"].item() for item in batch)
         
         # Prepare tensors
-        inputs = torch.zeros(len(batch), 1, max_audio_len)
+        inputs = torch.zeros(len(batch), max_audio_len, 1)
         input_lens = torch.zeros(len(batch), dtype=torch.int64)
         texts = torch.zeros(len(batch), max_text_len, dtype=torch.int64)
         text_lens = torch.zeros(len(batch), dtype=torch.int64)
@@ -222,7 +222,7 @@ class EstonianDataset(Dataset):
             audio_len = item["input_lens"].item()
             text_len = item["text_lens"].item()
             
-            inputs[i, :, :audio_len] = item["inputs"]
+            inputs[i, :audio_len, 0] = item["inputs"].squeeze(0)
             input_lens[i] = audio_len
             
             if text_len > 0:

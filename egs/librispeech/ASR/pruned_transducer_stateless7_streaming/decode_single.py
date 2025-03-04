@@ -91,6 +91,13 @@ def get_parser():
         help="Number of frames for attention sink"
     )
 
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default="log",
+        help="Directory for saving logs"
+    )
+
     return parser
 
 def load_checkpoint(
@@ -234,7 +241,14 @@ def main():
     parser = get_parser()
     args = parser.parse_args()
     
-    setup_logger()
+    # Create log directory if it doesn't exist
+    log_dir = Path(args.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Set up logger with a filename based on the audio file being processed
+    audio_name = Path(args.audio_file).stem
+    log_file = log_dir / f"decode_{audio_name}.log"
+    setup_logger(log_file)
     
     # Load BPE model
     sp = spm.SentencePieceProcessor()
@@ -242,13 +256,17 @@ def main():
     
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"Using device: {device}")
     
     # Load model
     params, model = load_checkpoint(Path(args.checkpoint), device)
+    logging.info("Model loaded successfully")
     
     # Load and normalize audio
+    logging.info(f"Processing audio file: {args.audio_file}")
     audio, sample_rate = torchaudio.load(args.audio_file)
     audio = normalize_audio(audio, sample_rate)
+    logging.info(f"Audio shape after normalization: {audio.shape}")
     
     # Process in streaming mode
     with torch.no_grad():
@@ -264,6 +282,7 @@ def main():
             left_context_chunks=args.left_context_chunks,
             device=device
         )
+        logging.info(f"Encoder output shape: {encoder_out.shape}")
         
         # Create encoder output lengths
         encoder_out_lens = torch.tensor(
@@ -273,6 +292,7 @@ def main():
         )
         
         # Decode with beam search
+        logging.info(f"Decoding with beam size: {args.beam_size}")
         hyp_tokens = modified_beam_search(
             model=model,
             encoder_out=encoder_out,
@@ -286,6 +306,7 @@ def main():
         hyp = sp.decode(hyp_tokens[0].tolist())
         
         print(f"\nTranscription: {hyp}")
+        logging.info(f"Transcription: {hyp}")
 
 if __name__ == "__main__":
     main() 

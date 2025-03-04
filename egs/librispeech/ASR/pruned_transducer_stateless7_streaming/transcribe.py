@@ -463,8 +463,35 @@ def transcribe_wav(wav_path: str,
     # Log hypotheses for diagnosis
     logging.info(f"Number of hypotheses returned: {len(hyps)}")
     
-    # Get the best hypothesis
-    best_hyp = hyps[0][0]
+    # Detailed debug info for all hypotheses
+    for i, (hyp, score) in enumerate(hyps[:2]):  # Show top 2 hypotheses with scores
+        logging.info(f"Hypothesis {i+1}:")
+        if isinstance(hyp, int):
+            tokens = [hyp]
+        else:
+            tokens = hyp
+            
+        if len(tokens) <= 10:
+            token_texts = []
+            for token in tokens:
+                piece = sp.id_to_piece(token)
+                token_texts.append(f"{token} → '{piece}'")
+            logging.info(f"  Tokens: {', '.join(token_texts)}")
+        else:
+            logging.info(f"  First 10 tokens: {tokens[:10]}")
+            logging.info(f"  Last 5 tokens: {tokens[-5:]}")
+            
+        logging.info(f"  Score: {score}")
+        logging.info(f"  Text: {sp.decode(tokens)}")
+    
+    # Check if hyps is a DecodingResults object or list of hypotheses
+    if hasattr(hyps, 'hyps'):
+        # Handle DecodingResults object
+        best_hyp = hyps.hyps[0]
+    else:
+        # Handle list of hypotheses format
+        best_hyp = hyps[0][0] if isinstance(hyps[0], tuple) else hyps[0]
+    
     logging.info(f"Best hypothesis tokens: {best_hyp}")
     
     # Convert tokens to text
@@ -563,8 +590,9 @@ def main():
     
     # Set beam search parameters
     params.beam_size = args.beam_size if hasattr(args, 'beam_size') else 4
-    params.blank_penalty = args.blank_penalty if hasattr(args, 'blank_penalty') else 0.8
-    params.temperature = args.temperature if hasattr(args, 'temperature') else 1.0
+    # Use a higher blank penalty to discourage early termination
+    params.blank_penalty = 1.0  # Increased from 0.5 to encourage more tokens
+    params.temperature = 1.0
     
     # Set pretrained encoder configs
     params.pretrained_encoder = True

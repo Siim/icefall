@@ -128,7 +128,7 @@ def load_checkpoint(
         "use_xlsr": True,  # Default to using XLSR
         
         # XLSR specific parameters
-        "xlsr_model_name": "facebook/wav2vec2-xls-r-300m",
+        "xlsr_model_name": "facebook/wav2vec2-large-xlsr-53",  # Correct model name from train_xlsr.sh
         "decode_chunk_size": 5120,  # 320ms at 16kHz
         "frame_duration": 0.025,  # 25ms per frame
         "frame_stride": 0.020,    # 20ms stride
@@ -330,10 +330,18 @@ def main():
         )
         
         # Convert tokens to text
-        hyp = sp.decode(hyp_tokens[0].tolist())
+        hyps = []
+        for h in hyp_tokens:
+            # Check if h is a tensor or a list
+            if isinstance(h, torch.Tensor):
+                h_list = h.tolist()
+            else:
+                h_list = h
+            hyps.append(sp.decode(h_list))
         
-        print(f"\nTranscription: {hyp}")
-        logging.info(f"Transcription: {hyp}")
+        # Print the transcription
+        print(f"\nTranscription: {hyps[0]}")
+        logging.info(f"Transcription: {hyps[0]}")
 
 if __name__ == "__main__":
     main() 

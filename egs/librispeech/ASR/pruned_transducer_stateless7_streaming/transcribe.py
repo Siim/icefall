@@ -325,6 +325,7 @@ def main():
     params.encoder_type = "XLSR"
     params.encoder_dim = 1024  # XLSR output dimension is 1024
     params.encoder_dims = "1024,1024,1024,1024,1024,1024"  # Add the missing encoder_dims
+    params.encoder_unmasked_dims = "1024,1024,1024,1024,1024,1024"  # Add encoder_unmasked_dims
     params.joiner_dim = 512
     params.use_encoder_proj = True  # Enable projection layer from XLSR output to joiner
     

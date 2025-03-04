@@ -282,6 +282,13 @@ def get_parser():
         default=1,
         help="Number of GPUs for DDP training.",
     )
+    
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=16,
+        help="Batch size for training and validation.",
+    )
 
     parser.add_argument(
         "--master-port",
@@ -529,6 +536,7 @@ def get_params() -> AttributeDict:
             "feature_dim": 80,
             "subsampling_factor": 4,  # not passed in, this is fixed.
             "warm_step": 2000,
+            "batch_size": 16,  # Default batch size
             "env_info": get_env_info(),
         }
     )

@@ -248,88 +248,107 @@ def process_streaming_chunks(
     # Ensure feature is on the correct device
     feature = feature.to(device)
     
-    # Check if feature is 2D (batch, time) or 3D (batch, time, dim)
-    if feature.dim() == 3 and feature.size(2) > 1:
-        # Already processed features, just return them
-        logging.info(f"Input is already processed features with shape {feature.shape}")
-        return feature
+    # Get dimensions
+    batch_size, seq_len = feature.shape
     
-    # Create feature lengths for all sequences
-    batch_size = feature.shape[0]
-    feature_lens = torch.tensor([feature.shape[1]] * batch_size, device=device)
-    
-    # Use encoder directly if model is wrapped in DDP
+    # Use encoder directly if model is wrapped
     if hasattr(model, 'module'):
         encoder = model.module.encoder
     else:
         encoder = model.encoder
     
-    # Calculate number of chunks
-    total_frames = feature.size(1)
-    num_chunks = (total_frames + chunk_size - 1) // chunk_size
-    logging.info(f"Processing audio in {num_chunks} chunks of size {chunk_size}")
-    
-    # Set up chunk-based processing
-    # Each chunk will have left_context_chunks * chunk_size frames of left context
+    # Calculate the actual context size in samples
     left_context_size = left_context_chunks * chunk_size
     
-    # Initialize array to store encoder outputs
-    encoder_out_chunks = []
+    # Initialize the attention sink if needed
+    if attention_sink_size > 0:
+        # This will be initialized with actual frames later
+        attention_sink = None
+    else:
+        attention_sink = None
     
-    # Process each chunk
+    # Calculate number of chunks and log
+    num_chunks = (seq_len + chunk_size - 1) // chunk_size
+    logging.info(f"Processing audio in {num_chunks} chunks of size {chunk_size}")
+    
+    # Process the audio in chunks
+    outputs = []
+    cached_left_context = None
+    
     for i in range(num_chunks):
-        start_idx = max(0, i * chunk_size - left_context_size)
-        end_idx = min(total_frames, (i + 1) * chunk_size)
+        # Determine current chunk boundaries
+        chunk_start = i * chunk_size
+        chunk_end = min(chunk_start + chunk_size, seq_len)
+        current_chunk = feature[:, chunk_start:chunk_end]
         
-        # Extract chunk with left context
-        chunk = feature[:, start_idx:end_idx]
-        chunk_len = torch.tensor([chunk.size(1)], device=device)
+        logging.info(f"Processing chunk {i+1}/{num_chunks}: frames {chunk_start}:{chunk_end}, shape {current_chunk.shape}")
         
-        logging.info(f"Processing chunk {i+1}/{num_chunks}: frames {start_idx}:{end_idx}, shape {chunk.shape}")
+        # Add left context if available
+        if cached_left_context is not None:
+            context_size = min(left_context_size, cached_left_context.size(1))
+            with_context = torch.cat([
+                cached_left_context[:, -context_size:], 
+                current_chunk
+            ], dim=1)
+        else:
+            # For the first chunk, use available left context if any
+            context_size = min(left_context_size, chunk_start)
+            if context_size > 0:
+                left_pad = feature[:, chunk_start-context_size:chunk_start]
+                with_context = torch.cat([left_pad, current_chunk], dim=1)
+            else:
+                with_context = current_chunk
         
-        # Add attention sink if specified
-        if attention_sink_size > 0:
-            # Create attention sink (first few frames)
-            if i > 0 and start_idx > 0:
-                sink_start = 0
-                sink_end = min(attention_sink_size, total_frames)
-                attention_sink = feature[:, sink_start:sink_end]
-                
-                # Prepend attention sink to the chunk
-                chunk = torch.cat([attention_sink, chunk], dim=1)
-                chunk_len = torch.tensor([chunk.size(1)], device=device)
-                logging.info(f"Added attention sink of size {attention_sink.size(1)}")
+        # Create lengths tensor for this chunk
+        chunk_lens = torch.tensor([with_context.size(1)] * batch_size, device=device)
         
         # Process through encoder
         with torch.no_grad():
-            chunk_out, _ = encoder(x=chunk, x_lens=chunk_len)
+            chunk_out, _ = encoder(x=with_context, x_lens=chunk_lens)
         
-        # If this is the first chunk, keep everything
-        # Otherwise, only keep the portion corresponding to the current chunk
-        if i == 0:
-            # Keep the full output for the first chunk
-            encoder_out_chunks.append(chunk_out)
-        else:
-            # For subsequent chunks, ignore the left context portion
-            left_ctx_frames = left_context_size // 4  # Assuming 4x downsampling in encoder
-            attn_sink_frames = attention_sink_size // 4 if attention_sink_size > 0 else 0
-            
-            # Calculate start index in encoder output
-            # This depends on the encoder's downsampling ratio
-            start_offset = left_ctx_frames + attn_sink_frames
-            
-            if start_offset < chunk_out.size(1):
-                encoder_out_chunks.append(chunk_out[:, start_offset:])
+        # Apply attention sink mechanism if enabled
+        if attention_sink_size > 0:
+            if attention_sink is not None:
+                # Prepend attention sink tokens to the chunk output
+                chunk_out_with_sink = torch.cat([attention_sink, chunk_out], dim=1)
+                
+                # Keep only the output excluding the sink portion
+                chunk_result = chunk_out_with_sink[:, attention_sink.size(1):]
+                
+                # Update sink with last n frames
+                attention_sink = chunk_out[:, -min(attention_sink_size, chunk_out.size(1)):]
             else:
-                logging.warning(f"Start offset {start_offset} exceeds chunk output size {chunk_out.size(1)}")
-                # Use the last frame as a fallback
-                encoder_out_chunks.append(chunk_out[:, -1:])
+                # For first chunk, initialize attention sink and use full output
+                chunk_result = chunk_out
+                attention_sink = chunk_out[:, -min(attention_sink_size, chunk_out.size(1)):]
+                logging.info(f"Added attention sink of size {attention_sink.size(1)}")
+        else:
+            # If not using attention sink, still need to trim left context
+            downsample_factor = 4  # Assuming 4x downsampling in encoder
+            left_context_frames = context_size // downsample_factor
+            
+            if left_context_frames < chunk_out.size(1):
+                chunk_result = chunk_out[:, left_context_frames:]
+            else:
+                logging.warning(f"Left context frames {left_context_frames} exceeds chunk output size {chunk_out.size(1)}")
+                chunk_result = chunk_out[:, -1:]
+        
+        # Store result
+        outputs.append(chunk_result)
+        
+        # Update cached context
+        cached_left_context = current_chunk
     
     # Concatenate all chunks
-    encoder_out = torch.cat(encoder_out_chunks, dim=1)
-    logging.info(f"Combined encoder output shape: {encoder_out.shape}")
-    
-    return encoder_out
+    if outputs:
+        encoder_out = torch.cat(outputs, dim=1)
+        logging.info(f"Combined encoder output shape: {encoder_out.shape}")
+        return encoder_out
+    else:
+        logging.warning("No outputs generated during streaming processing")
+        # Return empty tensor with correct dimensions
+        output_dim = encoder.output_dim if hasattr(encoder, 'output_dim') else 1024
+        return torch.zeros((batch_size, 0, output_dim), device=device)
 
 def main():
     parser = get_parser()
@@ -352,23 +371,42 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
     
-    # Load model
-    params, model = load_checkpoint(Path(args.checkpoint), device)
-    logging.info(f"Model loaded successfully with parameters: {params}")
-    
-    # Load and normalize audio
-    logging.info(f"Processing audio file: {args.audio_file}")
-    audio, sample_rate = torchaudio.load(args.audio_file)
-    audio = normalize_audio(audio, sample_rate)
-    logging.info(f"Audio shape after normalization: {audio.shape}, sample rate: {sample_rate}")
-    
-    # Move audio to device
-    audio = audio.to(device)
-    
     # Process with no gradient calculation
     with torch.no_grad():
-        # Process directly through encoder in non-streaming mode
-        logging.info("Using non-streaming mode for decoding")
+        # Load model
+        logging.info(f"Loading model from checkpoint")
+        params, model = load_checkpoint(Path(args.checkpoint), device)
+        logging.info(f"Model loaded successfully with parameters: {params}")
+        
+        # Load and normalize audio
+        logging.info(f"Processing audio file: {args.audio_file}")
+        waveform, sample_rate = torchaudio.load(args.audio_file)
+        
+        # Verify sample rate
+        if sample_rate != 16000:
+            logging.info(f"Resampling audio from {sample_rate}Hz to 16000Hz")
+            resampler = torchaudio.transforms.Resample(sample_rate, 16000)
+            waveform = resampler(waveform)
+            sample_rate = 16000
+        
+        # Check that audio is mono
+        if waveform.dim() > 1 and waveform.shape[0] > 1:
+            logging.warning(f"Audio should be mono, got {waveform.shape[0]} channels. Converting to mono.")
+            waveform = waveform.mean(dim=0, keepdim=True)
+        
+        # Check normalization range (similar to EstonianDataset._verify_audio)
+        min_val, max_val = waveform.min().item(), waveform.max().item()
+        if min_val < -1.01 or max_val > 1.01:
+            logging.info(f"Audio values outside range [-1, 1]: min={min_val:.4f}, max={max_val:.4f}. Normalizing.")
+            # Normalize to [-1, 1]
+            if waveform.abs().max() > 0:
+                waveform = waveform / waveform.abs().max()
+        
+        # Log audio stats
+        logging.info(f"Normalized audio shape: {waveform.shape}, range: [{waveform.min().item():.2f}, {waveform.max().item():.2f}], std: {waveform.std().item():.6f}")
+        
+        # Move audio to device
+        waveform = waveform.to(device)
         
         # Get encoder directly
         if hasattr(model, 'module'):
@@ -390,7 +428,7 @@ def main():
             # Process in streaming chunks
             encoder_out = process_streaming_chunks(
                 model=model,
-                feature=audio,
+                feature=waveform,
                 chunk_size=args.chunk_size,
                 attention_sink_size=args.attention_sink_size,
                 left_context_chunks=args.left_context_chunks,
@@ -400,9 +438,9 @@ def main():
         else:
             # Get encoder output directly (no chunking)
             logging.info("Processing full audio without chunking")
-            feature_lens = torch.tensor([audio.size(1)], device=device)
+            feature_lens = torch.tensor([waveform.size(1)], device=device)
             encoder_out, encoder_out_lens = encoder(
-                x=audio,
+                x=waveform,
                 x_lens=feature_lens
             )
         
@@ -440,18 +478,18 @@ def main():
         # Import the modified_beam_search function
         from beam_search import modified_beam_search
         
-        # Use a much higher blank penalty to strongly discourage repetitions
-        effective_blank_penalty = args.blank_penalty + 3.0  # Use a very high penalty
+        # Use a moderate blank penalty - 0.5 is used in training
+        effective_blank_penalty = args.blank_penalty + 0.5  # Use same as training
         logging.info(f"Using effective blank penalty: {effective_blank_penalty} (base: {args.blank_penalty})")
         
-        # Use the exact same beam search parameters as in validation, but with higher blank penalty
+        # Use the exact same beam search parameters as in validation
         hyp_tokens = modified_beam_search(
             model=model,
             encoder_out=encoder_out,
             encoder_out_lens=encoder_out_lens,
             beam=args.beam_size,
-            temperature=1.0,  # Use fixed temperature of 1.0 as in validation
-            blank_penalty=effective_blank_penalty  # Use increased blank penalty to discourage repetitions
+            temperature=1.0,
+            blank_penalty=effective_blank_penalty
         )
         
         # Log the raw token IDs for debugging

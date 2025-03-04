@@ -25,11 +25,13 @@ from train import (
     get_decoder_model
 )
 
+# Import beam search functions
+from beam_search import modified_beam_search
+
 # Import XLSR encoder and other components
 from encoder_interface import EncoderInterface
 from xlsr_encoder import XLSREncoder
 from model import Transducer
-from beam_search import modified_beam_search
 
 # Override get_encoder_model to create XLSR encoder directly
 def get_encoder_model(params: AttributeDict):
@@ -350,28 +352,35 @@ def transcribe_wav(wav_path: str,
     # Decode using beam search
     start_time = time.time()
     
+    # Call modified_beam_search with the parameters it accepts
     hyps = modified_beam_search(
         model=model,
         encoder_out=encoder_out,
         encoder_out_lens=encoder_out_lens,
         beam=params.beam_size,
-        max_states=params.max_states,
-        max_contexts=params.max_contexts,
-        blank_penalty=params.blank_penalty,
+        blank_penalty=getattr(params, 'blank_penalty', 0.0),
+        temperature=getattr(params, 'temperature', 1.0),
+        return_timestamps=False,
     )
     
     end_time = time.time()
     latency = end_time - start_time
     logging.info(f"Beam search took {latency:.3f} seconds")
     
-    # Convert predictions to text
-    hyps_texts = [sp.decode(hyp["tokens"]) for hyp in hyps]
+    # Get the best hypothesis
+    best_hyp = hyps[0][0]
     
-    # Return best hypothesis (first one)
-    transcript = hyps_texts[0]
-    logging.info(f"Transcript: {transcript}")
+    # Convert tokens to text
+    if isinstance(best_hyp, int):
+        tokens = [best_hyp]
+    else:
+        tokens = best_hyp
+        
+    text = sp.decode(tokens)
     
-    return transcript
+    logging.info(f"Transcription: {text}")
+    
+    return text
 
 
 def load_checkpoint_if_available(params: AttributeDict, model: torch.nn.Module):
@@ -444,6 +453,11 @@ def main():
     params.use_attention_sink = True
     params.attention_sink_size = args.attention_sink_size
     params.left_context_chunks = args.left_context_chunks
+    
+    # Set beam search parameters
+    params.beam_size = args.beam_size
+    params.blank_penalty = 0.0
+    params.temperature = 1.0
     
     # Set pretrained encoder configs
     params.pretrained_encoder = True

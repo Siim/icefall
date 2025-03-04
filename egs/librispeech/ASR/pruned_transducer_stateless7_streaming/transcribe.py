@@ -16,11 +16,10 @@ from torch.nn.utils.rnn import pad_sequence
 from icefall.utils import AttributeDict, setup_logger
 import sentencepiece as spm
 
-# Import train functions except for get_transducer_model and get_encoder_model
+# Import train functions except for get_transducer_model, get_encoder_model, and load_checkpoint_if_available
 from train import (
     add_model_arguments,
     get_params,
-    load_checkpoint_if_available,
     process_streaming_chunks,
     get_joiner_model,
     get_decoder_model
@@ -373,6 +372,32 @@ def transcribe_wav(wav_path: str,
     logging.info(f"Transcript: {transcript}")
     
     return transcript
+
+
+def load_checkpoint_if_available(params: AttributeDict, model: torch.nn.Module):
+    """Simplified function to load checkpoint for inference only.
+    
+    Args:
+        params: Configuration parameters.
+        model: The model to load checkpoint for.
+    """
+    checkpoint_path = params.checkpoint
+    
+    if checkpoint_path is None:
+        return None
+    
+    logging.info(f"Loading checkpoint from {checkpoint_path}")
+    
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    
+    if isinstance(checkpoint, dict) and "model" in checkpoint:
+        logging.info("Loading model parameters from checkpoint['model']")
+        model.load_state_dict(checkpoint["model"], strict=False)
+    else:
+        logging.info("Loading model parameters directly")
+        model.load_state_dict(checkpoint, strict=False)
+    
+    return None
 
 
 def main():

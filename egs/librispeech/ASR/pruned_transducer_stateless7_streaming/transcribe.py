@@ -145,7 +145,7 @@ def get_parser():
     parser.add_argument(
         "--streaming",
         type=bool,
-        default=True,
+        default=False,
         help="Whether to use streaming mode for transcription",
     )
 

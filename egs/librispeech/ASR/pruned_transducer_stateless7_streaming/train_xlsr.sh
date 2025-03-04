@@ -48,7 +48,7 @@ python "$WORKSPACE_DIR/train.py" \
     --decode-chunk-size=8000 \
     --attention-sink-size=16 \
     --left-context-chunks=1 \
-    --num-epochs=5 \
+    --num-epochs=30 \
     --lr-epochs=10 \
     --base-lr=3e-5 \
     --train-txt="$DATA_DIR/train_list.txt" \
@@ -63,6 +63,7 @@ python "$WORKSPACE_DIR/train.py" \
     --world-size=1 \
     --batch-size=8 \
     --dataset="estonian" \
-    --use-fp16=false
+    --use-fp16=false \
+    --start-epoch 6
 
 echo "Training completed. Models saved to $EXP_DIR" 

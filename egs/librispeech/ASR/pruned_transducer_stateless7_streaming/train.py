@@ -767,13 +767,20 @@ def compute_loss(
     assert feature.ndim == 3
     feature = feature.to(device)
 
-    supervisions = batch["supervisions"]
-    feature_lens = supervisions["num_frames"].to(device)
-
+    # Handle different batch structures based on dataset type
+    if isinstance(batch["supervisions"], list):
+        # Estonian dataset structure
+        feature_lens = batch["input_lens"].to(device)
+        texts = [supervision["text"] for supervision in batch["supervisions"]]
+    else:
+        # Original dataset structure
+        supervisions = batch["supervisions"]
+        feature_lens = supervisions["num_frames"].to(device)
+        texts = batch["supervisions"]["text"]
+    
     batch_idx_train = params.batch_idx_train
     warm_step = params.warm_step
 
-    texts = batch["supervisions"]["text"]
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
 
@@ -903,7 +910,14 @@ def train_one_epoch(
 
     for batch_idx, batch in enumerate(train_dl):
         params.batch_idx_train += 1
-        batch_size = len(batch["supervisions"]["text"])
+        
+        # Handle different batch structures based on dataset type
+        if isinstance(batch["supervisions"], list):
+            # Estonian dataset structure
+            batch_size = len(batch["supervisions"])
+        else:
+            # Original dataset structure
+            batch_size = len(batch["supervisions"]["text"])
 
         try:
             with autocast('cuda', enabled=params.use_fp16):
@@ -1343,14 +1357,18 @@ def display_and_save_batch(
     logging.info(f"Saving batch to {filename}")
     torch.save(batch, filename)
 
-    supervisions = batch["supervisions"]
+    # Handle different batch structures
     features = batch["inputs"]
-
     logging.info(f"features shape: {features.shape}")
-
-    y = sp.encode(supervisions["text"], out_type=int)
-    num_tokens = sum(len(i) for i in y)
-    logging.info(f"num tokens: {num_tokens}")
+    
+    if isinstance(batch["supervisions"], list):
+        # Estonian dataset structure
+        texts = [supervision["text"] for supervision in batch["supervisions"]]
+        logging.info(f"Number of utterances: {len(texts)}")
+    else:
+        # Original dataset structure
+        supervisions = batch["supervisions"]
+        logging.info(f"supervisions shape: {supervisions['text'].shape}")
 
 
 def scan_pessimistic_batches_for_oom(

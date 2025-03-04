@@ -293,8 +293,13 @@ def main():
     parser = get_parser()
     args = parser.parse_args()
     
-    # Setup logger
-    setup_logger(f"transcribe_{Path(args.wav_file).stem}")
+    # Create logs directory if it doesn't exist
+    log_dir = Path("pruned_transducer_stateless7_streaming/logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Setup logger with proper file path
+    log_filename = log_dir / f"transcribe_{Path(args.wav_file).stem}.log"
+    setup_logger(log_filename)
     
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

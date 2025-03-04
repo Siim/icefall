@@ -575,9 +575,18 @@ def load_checkpoint_if_available(params: AttributeDict, model: torch.nn.Module):
     
     return None
 
+class AttributeDict(dict):
+    """A dictionary that allows attribute-style access while still functioning as a dict."""
+    def __getattr__(self, key):
+        if key in self:
+            return self[key]
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{key}'")
+    
+    def __setattr__(self, key, value):
+        self[key] = value
+
 def convert_args_to_params(args):
     """Convert command line args to AttributeDict params."""
-    from lhotse.utils import AttributeDict
     params = AttributeDict()
     # Convert all args to AttributeDict
     params.update(vars(args))

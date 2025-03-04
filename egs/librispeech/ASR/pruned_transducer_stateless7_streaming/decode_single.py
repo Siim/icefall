@@ -140,6 +140,22 @@ def load_checkpoint(
             }
         )
     
+    # Add XLSR-specific parameters if they don't exist
+    if not hasattr(params, "frame_duration"):
+        params.frame_duration = 0.025  # 25ms per frame
+    
+    if not hasattr(params, "frame_stride"):
+        params.frame_stride = 0.020  # 20ms stride
+    
+    if not hasattr(params, "context_frames"):
+        params.context_frames = 10  # Default context frames
+    
+    if not hasattr(params, "transition_frames"):
+        params.transition_frames = 5  # Default transition frames
+    
+    if not hasattr(params, "downsample_factor"):
+        params.downsample_factor = 320  # For wav2vec2/XLSR models
+    
     # Create model
     model = get_transducer_model(params)
     
@@ -157,27 +173,48 @@ def normalize_audio(
     sample_rate: int,
     target_sample_rate: int = 16000,
 ) -> torch.Tensor:
-    """Normalize and resample audio if needed."""
-    # Resample if necessary
-    if sample_rate != target_sample_rate:
-        audio = torchaudio.functional.resample(
-            audio, 
-            sample_rate, 
-            target_sample_rate
-        )
-
-    # Convert to mono if stereo
-    if audio.shape[0] > 1:
-        audio = torch.mean(audio, dim=0, keepdim=True)
-
-    # Normalize to [-1, 1]
-    if audio.abs().max() > 1.0:
-        audio = audio / audio.abs().max()
-
-    # Ensure audio is in the format [channels, samples]
+    """Normalize audio to [-1, 1] range and resample if needed.
+    
+    Args:
+        audio: Audio tensor of shape (channels, time) or (time,)
+        sample_rate: Original sample rate
+        target_sample_rate: Target sample rate (default: 16kHz)
+        
+    Returns:
+        Normalized audio tensor of shape (batch=1, time)
+    """
+    # Ensure audio is 2D: (channels, time)
     if audio.dim() == 1:
         audio = audio.unsqueeze(0)  # Add channel dimension
-        
+    
+    # Resample if needed
+    if sample_rate != target_sample_rate:
+        logging.info(f"Resampling audio from {sample_rate}Hz to {target_sample_rate}Hz")
+        audio = torchaudio.functional.resample(
+            audio, 
+            orig_freq=sample_rate, 
+            new_freq=target_sample_rate
+        )
+    
+    # Convert to mono if stereo
+    if audio.size(0) > 1:
+        logging.info(f"Converting {audio.size(0)} channels to mono")
+        audio = torch.mean(audio, dim=0, keepdim=True)
+    
+    # Normalize to [-1, 1]
+    if audio.abs().max() > 0:
+        audio = audio / audio.abs().max()
+    
+    # Ensure shape is (batch=1, time)
+    if audio.dim() == 2 and audio.size(0) == 1:
+        # Shape is already (1, time)
+        pass
+    else:
+        # Reshape to (1, time)
+        audio = audio.reshape(1, -1)
+    
+    logging.info(f"Normalized audio shape: {audio.shape}, range: [{audio.min():.2f}, {audio.max():.2f}]")
+    
     return audio
 
 def process_streaming_chunks(
@@ -207,9 +244,6 @@ def process_streaming_chunks(
         logging.info(f"Input is already processed features with shape {feature.shape}")
         return feature
     
-    # For now, use non-streaming mode since the model is in pre-training phase
-    logging.info(f"Processing in non-streaming mode for feature shape {feature.shape}")
-    
     # Create feature lengths for all sequences
     batch_size = feature.shape[0]
     feature_lens = torch.tensor([feature.shape[1]] * batch_size, device=device)
@@ -220,8 +254,13 @@ def process_streaming_chunks(
     else:
         encoder = model.encoder
     
-    # Process the full audio sequence
-    encoder_out, _ = encoder(feature, feature_lens)
+    # Process in non-streaming mode (since model is in pre-training phase)
+    logging.info("Using full sequence processing for decoding (pre-training mode)")
+    encoder_out, _ = encoder(
+        x=feature,
+        x_lens=feature_lens
+    )
+    
     logging.info(f"Encoder output shape: {encoder_out.shape}")
     
     return encoder_out

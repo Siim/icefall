@@ -21,6 +21,10 @@ streaming=0
 chunk_size=32
 left_context_chunks=1
 attention_sink_size=0
+et_manifest_dir="data/ssl"
+bpe_model="Data/lang_bpe_2500/bpe.model"
+use_custom_dataset=0
+filter_cuts=0
 
 # Parse command-line arguments
 while [[ $# -gt 0 ]]; do
@@ -70,6 +74,27 @@ while [[ $# -gt 0 ]]; do
       stage=$2
       shift 2
       ;;
+    --et-manifest-dir)
+      et_manifest_dir=$2
+      shift 2
+      ;;
+    --manifest-dir)
+      # For backward compatibility, treat as et-manifest-dir
+      et_manifest_dir=$2
+      shift 2
+      ;;
+    --bpe-model)
+      bpe_model=$2
+      shift 2
+      ;;
+    --use-custom-dataset)
+      use_custom_dataset=$2
+      shift 2
+      ;;
+    --filter-cuts)
+      filter_cuts=$2
+      shift 2
+      ;;
     *)
       echo "Unknown option: $1"
       exit 1
@@ -92,13 +117,18 @@ python train.py \
   --exp-dir ${exp_dir} \
   --seed ${seed} \
   --max-duration ${max_duration} \
-  --bpe-model Data/lang_bpe_2500/bpe.model \
+  --bpe-model ${bpe_model} \
   --use-fp16 1 \
   --use-xlsr-encoder ${use_xlsr_encoder} \
   --streaming ${streaming} \
   --encoder-dim ${encoder_dim} \
   --chunk-size ${chunk_size} \
   --left-context-chunks ${left_context_chunks} \
-  --attention-sink-size ${attention_sink_size}
+  --attention-sink-size ${attention_sink_size} \
+  --et-manifest-dir ${et_manifest_dir} \
+  --mini-libri 0 \
+  --full-libri 0 \
+  --use-custom-dataset ${use_custom_dataset} \
+  --filter-cuts ${filter_cuts}
 
 echo "Training completed!" 

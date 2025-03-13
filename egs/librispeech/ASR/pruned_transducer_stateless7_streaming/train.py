@@ -433,6 +433,27 @@ def get_parser():
         help="Attention sink size for the XLSR encoder.",
     )
 
+    parser.add_argument(
+        "--et-manifest-dir",
+        type=str,
+        default="data/ssl",
+        help="Directory containing the Estonian dataset manifests with XLSR features",
+    )
+
+    parser.add_argument(
+        "--use-custom-dataset",
+        type=str2bool,
+        default=False,
+        help="Whether to use custom Estonian dataset instead of LibriSpeech",
+    )
+
+    parser.add_argument(
+        "--filter-cuts",
+        type=str2bool,
+        default=False,
+        help="Whether to filter short and long utterances",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -519,6 +540,10 @@ def get_params() -> AttributeDict:
             "chunk_size": 32,  # 32 frames = ~640ms with 20ms stride
             "left_context_chunks": 1,
             "attention_sink_size": 0,
+            # parameters for custom dataset
+            "use_custom_dataset": False,
+            "et_manifest_dir": "data/ssl",
+            "filter_cuts": False,
         }
     )
 
@@ -1132,85 +1157,78 @@ def run(rank, world_size, args):
     if params.inf_check:
         register_inf_check_hooks(model)
 
-    librispeech = LibriSpeechAsrDataModule(args)
+    # Load the dataset
+    if params.use_custom_dataset:
+        logging.info(f"Using custom Estonian dataset from {params.et_manifest_dir}")
+        
+        # Load Estonian SSL features instead of LibriSpeech
+        from lhotse import CutSet
+        
+        train_cuts = CutSet.from_file(f"{params.et_manifest_dir}/et_cuts_train.jsonl.gz")
+        valid_cuts = CutSet.from_file(f"{params.et_manifest_dir}/et_cuts_val.jsonl.gz")
+        
+        logging.info(f"Loaded {len(train_cuts)} training cuts and {len(valid_cuts)} validation cuts")
 
-    assert not (
-        params.mini_libri and params.full_libri
-    ), f"Cannot set both mini-libri and full-libri flags to True, now mini-libri {params.mini_libri} and full-libri {params.full_libri}"
+        # Apply filtering if requested
+        if params.filter_cuts:
+            logging.info("Filtering short and long utterances")
+            # Create a function that has sp already applied
+            filter_fn = lambda c: remove_short_and_long_utt(c, sp)
+            train_cuts = train_cuts.filter(filter_fn)
+            logging.info(f"After filtering: {len(train_cuts)} training cuts")
 
-    if params.mini_libri:
-        train_cuts = librispeech.train_clean_5_cuts()
-    else:
-        if params.full_libri:
-            train_cuts = librispeech.train_all_shuf_cuts()
-
-            # previously we used the following code to load all training cuts,
-            # strictly speaking, shuffled training cuts should be used instead,
-            # but we leave the code here to demonstrate that there is an option
-            # like this to combine multiple cutsets
-
-            # train_cuts = librispeech.train_clean_100_cuts()
-            # train_cuts += librispeech.train_clean_360_cuts()
-            # train_cuts += librispeech.train_other_500_cuts()
+        # Create the dataloaders for our custom dataset
+        if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
+            sampler_state_dict = checkpoints["sampler"]
         else:
-            train_cuts = librispeech.train_clean_100_cuts()
+            sampler_state_dict = None
 
-    def remove_short_and_long_utt(c: Cut):
-        # Keep only utterances with duration between 1 second and 20 seconds
-        #
-        # Caution: There is a reason to select 20.0 here. Please see
-        # ../local/display_manifest_statistics.py
-        #
-        # You should use ../local/display_manifest_statistics.py to get
-        # an utterance duration distribution for your dataset to select
-        # the threshold
-        if c.duration < 1.0 or c.duration > 20.0:
-            logging.warning(
-                f"Exclude cut with ID {c.id} from training. Duration: {c.duration}"
-            )
-            return False
-
-        # In pruned RNN-T, we require that T >= S
-        # where T is the number of feature frames after subsampling
-        # and S is the number of tokens in the utterance
-
-        # In ./zipformer.py, the conv module uses the following expression
-        # for subsampling
-        T = ((c.num_frames - 7) // 2 + 1) // 2
-        tokens = sp.encode(c.supervisions[0].text, out_type=str)
-
-        if T < len(tokens):
-            logging.warning(
-                f"Exclude cut with ID {c.id} from training. "
-                f"Number of frames (before subsampling): {c.num_frames}. "
-                f"Number of frames (after subsampling): {T}. "
-                f"Text: {c.supervisions[0].text}. "
-                f"Tokens: {tokens}. "
-                f"Number of tokens: {len(tokens)}"
-            )
-            return False
-
-        return True
-
-    # train_cuts = train_cuts.filter(remove_short_and_long_utt)
-
-    if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
-        # We only load the sampler's state dict when it loads a checkpoint
-        # saved in the middle of an epoch
-        sampler_state_dict = checkpoints["sampler"]
+        librispeech = LibriSpeechAsrDataModule(args)
+        train_dl = librispeech.train_dataloaders(
+            train_cuts, sampler_state_dict=sampler_state_dict
+        )
+        valid_dl = librispeech.valid_dataloaders(valid_cuts)
     else:
-        sampler_state_dict = None
+        # Use the standard LibriSpeech dataset
+        librispeech = LibriSpeechAsrDataModule(args)
 
-    train_dl = librispeech.train_dataloaders(
-        train_cuts, sampler_state_dict=sampler_state_dict
-    )
+        assert not (
+            params.mini_libri and params.full_libri
+        ), f"Cannot set both mini-libri and full-libri flags to True, now mini-libri {params.mini_libri} and full-libri {params.full_libri}"
 
-    if params.mini_libri:
-        valid_cuts = librispeech.dev_clean_2_cuts()
-    else:
-        valid_cuts = librispeech.dev_clean_cuts()
-        valid_cuts += librispeech.dev_other_cuts()
-    valid_dl = librispeech.valid_dataloaders(valid_cuts)
+        if params.mini_libri:
+            train_cuts = librispeech.train_clean_5_cuts()
+        else:
+            if params.full_libri:
+                train_cuts = librispeech.train_all_shuf_cuts()
+            else:
+                train_cuts = librispeech.train_clean_100_cuts()
+
+        # Apply filtering if requested
+        if params.filter_cuts:
+            logging.info("Filtering short and long utterances")
+            # Create a function that has sp already applied
+            filter_fn = lambda c: remove_short_and_long_utt(c, sp)
+            train_cuts = train_cuts.filter(filter_fn)
+            logging.info(f"After filtering: {len(train_cuts)} training cuts")
+
+        if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:
+            # We only load the sampler's state dict when it loads a checkpoint
+            # saved in the middle of an epoch
+            sampler_state_dict = checkpoints["sampler"]
+        else:
+            sampler_state_dict = None
+
+        train_dl = librispeech.train_dataloaders(
+            train_cuts, sampler_state_dict=sampler_state_dict
+        )
+
+        if params.mini_libri:
+            valid_cuts = librispeech.dev_clean_2_cuts()
+        else:
+            valid_cuts = librispeech.dev_clean_cuts()
+            valid_cuts += librispeech.dev_other_cuts()
+        valid_dl = librispeech.valid_dataloaders(valid_cuts)
 
     # if not params.print_diagnostics:
     #     scan_pessimistic_batches_for_oom(
@@ -1345,6 +1363,44 @@ def scan_pessimistic_batches_for_oom(
         logging.info(
             f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
         )
+
+
+def remove_short_and_long_utt(c: Cut, sp: spm.SentencePieceProcessor):
+    # Keep only utterances with duration between 1 second and 20 seconds
+    #
+    # Caution: There is a reason to select 20.0 here. Please see
+    # ../local/display_manifest_statistics.py
+    #
+    # You should use ../local/display_manifest_statistics.py to get
+    # an utterance duration distribution for your dataset to select
+    # the threshold
+    if c.duration < 1.0 or c.duration > 20.0:
+        logging.warning(
+            f"Exclude cut with ID {c.id} from training. Duration: {c.duration}"
+        )
+        return False
+
+    # In pruned RNN-T, we require that T >= S
+    # where T is the number of feature frames after subsampling
+    # and S is the number of tokens in the utterance
+
+    # In ./zipformer.py, the conv module uses the following expression
+    # for subsampling
+    T = ((c.num_frames - 7) // 2 + 1) // 2
+    tokens = sp.encode(c.supervisions[0].text, out_type=str)
+
+    if T < len(tokens):
+        logging.warning(
+            f"Exclude cut with ID {c.id} from training. "
+            f"Number of frames (before subsampling): {c.num_frames}. "
+            f"Number of frames (after subsampling): {T}. "
+            f"Text: {c.supervisions[0].text}. "
+            f"Tokens: {tokens}. "
+            f"Number of tokens: {len(tokens)}"
+        )
+        return False
+
+    return True
 
 
 def main():

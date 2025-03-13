@@ -894,7 +894,14 @@ def compute_validation_loss(
     if world_size > 1:
         tot_loss.reduce(loss.device)
 
-    loss_value = tot_loss["loss"] / tot_loss["frames"]
+    # Avoid division by zero
+    if tot_loss["frames"] > 0:
+        loss_value = tot_loss["loss"] / tot_loss["frames"]
+    else:
+        loss_value = 0.0
+        logging.warning("No frames were processed in this epoch. Check your data filtering.")
+    params.train_loss = loss_value
+
     if loss_value < params.best_valid_loss:
         params.best_valid_epoch = params.cur_epoch
         params.best_valid_loss = loss_value
@@ -1198,7 +1205,7 @@ def run(rank, world_size, args):
             logging.info("Filtering short and long utterances")
             # Create a function that has sp already applied
             filter_fn = lambda c: remove_short_and_long_utt(c, sp)
-            train_cuts = train_cuts.filter(filter_fn)
+            train_cuts = train_cuts.filter(filter_fn).to_eager()
             logging.info(f"After filtering: {len(train_cuts)} training cuts")
 
         # Create the dataloaders for our custom dataset
@@ -1233,7 +1240,7 @@ def run(rank, world_size, args):
             logging.info("Filtering short and long utterances")
             # Create a function that has sp already applied
             filter_fn = lambda c: remove_short_and_long_utt(c, sp)
-            train_cuts = train_cuts.filter(filter_fn)
+            train_cuts = train_cuts.filter(filter_fn).to_eager()
             logging.info(f"After filtering: {len(train_cuts)} training cuts")
 
         if params.start_batch > 0 and checkpoints and "sampler" in checkpoints:

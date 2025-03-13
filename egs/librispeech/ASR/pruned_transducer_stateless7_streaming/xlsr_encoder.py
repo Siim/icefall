@@ -18,6 +18,7 @@ class XLSREncoder(EncoderInterface):
         subsampling_factor: int = 2,
         dropout: float = 0.1,
         use_feat_proj: bool = True,
+        model_name: str = "TalTechNLP/xls-r-300m-et",  # Using Estonian-specific XLS-R
     ):
         super().__init__()
         
@@ -38,6 +39,7 @@ class XLSREncoder(EncoderInterface):
         self.feature_dim = feature_dim
         self.output_dim = output_dim
         self.subsampling_factor = subsampling_factor
+        self.model_name = model_name
         
         # Enhanced feature projection with multi-layer adaptation
         if use_feat_proj:
@@ -120,6 +122,7 @@ class StreamingXLSREncoder(XLSREncoder):
         chunk_size: int = 32,  # 32 frames = ~640ms with 20ms stride
         left_context_chunks: int = 1,
         attention_sink_size: int = 0,
+        model_name: str = "TalTechNLP/xls-r-300m-et",  # Using Estonian-specific XLS-R
     ):
         # Make sure feature_dim and output_dim are handled properly
         # by the parent class initialization
@@ -129,6 +132,7 @@ class StreamingXLSREncoder(XLSREncoder):
             subsampling_factor=subsampling_factor,
             dropout=dropout,
             use_feat_proj=use_feat_proj,
+            model_name=model_name,
         )
         
         # Convert chunk parameters to integers if they are strings
@@ -250,7 +254,7 @@ class HFXLSREncoder(EncoderInterface):
     """
     def __init__(
         self,
-        model_name: str = "facebook/wav2vec2-large-xlsr-53",
+        model_name: str = "TalTechNLP/xls-r-300m-et",
         output_dim: int = 1024,  # Updated to match paper recommendations
         subsampling_factor: int = 2,
         dropout: float = 0.1,

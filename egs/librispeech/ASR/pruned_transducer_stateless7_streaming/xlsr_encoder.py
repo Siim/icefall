@@ -18,7 +18,7 @@ class XLSREncoder(EncoderInterface):
         subsampling_factor: int = 2,
         dropout: float = 0.1,
         use_feat_proj: bool = True,
-        model_name: str = "TalTechNLP/xls-r-300m-et",  # Using Estonian-specific XLS-R
+        model_name: str = "facebook/wav2vec2-xls-r-2b",  # Using the larger 2B parameter model
     ):
         super().__init__()
         
@@ -122,7 +122,7 @@ class StreamingXLSREncoder(XLSREncoder):
         chunk_size: int = 32,  # 32 frames = ~640ms with 20ms stride
         left_context_chunks: int = 1,
         attention_sink_size: int = 0,
-        model_name: str = "TalTechNLP/xls-r-300m-et",  # Using Estonian-specific XLS-R
+        model_name: str = "facebook/wav2vec2-xls-r-2b",  # Using the larger 2B parameter model
     ):
         # Make sure feature_dim and output_dim are handled properly
         # by the parent class initialization
@@ -254,7 +254,7 @@ class HFXLSREncoder(EncoderInterface):
     """
     def __init__(
         self,
-        model_name: str = "TalTechNLP/xls-r-300m-et",
+        model_name: str = "facebook/wav2vec2-xls-r-2b",
         output_dim: int = 1024,  # Updated to match paper recommendations
         subsampling_factor: int = 2,
         dropout: float = 0.1,

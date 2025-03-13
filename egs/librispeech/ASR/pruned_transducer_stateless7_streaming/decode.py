@@ -772,13 +772,13 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
             from xlsr_encoder import XLSREncoder, StreamingXLSREncoder
             
             # Override feature_dim for XLSR
-            params.feature_dim = 768  # XLS-R-300M has 768-dim features
+            params.feature_dim = 768  # XLS-R models have 768-dim features
             
             # Set encoder_dim for XLSR (for proper joiner connection)
             params.encoder_dim = 1024  # XLSR paper recommends 1024
             
             if params.streaming:
-                logging.info("Using Streaming Estonian-specific XLSR Encoder")
+                logging.info("Using Streaming XLSR-2B Encoder")
                 encoder = StreamingXLSREncoder(
                     feature_dim=params.feature_dim,
                     output_dim=params.encoder_dim,  # Using 1024 for output dim
@@ -788,17 +788,17 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
                     chunk_size=params.chunk_size,
                     left_context_chunks=params.left_context_chunks,
                     attention_sink_size=params.attention_sink_size,
-                    model_name="TalTechNLP/xls-r-300m-et",  # Estonian-specific model
+                    model_name="facebook/wav2vec2-xls-r-2b",  # Using the larger 2B parameter model
                 )
             else:
-                logging.info("Using Estonian-specific XLSR Encoder")
+                logging.info("Using XLSR-2B Encoder")
                 encoder = XLSREncoder(
-                    feature_dim=params.feature_dim,  # 768 for XLS-R-300M
+                    feature_dim=params.feature_dim,  # 768 for XLS-R models
                     output_dim=params.encoder_dim,  # Using 1024 for output dim
                     subsampling_factor=params.subsampling_factor,
                     dropout=params.dropout,
                     use_feat_proj=True,
-                    model_name="TalTechNLP/xls-r-300m-et",  # Estonian-specific model
+                    model_name="facebook/wav2vec2-xls-r-2b",  # Using the larger 2B parameter model
                 )
             return encoder
         except ImportError:

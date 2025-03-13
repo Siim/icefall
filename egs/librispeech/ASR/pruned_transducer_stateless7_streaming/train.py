@@ -544,6 +544,7 @@ def get_params() -> AttributeDict:
             "use_custom_dataset": False,
             "et_manifest_dir": "data/ssl",
             "filter_cuts": False,
+            "warm_step": 3000,
         }
     )
 

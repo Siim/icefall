@@ -391,6 +391,48 @@ def get_parser():
         help="Whether to use half precision training.",
     )
 
+    parser.add_argument(
+        "--use-xlsr-encoder",
+        type=str2bool,
+        default=False,
+        help="Whether to use XLSR encoder.",
+    )
+
+    parser.add_argument(
+        "--streaming",
+        type=str2bool,
+        default=False,
+        help="Whether to use Streaming XLSR encoder.",
+    )
+
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.1,
+        help="Dropout rate for the XLSR encoder.",
+    )
+
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=1000,
+        help="Chunk size for the XLSR encoder.",
+    )
+
+    parser.add_argument(
+        "--left-context-chunks",
+        type=int,
+        default=10,
+        help="Left context chunks for the XLSR encoder.",
+    )
+
+    parser.add_argument(
+        "--attention-sink-size",
+        type=int,
+        default=100,
+        help="Attention sink size for the XLSR encoder.",
+    )
+
     add_model_arguments(parser)
 
     return parser
@@ -436,10 +478,15 @@ def get_params() -> AttributeDict:
 
         - encoder_dim: Hidden dim for multi-head attention model.
 
-        - num_decoder_layers: Number of decoder layer of transformer decoder.
+        - use_xlsr_encoder: Whether to use XLSR encoder instead of Zipformer.
 
-        - warm_step: The warmup period that dictates the decay of the
-              scale on "simple" (un-pruned) loss.
+        - streaming: Whether to use streaming XLSR encoder.
+
+        - chunk_size: Chunk size for streaming XLSR encoder.
+
+        - left_context_chunks: Number of left context chunks for streaming.
+
+        - attention_sink_size: Size of attention sinks for streaming.
     """
     params = AttributeDict(
         {
@@ -450,12 +497,28 @@ def get_params() -> AttributeDict:
             "batch_idx_train": 0,
             "log_interval": 50,
             "reset_interval": 200,
-            "valid_interval": 3000,  # For the 100h subset, use 800
+            "valid_interval": 3000,
             # parameters for zipformer
             "feature_dim": 80,
-            "subsampling_factor": 4,  # not passed in, this is fixed.
-            "warm_step": 2000,
-            "env_info": get_env_info(),
+            "subsampling_factor": 4,  # not passed in, this is fixed
+            "encoder_dim": 512,
+            "nhead": "8,8,8,8,8,8",
+            "dim_feedforward": "2048,2048,2048,2048,2048,2048",
+            "encoder_layers": "2,4,3,2,4,3",
+            "encoder_dim": "384,384,384,384,384,384",
+            "attention_dim": "192,192,192,192,192,192",
+            "encoder_unmasked_dim": "256,256,256,256,256,256",
+            "zipformer_downsampling_factors": "1,2,4,8,2,2",
+            "cnn_module_kernels": "31,31,31,31,31,31",
+            "decoder_dim": 512,
+            "joiner_dim": 512,
+            # parameters for XLSR encoder
+            "use_xlsr_encoder": False,
+            "streaming": False,
+            "dropout": 0.1,
+            "chunk_size": 32,  # 32 frames = ~640ms with 20ms stride
+            "left_context_chunks": 1,
+            "attention_sink_size": 0,
         }
     )
 
@@ -463,7 +526,38 @@ def get_params() -> AttributeDict:
 
 
 def get_encoder_model(params: AttributeDict) -> nn.Module:
-    # TODO: We can add an option to switch between Zipformer and Transformer
+    # Check if we should use XLSR encoder
+    if params.use_xlsr_encoder:
+        try:
+            from xlsr_encoder import XLSREncoder, StreamingXLSREncoder
+            
+            if params.streaming:
+                logging.info("Using Streaming XLSR Encoder")
+                encoder = StreamingXLSREncoder(
+                    feature_dim=params.feature_dim,  # 1024 for XLSR
+                    output_dim=params.encoder_dim,  # Same as Zipformer
+                    subsampling_factor=params.subsampling_factor,
+                    dropout=params.dropout,
+                    use_feat_proj=True,
+                    chunk_size=params.chunk_size,
+                    left_context_chunks=params.left_context_chunks,
+                    attention_sink_size=params.attention_sink_size,
+                )
+            else:
+                logging.info("Using XLSR Encoder")
+                encoder = XLSREncoder(
+                    feature_dim=params.feature_dim,  # 1024 for XLSR
+                    output_dim=params.encoder_dim,  # Same as Zipformer
+                    subsampling_factor=params.subsampling_factor,
+                    dropout=params.dropout,
+                    use_feat_proj=True,
+                )
+            return encoder
+        except ImportError:
+            logging.error("Failed to import XLSR encoder. Falling back to Zipformer.")
+    
+    # If not using XLSR or import failed, use Zipformer
+    logging.info("Using Zipformer Encoder")
     def to_int_tuple(s: str):
         return tuple(map(int, s.split(",")))
 

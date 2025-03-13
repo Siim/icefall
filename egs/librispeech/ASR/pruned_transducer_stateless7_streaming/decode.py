@@ -104,8 +104,10 @@ Usage:
 import argparse
 import logging
 import math
+import os
+import sys
 from collections import defaultdict
-from pathlib import Path
+from pathlib import Path, PosixPath
 from typing import Dict, List, Optional, Tuple
 
 import k2
@@ -128,6 +130,10 @@ from beam_search import (
     modified_beam_search_LODR,
 )
 from train import add_model_arguments, get_params, get_transducer_model
+from decoder import Decoder
+from joiner import Joiner
+from model import Transducer
+from zipformer import Zipformer
 
 from icefall import LmScorer, NgramLm
 from icefall.checkpoint import (
@@ -146,6 +152,9 @@ from icefall.utils import (
 )
 
 LOG_EPS = math.log(1e-10)
+
+# Add safe globals for PosixPath
+torch.serialization.add_safe_globals([PosixPath])
 
 
 def get_parser():
@@ -316,9 +325,42 @@ def get_parser():
         "--use-shallow-fusion",
         type=str2bool,
         default=False,
-        help="""Use neural network LM for shallow fusion.
-        If you want to use LODR, you will also need to set this to true
-        """,
+        help="Whether to use shallow fusion for decoding",
+    )
+
+    parser.add_argument(
+        "--use-xlsr-encoder",
+        type=str2bool,
+        default=False,
+        help="Whether to use XLSR encoder instead of Zipformer.",
+    )
+
+    parser.add_argument(
+        "--streaming",
+        type=str2bool,
+        default=False,
+        help="Whether to use Streaming XLSR encoder.",
+    )
+
+    parser.add_argument(
+        "--attention-sink-size",
+        type=int,
+        default=0,
+        help="Attention sink size for the XLSR encoder.",
+    )
+
+    parser.add_argument(
+        "--use-custom-dataset",
+        type=str2bool,
+        default=False,
+        help="Whether to use custom Estonian dataset instead of LibriSpeech"
+    )
+
+    parser.add_argument(
+        "--et-manifest-dir",
+        type=str,
+        default="data/ssl",
+        help="Directory containing the Estonian dataset manifests with XLSR features"
     )
 
     parser.add_argument(
@@ -351,6 +393,13 @@ def get_parser():
         type=int,
         default=500,
         help="ID of the backoff symbol in the ngram LM",
+    )
+
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.1,
+        help="Dropout rate for the XLSR encoder.",
     )
 
     add_model_arguments(parser)
@@ -716,6 +765,82 @@ def save_results(
     logging.info(s)
 
 
+def get_encoder_model(params: AttributeDict) -> nn.Module:
+    # Check if we should use XLSR encoder
+    if params.use_xlsr_encoder:
+        try:
+            from xlsr_encoder import XLSREncoder, StreamingXLSREncoder
+            
+            # Override feature_dim for XLSR
+            params.feature_dim = 768  # XLSR-53 has 768-dim features
+            
+            if params.streaming:
+                logging.info("Using Streaming XLSR Encoder")
+                encoder = StreamingXLSREncoder(
+                    feature_dim=params.feature_dim,
+                    output_dim=params.encoder_dim,  # Same as Zipformer
+                    subsampling_factor=params.subsampling_factor,
+                    dropout=params.dropout,
+                    use_feat_proj=True,
+                    chunk_size=params.chunk_size,
+                    left_context_chunks=params.left_context_chunks,
+                    attention_sink_size=params.attention_sink_size,
+                )
+            else:
+                logging.info("Using XLSR Encoder")
+                encoder = XLSREncoder(
+                    feature_dim=params.feature_dim,  # 768 for XLSR-53
+                    output_dim=params.encoder_dim,  # Same as Zipformer
+                    subsampling_factor=params.subsampling_factor,
+                    dropout=params.dropout,
+                    use_feat_proj=True,
+                )
+            return encoder
+        except ImportError:
+            logging.error("Failed to import XLSR encoder. Falling back to Zipformer.")
+    
+    # If not using XLSR or import failed, use Zipformer
+    logging.info("Using Zipformer Encoder")
+    def to_int_tuple(s: str):
+        return tuple(map(int, s.split(",")))
+
+    encoder = Zipformer(
+        num_features=params.feature_dim,
+        output_downsampling_factor=2,
+        zipformer_downsampling_factors=to_int_tuple(
+            params.zipformer_downsampling_factors
+        ),
+        encoder_dims=to_int_tuple(params.encoder_dims),
+        attention_dim=to_int_tuple(params.attention_dims),
+        encoder_unmasked_dims=to_int_tuple(params.encoder_unmasked_dims),
+        nhead=to_int_tuple(params.nhead),
+        feedforward_dim=to_int_tuple(params.feedforward_dims),
+        cnn_module_kernels=to_int_tuple(params.cnn_module_kernels),
+        num_encoder_layers=to_int_tuple(params.num_encoder_layers),
+        num_left_chunks=params.num_left_chunks,
+        short_chunk_size=params.short_chunk_size,
+        decode_chunk_size=params.decode_chunk_len // 2,
+    )
+    return encoder
+
+def get_decoder_model(params: AttributeDict) -> nn.Module:
+    decoder = Decoder(
+        vocab_size=params.vocab_size,
+        decoder_dim=params.decoder_dim,
+        blank_id=params.blank_id,
+        context_size=params.context_size,
+    )
+    return decoder
+
+def get_joiner_model(params: AttributeDict) -> nn.Module:
+    joiner = Joiner(
+        encoder_dim=int(params.encoder_dims.split(",")[-1]),
+        decoder_dim=params.decoder_dim,
+        joiner_dim=params.joiner_dim,
+        vocab_size=params.vocab_size,
+    )
+    return joiner
+
 @torch.no_grad()
 def main():
     parser = get_parser()
@@ -772,9 +897,6 @@ def main():
                 f"-LODR-{params.tokens_ngram}gram-scale-{params.ngram_lm_scale}"
             )
 
-    if params.use_averaged_model:
-        params.suffix += "-use-averaged-model"
-
     setup_logger(f"{params.res_dir}/log-decode-{params.suffix}")
     logging.info("Decoding started")
 
@@ -792,91 +914,75 @@ def main():
     params.unk_id = sp.piece_to_id("<unk>")
     params.vocab_size = sp.get_piece_size()
 
+    logging.info(f"Vocab size: {params.vocab_size}")
+
     logging.info(params)
 
     logging.info("About to create model")
-    model = get_transducer_model(params)
-    assert model.encoder.decode_chunk_size == params.decode_chunk_len // 2, (
-        model.encoder.decode_chunk_size,
-        params.decode_chunk_len,
+    
+    # Create the model first
+    model = Transducer(
+        encoder=get_encoder_model(params),
+        decoder=get_decoder_model(params),
+        joiner=get_joiner_model(params),
+        encoder_dim=int(params.encoder_dims.split(",")[-1]),
+        decoder_dim=params.decoder_dim,
+        joiner_dim=params.joiner_dim,
+        vocab_size=params.vocab_size,
     )
+    
+    if not params.use_xlsr_encoder:
+        assert model.encoder.decode_chunk_size == params.decode_chunk_len // 2, (
+            model.encoder.decode_chunk_size,
+            params.decode_chunk_len,
+        )
+    
+    # Now load the averaged model if needed
+    if params.use_averaged_model:
+        logging.info("Calculating the averaged model over epoch range")
+        filenames = []
+        start = params.epoch - params.avg + 1
+        for i in range(start, params.epoch + 1):
+            if start >= 1:
+                filenames.append(f"{params.exp_dir}/epoch-{i}.pt")
 
-    if not params.use_averaged_model:
-        if params.iter > 0:
-            filenames = find_checkpoints(params.exp_dir, iteration=-params.iter)[
-                : params.avg
-            ]
-            if len(filenames) == 0:
-                raise ValueError(
-                    f"No checkpoints found for"
-                    f" --iter {params.iter}, --avg {params.avg}"
-                )
-            elif len(filenames) < params.avg:
-                raise ValueError(
-                    f"Not enough checkpoints ({len(filenames)}) found for"
-                    f" --iter {params.iter}, --avg {params.avg}"
-                )
-            logging.info(f"averaging {filenames}")
-            model.to(device)
-            model.load_state_dict(average_checkpoints(filenames, device=device))
-        elif params.avg == 1:
-            load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model)
-        else:
-            start = params.epoch - params.avg + 1
-            filenames = []
-            for i in range(start, params.epoch + 1):
-                if i >= 1:
-                    filenames.append(f"{params.exp_dir}/epoch-{i}.pt")
-            logging.info(f"averaging {filenames}")
-            model.to(device)
-            model.load_state_dict(average_checkpoints(filenames, device=device))
+        # Instead of using average_checkpoints_with_averaged_model with filename_start and filename_end,
+        # let's directly use average_checkpoints for simplicity
+        model.to(device)
+        model.load_state_dict(
+            average_checkpoints(filenames, device=device),
+        )
+    elif params.iter > 0:
+        filenames = find_checkpoints(params.exp_dir, iteration=-params.iter)[: params.avg]
+        if len(filenames) == 0:
+            raise ValueError(
+                f"No checkpoints found for --iter {params.iter}, "
+                f"--exp-dir {params.exp_dir}"
+            )
+        elif len(filenames) < params.avg:
+            raise ValueError(
+                f"Not enough checkpoints ({len(filenames)}) found for"
+                f" --iter {params.iter}, --exp-dir {params.exp_dir}, "
+                f"--avg {params.avg}"
+            )
+        logging.info(f"averaging {filenames}")
+        model.to(device)
+        model.load_state_dict(
+            average_checkpoints(filenames, device=device),
+        )
+    elif params.avg == 1:
+        load_checkpoint(f"{params.exp_dir}/epoch-{params.epoch}.pt", model=model, weights_only=False)
     else:
-        if params.iter > 0:
-            filenames = find_checkpoints(params.exp_dir, iteration=-params.iter)[
-                : params.avg + 1
-            ]
-            if len(filenames) == 0:
-                raise ValueError(
-                    f"No checkpoints found for"
-                    f" --iter {params.iter}, --avg {params.avg}"
-                )
-            elif len(filenames) < params.avg + 1:
-                raise ValueError(
-                    f"Not enough checkpoints ({len(filenames)}) found for"
-                    f" --iter {params.iter}, --avg {params.avg}"
-                )
-            filename_start = filenames[-1]
-            filename_end = filenames[0]
-            logging.info(
-                "Calculating the averaged model over iteration checkpoints"
-                f" from {filename_start} (excluded) to {filename_end}"
-            )
-            model.to(device)
-            model.load_state_dict(
-                average_checkpoints_with_averaged_model(
-                    filename_start=filename_start,
-                    filename_end=filename_end,
-                    device=device,
-                )
-            )
-        else:
-            assert params.avg > 0, params.avg
-            start = params.epoch - params.avg
-            assert start >= 1, start
-            filename_start = f"{params.exp_dir}/epoch-{start}.pt"
-            filename_end = f"{params.exp_dir}/epoch-{params.epoch}.pt"
-            logging.info(
-                f"Calculating the averaged model over epoch range from "
-                f"{start} (excluded) to {params.epoch}"
-            )
-            model.to(device)
-            model.load_state_dict(
-                average_checkpoints_with_averaged_model(
-                    filename_start=filename_start,
-                    filename_end=filename_end,
-                    device=device,
-                )
-            )
+        start = params.epoch - params.avg + 1
+        filenames = []
+        for i in range(start, params.epoch + 1):
+            if start >= 1:
+                filenames.append(f"{params.exp_dir}/epoch-{i}.pt")
+        logging.info(f"averaging {filenames}")
+        model.to(device)
+        model.load_state_dict(
+            average_checkpoints(filenames, device=device),
+        )
 
     model.to(device)
     model.eval()
@@ -949,21 +1055,57 @@ def main():
     num_param = sum([p.numel() for p in model.parameters()])
     logging.info(f"Number of model parameters: {num_param}")
 
-    # we need cut ids to display recognition results.
-    args.return_cuts = True
-    librispeech = LibriSpeechAsrDataModule(args)
-
-    test_clean_cuts = librispeech.test_clean_cuts()
-    test_other_cuts = librispeech.test_other_cuts()
-
-    test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
-    test_other_dl = librispeech.test_dataloaders(test_other_cuts)
-
-    test_sets = ["test-clean", "test-other"]
-    test_dl = [test_clean_dl, test_other_dl]
+    # Create the appropriate dataset based on the use_custom_dataset flag
+    if params.use_custom_dataset:
+        logging.info("Using custom Estonian dataset for decoding")
+        from lhotse import CutSet
+        
+        # Load Estonian SSL features
+        test_cuts = CutSet.from_file(f"{params.et_manifest_dir}/et_cuts_val.jsonl.gz")
+        logging.info(f"Loaded {len(test_cuts)} validation cuts for decoding")
+        
+        # Apply filtering if requested
+        if params.filter_cuts:
+            logging.info("Filtering short and long utterances")
+            # Create a function that filters based on duration
+            def remove_short_and_long_utt(c):
+                # Keep utterances between 1 and 20 seconds
+                return 1.0 <= c.duration <= 20.0
+            
+            test_cuts = test_cuts.filter(remove_short_and_long_utt).to_eager()
+            logging.info(f"After filtering: {len(test_cuts)} test cuts")
+        
+        # Create a dataloader for the custom dataset
+        from lhotse.dataset import K2SpeechRecognitionDataset
+        from torch.utils.data import DataLoader
+        
+        # Set return_cuts in params to True for decoding
+        params.return_cuts = True
+        
+        # Use the ASR datamodule to create the dataset and dataloader
+        # This ensures compatibility with the decode_dataset function
+        librispeech = LibriSpeechAsrDataModule(params)
+        test_dl = librispeech.test_dataloaders(test_cuts)
+        
+        # Define a single test set
+        test_sets = ["custom-test"]
+        test_dls = [test_dl]
+    else:
+        # Use LibriSpeech test sets
+        logging.info("Using LibriSpeech dataset for decoding")
+        librispeech = LibriSpeechAsrDataModule(args)
+        test_clean_cuts = librispeech.test_clean_cuts()
+        test_other_cuts = librispeech.test_other_cuts()
+        
+        test_clean_dl = librispeech.test_dataloaders(test_clean_cuts)
+        test_other_dl = librispeech.test_dataloaders(test_other_cuts)
+        
+        test_sets = ["test-clean", "test-other"]
+        test_dls = [test_clean_dl, test_other_dl]
+    
     import time
-
-    for test_set, test_dl in zip(test_sets, test_dl):
+    
+    for test_set, test_dl in zip(test_sets, test_dls):
         start = time.time()
         results_dict = decode_dataset(
             dl=test_dl,
@@ -989,3 +1131,49 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# Define a custom average_checkpoints function that uses weights_only=False
+
+def average_checkpoints(
+    filenames: List[str],
+    device: torch.device = torch.device("cpu"),
+) -> Dict[str, torch.Tensor]:
+    """Average a list of checkpoint models.
+
+    Args:
+      filenames:
+        Filenames of the checkpoints to be averaged. We assume all
+        checkpoints are saved by :func:`save_checkpoint`.
+      device:
+        Move checkpoints to this device before averaging.
+    Returns:
+      Return a dict containing the averaged model.
+    """
+    n = len(filenames)
+    
+    # We assume all checkpoints use the same set of keys
+    states = dict()
+    for filename in filenames:
+        state = torch.load(
+            filename,
+            map_location=device,
+            weights_only=False,  # Use weights_only=False for PyTorch 2.6 compatibility
+        )
+        
+        # Get the model state (either from model or model_avg key)
+        if "model" in state:
+            state = state["model"]
+        elif "model_avg" in state:
+            state = state["model_avg"]
+        else:
+            raise ValueError(f"No model or model_avg key found in {filename}")
+
+        for k, v in state.items():
+            if k not in states:
+                states[k] = 0
+            states[k] = states[k] + v
+            
+    for k, v in states.items():
+        states[k] = v / n
+    
+    return states

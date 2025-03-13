@@ -89,6 +89,9 @@ class XLSREncoder(EncoderInterface):
             
             # Update sequence lengths
             x_lens = torch.div(x_lens, self.subsampling_factor, rounding_mode='floor')
+            
+            # Ensure all lengths are at least 1 to prevent assertion errors
+            x_lens = torch.clamp(x_lens, min=1)
         
         return x, x_lens
 
@@ -222,6 +225,9 @@ class StreamingXLSREncoder(XLSREncoder):
             
             # Update sequence lengths
             x_lens = torch.div(x_lens, self.subsampling_factor, rounding_mode='floor')
+            
+            # Ensure all lengths are at least 1 to prevent assertion errors
+            x_lens = torch.clamp(x_lens, min=1)
         
         return output, x_lens
 
@@ -317,5 +323,8 @@ class HFXLSREncoder(EncoderInterface):
             
             # Update sequence lengths
             x_lens = torch.div(x_lens, self.subsampling_factor, rounding_mode='floor')
+            
+            # Ensure all lengths are at least 1 to prevent assertion errors
+            x_lens = torch.clamp(x_lens, min=1)
         
         return x, x_lens 

@@ -796,11 +796,34 @@ def compute_loss(
 
     supervisions = batch["supervisions"]
     feature_lens = supervisions["num_frames"].to(device)
+    texts = batch["supervisions"]["text"]
+
+    # Filter out extremely short utterances that might cause issues after encoder processing
+    # For a subsampling factor of 2, we need at least 2 frames
+    min_input_length = 2 * params.subsampling_factor  # This ensures at least 1 frame after subsampling
+    mask = feature_lens >= min_input_length
+    
+    if not torch.all(mask):
+        logging.warning(
+            f"Filtering {(~mask).sum().item()} utterances shorter than {min_input_length} frames"
+        )
+        feature = feature[mask]
+        feature_lens = feature_lens[mask]
+        texts = [texts[i] for i in range(len(texts)) if mask[i]]
+        
+        # If all utterances were filtered out, return a dummy loss
+        if feature.shape[0] == 0:
+            dummy_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            info = MetricsTracker()
+            info["loss"] = dummy_loss.detach().cpu().item()
+            info["simple_loss"] = dummy_loss.detach().cpu().item()
+            info["pruned_loss"] = dummy_loss.detach().cpu().item()
+            info["frames"] = 0
+            return dummy_loss, info
 
     batch_idx_train = params.batch_idx_train
     warm_step = params.warm_step
 
-    texts = batch["supervisions"]["text"]
     y = sp.encode(texts, out_type=int)
     y = k2.RaggedTensor(y).to(device)
 
@@ -1240,7 +1263,11 @@ def run(rank, world_size, args):
     #         params=params,
     #     )
 
-    scaler = GradScaler(enabled=params.use_fp16, init_scale=1.0)
+    if params.use_fp16:
+        scaler = torch.amp.GradScaler('cuda', enabled=True, init_scale=1.0)
+    else:
+        scaler = torch.amp.GradScaler('cpu', enabled=False, init_scale=1.0)
+        
     if checkpoints and "grad_scaler" in checkpoints:
         logging.info("Loading grad scaler state dict")
         scaler.load_state_dict(checkpoints["grad_scaler"])

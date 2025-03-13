@@ -16,7 +16,7 @@ world_size=1  # Number of GPUs
 seed=42
 max_duration=30  # Maximum utterance duration in seconds
 use_xlsr_encoder=0
-feature_dim=80  # Default: 80 for fbank, should be 768 for XLSR
+encoder_dim=512  # Encoder output dimension
 streaming=0
 chunk_size=32
 left_context_chunks=1
@@ -42,7 +42,12 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --feature-dim)
-      feature_dim=$2
+      # We can't pass this directly to train.py, but we'll print a message about it
+      echo "Note: XLSR features have dimension $2, this is handled automatically in the encoder"
+      shift 2
+      ;;
+    --encoder-dim)
+      encoder_dim=$2
       shift 2
       ;;
     --streaming)
@@ -91,7 +96,7 @@ python train.py \
   --use-fp16 1 \
   --use-xlsr-encoder ${use_xlsr_encoder} \
   --streaming ${streaming} \
-  --feature-dim ${feature_dim} \
+  --encoder-dim ${encoder_dim} \
   --chunk-size ${chunk_size} \
   --left-context-chunks ${left_context_chunks} \
   --attention-sink-size ${attention_sink_size}

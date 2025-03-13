@@ -560,11 +560,14 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
             # Override feature_dim for XLSR
             params.feature_dim = 768  # XLSR-53 has 768-dim features
             
+            # Set encoder_dim for XLSR (for proper joiner connection)
+            params.encoder_dim = 1024  # XLSR paper recommends 1024
+            
             if params.streaming:
                 logging.info("Using Streaming XLSR Encoder")
                 encoder = StreamingXLSREncoder(
                     feature_dim=params.feature_dim,
-                    output_dim=params.encoder_dim,  # Same as Zipformer
+                    output_dim=params.encoder_dim,  # Using 1024 for output dim
                     subsampling_factor=params.subsampling_factor,
                     dropout=params.dropout,
                     use_feat_proj=True,
@@ -576,7 +579,7 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
                 logging.info("Using XLSR Encoder")
                 encoder = XLSREncoder(
                     feature_dim=params.feature_dim,  # 768 for XLSR-53
-                    output_dim=params.encoder_dim,  # Same as Zipformer
+                    output_dim=params.encoder_dim,  # Using 1024 for output dim
                     subsampling_factor=params.subsampling_factor,
                     dropout=params.dropout,
                     use_feat_proj=True,
@@ -621,8 +624,16 @@ def get_decoder_model(params: AttributeDict) -> nn.Module:
 
 
 def get_joiner_model(params: AttributeDict) -> nn.Module:
+    # Use the appropriate encoder dimension based on encoder type
+    if hasattr(params, 'use_xlsr_encoder') and params.use_xlsr_encoder:
+        # Use directly set encoder_dim for XLSR
+        encoder_dim = params.encoder_dim
+    else:
+        # Use traditional encoder_dims for Zipformer
+        encoder_dim = int(params.encoder_dims.split(",")[-1])
+        
     joiner = Joiner(
-        encoder_dim=int(params.encoder_dims.split(",")[-1]),
+        encoder_dim=encoder_dim,
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
@@ -634,12 +645,17 @@ def get_transducer_model(params: AttributeDict) -> nn.Module:
     encoder = get_encoder_model(params)
     decoder = get_decoder_model(params)
     joiner = get_joiner_model(params)
-
+    
+    # We need the encoder_dim to be correct
+    if not params.use_xlsr_encoder:
+        # Original behavior for Zipformer encoder
+        params.encoder_dim = int(params.encoder_dims.split(",")[-1])
+    
     model = Transducer(
         encoder=encoder,
         decoder=decoder,
         joiner=joiner,
-        encoder_dim=int(params.encoder_dims.split(",")[-1]),
+        encoder_dim=params.encoder_dim,
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
@@ -1023,18 +1039,6 @@ def train_one_epoch(
                 rank=rank,
             )
 
-        if batch_idx % 100 == 0 and params.use_fp16:
-            # If the grad scale was less than 1, try increasing it.    The _growth_interval
-            # of the grad scaler is configurable, but we can't configure it to have different
-            # behavior depending on the current grad scale.
-            cur_grad_scale = scaler._scale.item()
-            if cur_grad_scale < 1.0 or (cur_grad_scale < 8.0 and batch_idx % 400 == 0):
-                scaler.update(cur_grad_scale * 2.0)
-            if cur_grad_scale < 0.01:
-                logging.warning(f"Grad scale is small: {cur_grad_scale}")
-            if cur_grad_scale < 1.0e-05:
-                raise_grad_scale_is_too_small_error(cur_grad_scale)
-
         if batch_idx % params.log_interval == 0:
             cur_lr = scheduler.get_last_lr()[0]
             cur_grad_scale = scaler._scale.item() if params.use_fp16 else 1.0
@@ -1047,7 +1051,8 @@ def train_one_epoch(
                 + (f"grad_scale: {scaler._scale.item()}" if params.use_fp16 else "")
             )
 
-            if tb_writer is not None:
+            # Disable TensorBoard writing if tensorboard is disabled
+            if tb_writer is not None and params.tensorboard:
                 tb_writer.add_scalar(
                     "train/learning_rate", cur_lr, params.batch_idx_train
                 )
@@ -1077,7 +1082,8 @@ def train_one_epoch(
             logging.info(
                 f"Maximum memory allocated so far is {torch.cuda.max_memory_allocated()//1000000}MB"
             )
-            if tb_writer is not None:
+            # Disable TensorBoard writing if tensorboard is disabled
+            if tb_writer is not None and params.tensorboard:
                 valid_info.write_summary(
                     tb_writer, "train/valid_", params.batch_idx_train
                 )

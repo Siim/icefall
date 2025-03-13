@@ -774,11 +774,14 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
             # Override feature_dim for XLSR
             params.feature_dim = 768  # XLSR-53 has 768-dim features
             
+            # Set encoder_dim for XLSR (for proper joiner connection)
+            params.encoder_dim = 1024  # XLSR paper recommends 1024
+            
             if params.streaming:
                 logging.info("Using Streaming XLSR Encoder")
                 encoder = StreamingXLSREncoder(
                     feature_dim=params.feature_dim,
-                    output_dim=params.encoder_dim,  # Same as Zipformer
+                    output_dim=params.encoder_dim,  # Using 1024 for output dim
                     subsampling_factor=params.subsampling_factor,
                     dropout=params.dropout,
                     use_feat_proj=True,
@@ -790,7 +793,7 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
                 logging.info("Using XLSR Encoder")
                 encoder = XLSREncoder(
                     feature_dim=params.feature_dim,  # 768 for XLSR-53
-                    output_dim=params.encoder_dim,  # Same as Zipformer
+                    output_dim=params.encoder_dim,  # Using 1024 for output dim
                     subsampling_factor=params.subsampling_factor,
                     dropout=params.dropout,
                     use_feat_proj=True,
@@ -833,8 +836,16 @@ def get_decoder_model(params: AttributeDict) -> nn.Module:
     return decoder
 
 def get_joiner_model(params: AttributeDict) -> nn.Module:
+    # Use the appropriate encoder dimension based on encoder type
+    if hasattr(params, 'use_xlsr_encoder') and params.use_xlsr_encoder:
+        # Use directly set encoder_dim for XLSR
+        encoder_dim = params.encoder_dim
+    else:
+        # Use traditional encoder_dims for Zipformer
+        encoder_dim = int(params.encoder_dims.split(",")[-1])
+        
     joiner = Joiner(
-        encoder_dim=int(params.encoder_dims.split(",")[-1]),
+        encoder_dim=encoder_dim,
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,
@@ -920,12 +931,23 @@ def main():
 
     logging.info("About to create model")
     
-    # Create the model first
+    # We need to ensure the encoder dimension value is correct before model instantiation
+    if params.use_xlsr_encoder:
+        logging.info("Using XLSR encoder with encoder dimension: %d", params.encoder_dim)
+    else:
+        # Original behavior for Zipformer encoder
+        params.encoder_dim = int(params.encoder_dims.split(",")[-1])
+        logging.info("Using Zipformer encoder with encoder dimension: %d", params.encoder_dim)
+
+    encoder = get_encoder_model(params)
+    decoder = get_decoder_model(params)
+    joiner = get_joiner_model(params)
+
     model = Transducer(
-        encoder=get_encoder_model(params),
-        decoder=get_decoder_model(params),
-        joiner=get_joiner_model(params),
-        encoder_dim=int(params.encoder_dims.split(",")[-1]),
+        encoder=encoder,
+        decoder=decoder,
+        joiner=joiner,
+        encoder_dim=params.encoder_dim,
         decoder_dim=params.decoder_dim,
         joiner_dim=params.joiner_dim,
         vocab_size=params.vocab_size,

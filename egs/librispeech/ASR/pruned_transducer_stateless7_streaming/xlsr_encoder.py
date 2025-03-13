@@ -13,8 +13,8 @@ class XLSREncoder(EncoderInterface):
     """
     def __init__(
         self,
-        feature_dim: int = 768,  # Changed default to match XLSR-53
-        output_dim: int = 512,
+        feature_dim: int = 768,  # XLSR-53 raw feature dimension
+        output_dim: int = 1024,  # Updated to match paper recommendations
         subsampling_factor: int = 2,
         dropout: float = 0.1,
         use_feat_proj: bool = True,
@@ -33,22 +33,32 @@ class XLSREncoder(EncoderInterface):
         if isinstance(output_dim, str):
             output_dim = int(output_dim.split(',')[0])
         elif isinstance(output_dim, (list, tuple)):
-            output_dim = int(output_dim[0]) if len(output_dim) > 0 else 512
+            output_dim = int(output_dim[0]) if len(output_dim) > 0 else 1024
             
         self.feature_dim = feature_dim
         self.output_dim = output_dim
         self.subsampling_factor = subsampling_factor
         
-        # Feature projection if needed
-        if use_feat_proj and feature_dim != output_dim:
+        # Enhanced feature projection with multi-layer adaptation
+        if use_feat_proj:
+            # Create a more robust adapter for SSL features
             self.feat_proj = nn.Sequential(
                 nn.Linear(feature_dim, output_dim),
-                nn.Dropout(dropout),
                 nn.LayerNorm(output_dim),
-                nn.ReLU()
+                nn.Dropout(dropout),
+                nn.GELU(),
+                nn.Linear(output_dim, output_dim),
+                nn.LayerNorm(output_dim),
+                nn.Dropout(dropout),
+                nn.GELU()
             )
         else:
-            self.feat_proj = nn.Identity()
+            # Only use identity if dimensions match
+            if feature_dim == output_dim:
+                self.feat_proj = nn.Identity()
+            else:
+                # Simple projection if use_feat_proj is False but dims don't match
+                self.feat_proj = nn.Linear(feature_dim, output_dim)
             
         # For frame-level subsampling if needed
         if subsampling_factor > 1:
@@ -102,8 +112,8 @@ class StreamingXLSREncoder(XLSREncoder):
     """
     def __init__(
         self,
-        feature_dim: int = 768,  # Changed default to match XLSR-53
-        output_dim: int = 512,
+        feature_dim: int = 768,  # XLSR-53 raw feature dimension
+        output_dim: int = 1024,  # Updated to match paper recommendations
         subsampling_factor: int = 2,
         dropout: float = 0.1,
         use_feat_proj: bool = True,
@@ -241,7 +251,7 @@ class HFXLSREncoder(EncoderInterface):
     def __init__(
         self,
         model_name: str = "facebook/wav2vec2-large-xlsr-53",
-        output_dim: int = 512,
+        output_dim: int = 1024,  # Updated to match paper recommendations
         subsampling_factor: int = 2,
         dropout: float = 0.1,
         freeze_feature_extractor: bool = True,

@@ -13,7 +13,7 @@ class XLSREncoder(EncoderInterface):
     """
     def __init__(
         self,
-        feature_dim: int = 1024,
+        feature_dim: int = 768,  # Changed default to match XLSR-53
         output_dim: int = 512,
         subsampling_factor: int = 2,
         dropout: float = 0.1,
@@ -21,6 +21,20 @@ class XLSREncoder(EncoderInterface):
     ):
         super().__init__()
         
+        # Ensure feature_dim is an integer (not a string or list)
+        if isinstance(feature_dim, str):
+            # Handle case where feature_dim is a comma-separated string
+            feature_dim = int(feature_dim.split(',')[0])
+        elif isinstance(feature_dim, (list, tuple)):
+            # Handle case where feature_dim is a list/tuple
+            feature_dim = int(feature_dim[0]) if len(feature_dim) > 0 else 768
+            
+        # Ensure output_dim is an integer
+        if isinstance(output_dim, str):
+            output_dim = int(output_dim.split(',')[0])
+        elif isinstance(output_dim, (list, tuple)):
+            output_dim = int(output_dim[0]) if len(output_dim) > 0 else 512
+            
         self.feature_dim = feature_dim
         self.output_dim = output_dim
         self.subsampling_factor = subsampling_factor
@@ -85,7 +99,7 @@ class StreamingXLSREncoder(XLSREncoder):
     """
     def __init__(
         self,
-        feature_dim: int = 1024,
+        feature_dim: int = 768,  # Changed default to match XLSR-53
         output_dim: int = 512,
         subsampling_factor: int = 2,
         dropout: float = 0.1,
@@ -94,6 +108,8 @@ class StreamingXLSREncoder(XLSREncoder):
         left_context_chunks: int = 1,
         attention_sink_size: int = 0,
     ):
+        # Make sure feature_dim and output_dim are handled properly
+        # by the parent class initialization
         super().__init__(
             feature_dim=feature_dim,
             output_dim=output_dim,
@@ -102,6 +118,14 @@ class StreamingXLSREncoder(XLSREncoder):
             use_feat_proj=use_feat_proj,
         )
         
+        # Convert chunk parameters to integers if they are strings
+        if isinstance(chunk_size, str):
+            chunk_size = int(chunk_size)
+        if isinstance(left_context_chunks, str):
+            left_context_chunks = int(left_context_chunks)
+        if isinstance(attention_sink_size, str):
+            attention_sink_size = int(attention_sink_size)
+            
         self.chunk_size = chunk_size
         self.left_context_chunks = left_context_chunks
         self.attention_sink_size = attention_sink_size

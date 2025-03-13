@@ -499,7 +499,7 @@ def get_params() -> AttributeDict:
             "reset_interval": 200,
             "valid_interval": 3000,
             # parameters for zipformer
-            "feature_dim": 80,
+            "feature_dim": 80,  # will be overridden if use_xlsr_encoder=True
             "subsampling_factor": 4,  # not passed in, this is fixed
             "encoder_dim": 512,
             "nhead": "8,8,8,8,8,8",
@@ -531,10 +531,13 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
         try:
             from xlsr_encoder import XLSREncoder, StreamingXLSREncoder
             
+            # Override feature_dim for XLSR
+            params.feature_dim = 768  # XLSR-53 has 768-dim features
+            
             if params.streaming:
                 logging.info("Using Streaming XLSR Encoder")
                 encoder = StreamingXLSREncoder(
-                    feature_dim=params.feature_dim,  # 1024 for XLSR
+                    feature_dim=params.feature_dim,
                     output_dim=params.encoder_dim,  # Same as Zipformer
                     subsampling_factor=params.subsampling_factor,
                     dropout=params.dropout,
@@ -546,7 +549,7 @@ def get_encoder_model(params: AttributeDict) -> nn.Module:
             else:
                 logging.info("Using XLSR Encoder")
                 encoder = XLSREncoder(
-                    feature_dim=params.feature_dim,  # 1024 for XLSR
+                    feature_dim=params.feature_dim,  # 768 for XLSR-53
                     output_dim=params.encoder_dim,  # Same as Zipformer
                     subsampling_factor=params.subsampling_factor,
                     dropout=params.dropout,

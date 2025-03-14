@@ -6,6 +6,7 @@ import argparse
 import logging
 from pathlib import Path
 import torch
+import torchaudio
 from lhotse import S3PRLSSL, CutSet, NumpyFilesWriter, S3PRLSSLConfig
 from lhotse.recipes.utils import read_manifests_if_cached
 import platform
@@ -70,7 +71,7 @@ def compute_xlsr_features(args):
             supervisions=m["supervisions"],
         )
         
-        # FIXED: Check for non-16kHz files by iterating through cuts
+        # Check for non-16kHz files by iterating through cuts
         non_16k_files = []
         for cut in cut_set:
             if cut.sampling_rate != 16000:
@@ -84,19 +85,69 @@ def compute_xlsr_features(args):
             else:
                 logging.warning(f"Non-16kHz files: {non_16k_files}")
         
-        # Resample to 16kHz if needed - FIXED: Ensure resampling happens
-        if args.resample:
+        # Always resample and persist to disk if non-16kHz files are found
+        if non_16k_files:
             logging.info(f"RESAMPLING: Converting all audio to 16kHz for XLSR compatibility")
+            
+            # 1. Persist resampled files by overwriting originals
+            for cut in cut_set:
+                if cut.sampling_rate != 16000:
+                    try:
+                        # Load the audio
+                        audio = cut.load_audio()
+                        # Resample it
+                        if isinstance(audio, tuple):
+                            # Handle (samples, sampling_rate) tuple
+                            samples, _ = audio
+                            resampled = torchaudio.functional.resample(
+                                torch.tensor(samples), 
+                                orig_freq=cut.sampling_rate, 
+                                new_freq=16000
+                            ).numpy()
+                        else:
+                            # Handle just samples
+                            resampled = torchaudio.functional.resample(
+                                torch.tensor(audio), 
+                                orig_freq=cut.sampling_rate, 
+                                new_freq=16000
+                            ).numpy()
+                        
+                        # Save back to the original file
+                        filepath = cut.recording.sources[0].source
+                        logging.info(f"Saving resampled audio to {filepath}")
+                        torchaudio.save(
+                            filepath=filepath,
+                            src=torch.tensor(resampled).unsqueeze(0),
+                            sample_rate=16000,
+                            format=os.path.splitext(filepath)[1][1:]  # Extract format from extension
+                        )
+                    except Exception as e:
+                        logging.error(f"Failed to resample and save {cut.id}: {e}")
+            
+            # 2. Reload manifests to get updated sampling rates
+            logging.info(f"Reloading manifests after resampling...")
+            m = read_manifests_if_cached(
+                dataset_parts=[partition],
+                output_dir=src_dir,
+                prefix=args.prefix,
+                suffix=args.suffix,
+            )[partition]
+            
+            # Recreate CutSet with updated recordings
+            cut_set = CutSet.from_manifests(
+                recordings=m["recordings"],
+                supervisions=m["supervisions"],
+            )
+            
+            # Ensure all cuts are now at 16kHz
+            for cut in cut_set:
+                if cut.sampling_rate != 16000:
+                    # As a fallback, use lhotse's resample method
+                    logging.warning(f"Cut {cut.id} still not at 16kHz, using lhotse resample")
+            
+            # Final resample with lhotse
             cut_set = cut_set.resample(16000)
             logging.info(f"Resampling complete for {partition}")
-        else:
-            logging.error("CRITICAL: Resampling is disabled but non-16kHz files were found!")
-            logging.error("XLSR models require 16kHz audio. Feature extraction will likely fail.")
-            logging.error("Please enable resampling with --resample")
-            if not args.force_no_resample:
-                logging.info("Forcing resampling to prevent errors...")
-                cut_set = cut_set.resample(16000)
-                logging.info(f"Forced resampling complete for {partition}")
         
         # Check if we should use parallel processing
         if args.num_jobs > 1 and platform.system() == "Darwin":

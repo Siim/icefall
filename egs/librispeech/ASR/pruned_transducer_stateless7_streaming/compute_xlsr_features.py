@@ -44,36 +44,14 @@ def compute_xlsr_features(args):
     
     # Create the SSL feature extractor with specific frame parameters
     logging.info(f"Creating feature extractor with model: {args.ssl_model}")
-    logging.info(f"Frame duration: {args.frame_duration}ms, Frame stride: {args.frame_stride}ms")
+    logging.info(f"Frame shift: {args.frame_shift}s (matches paper's 20ms recommendation)")
     
-    # Create config with frame parameters
-    # Note: Check the actual parameter names in S3PRLSSLConfig documentation
-    try:
-        ssl_config = S3PRLSSLConfig(
-            ssl_model=args.ssl_model,
-            device=args.device,
-            # Add frame duration and stride parameters
-            window_ms=args.frame_duration,  # Frame duration in ms
-            stride_ms=args.frame_stride,    # Frame stride in ms
-        )
-    except TypeError as e:
-        logging.warning(f"Error with window_ms/stride_ms parameters: {e}")
-        logging.info("Trying with alternative parameter names...")
-        try:
-            ssl_config = S3PRLSSLConfig(
-                ssl_model=args.ssl_model,
-                device=args.device,
-                # Try alternative parameter names
-                feature_frame_length=args.frame_duration,
-                feature_frame_shift=args.frame_stride,
-            )
-        except TypeError as e:
-            logging.warning(f"Error with alternative parameter names: {e}")
-            logging.info("Falling back to default parameters...")
-            ssl_config = S3PRLSSLConfig(
-                ssl_model=args.ssl_model,
-                device=args.device,
-            )
+    # Create config with correct frame_shift parameter
+    ssl_config = S3PRLSSLConfig(
+        ssl_model=args.ssl_model,
+        device=args.device,
+        frame_shift=args.frame_shift,  # This is the correct parameter name!
+    )
     
     extractor = S3PRLSSL(ssl_config)
     
@@ -137,10 +115,8 @@ def main():
                         help="Output directory for features")
     parser.add_argument("--ssl-model", type=str, default="facebook/wav2vec2-xls-r-2b", 
                         help="SSL model to use (default: facebook/wav2vec2-xls-r-2b)")
-    parser.add_argument("--frame-duration", type=int, default=25,
-                        help="Frame duration in milliseconds (default: 25ms as per paper)")
-    parser.add_argument("--frame-stride", type=int, default=20,
-                        help="Frame stride in milliseconds (default: 20ms as per paper)")
+    parser.add_argument("--frame-shift", type=float, default=0.02,
+                        help="Frame shift in seconds (default: 0.02s = 20ms as per paper)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", 
                         help="Device to use for computation")
     parser.add_argument("--prefix", type=str, default="et", 

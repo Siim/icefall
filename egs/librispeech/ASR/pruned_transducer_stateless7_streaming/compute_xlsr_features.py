@@ -43,18 +43,37 @@ def compute_xlsr_features(args):
     assert manifests is not None, "Failed to read manifests"
     
     # Create the SSL feature extractor with specific frame parameters
-    logging.info(f"Creating feature extractor with model: {args.model_name}")
+    logging.info(f"Creating feature extractor with model: {args.ssl_model}")
     logging.info(f"Frame duration: {args.frame_duration}ms, Frame stride: {args.frame_stride}ms")
     
     # Create config with frame parameters
-    ssl_config = S3PRLSSLConfig(
-        ssl_model=args.ssl_model,
-        model_name=args.model_name,
-        device=args.device,
-        # Add frame duration and stride parameters
-        window_ms=args.frame_duration,  # Frame duration in ms
-        stride_ms=args.frame_stride,    # Frame stride in ms
-    )
+    # Note: Check the actual parameter names in S3PRLSSLConfig documentation
+    try:
+        ssl_config = S3PRLSSLConfig(
+            ssl_model=args.ssl_model,
+            device=args.device,
+            # Add frame duration and stride parameters
+            window_ms=args.frame_duration,  # Frame duration in ms
+            stride_ms=args.frame_stride,    # Frame stride in ms
+        )
+    except TypeError as e:
+        logging.warning(f"Error with window_ms/stride_ms parameters: {e}")
+        logging.info("Trying with alternative parameter names...")
+        try:
+            ssl_config = S3PRLSSLConfig(
+                ssl_model=args.ssl_model,
+                device=args.device,
+                # Try alternative parameter names
+                feature_frame_length=args.frame_duration,
+                feature_frame_shift=args.frame_stride,
+            )
+        except TypeError as e:
+            logging.warning(f"Error with alternative parameter names: {e}")
+            logging.info("Falling back to default parameters...")
+            ssl_config = S3PRLSSLConfig(
+                ssl_model=args.ssl_model,
+                device=args.device,
+            )
     
     extractor = S3PRLSSL(ssl_config)
     
@@ -116,10 +135,8 @@ def main():
                         help="Directory containing the manifest files")
     parser.add_argument("--output-dir", type=str, default="data/ssl", 
                         help="Output directory for features")
-    parser.add_argument("--ssl-model", type=str, default="wav2vec2", 
-                        help="SSL model to use (default: wav2vec2)")
-    parser.add_argument("--model-name", type=str, default="TalTechNLP/xls-r-300m-et",
-                        help="Specific model name/path to use (default: TalTechNLP/xls-r-300m-et)")
+    parser.add_argument("--ssl-model", type=str, default="facebook/wav2vec2-xls-r-2b", 
+                        help="SSL model to use (default: facebook/wav2vec2-xls-r-2b)")
     parser.add_argument("--frame-duration", type=int, default=25,
                         help="Frame duration in milliseconds (default: 25ms as per paper)")
     parser.add_argument("--frame-stride", type=int, default=20,

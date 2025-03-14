@@ -113,8 +113,8 @@ def main():
                         help="Directory containing the manifest files")
     parser.add_argument("--output-dir", type=str, default="data/ssl", 
                         help="Output directory for features")
-    parser.add_argument("--ssl-model", type=str, default="facebook/wav2vec2-xls-r-2b", 
-                        help="SSL model to use (default: facebook/wav2vec2-xls-r-2b)")
+    parser.add_argument("--ssl-model", type=str, default="facebook/wav2vec2-large-xlsr-53", 
+                        help="SSL model to use (default: facebook/wav2vec2-large-xlsr-53)")
     parser.add_argument("--frame-shift", type=float, default=0.02,
                         help="Frame shift in seconds (default: 0.02s = 20ms as per paper)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", 

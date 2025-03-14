@@ -42,8 +42,21 @@ def compute_xlsr_features(args):
     
     assert manifests is not None, "Failed to read manifests"
     
-    # Create the SSL feature extractor
-    extractor = S3PRLSSL(S3PRLSSLConfig(ssl_model=args.ssl_model, device=args.device))
+    # Create the SSL feature extractor with specific frame parameters
+    logging.info(f"Creating feature extractor with model: {args.model_name}")
+    logging.info(f"Frame duration: {args.frame_duration}ms, Frame stride: {args.frame_stride}ms")
+    
+    # Create config with frame parameters
+    ssl_config = S3PRLSSLConfig(
+        ssl_model=args.ssl_model,
+        model_name=args.model_name,
+        device=args.device,
+        # Add frame duration and stride parameters
+        window_ms=args.frame_duration,  # Frame duration in ms
+        stride_ms=args.frame_stride,    # Frame stride in ms
+    )
+    
+    extractor = S3PRLSSL(ssl_config)
     
     # Process each partition
     for partition, m in manifests.items():
@@ -105,6 +118,12 @@ def main():
                         help="Output directory for features")
     parser.add_argument("--ssl-model", type=str, default="wav2vec2", 
                         help="SSL model to use (default: wav2vec2)")
+    parser.add_argument("--model-name", type=str, default="TalTechNLP/xls-r-300m-et",
+                        help="Specific model name/path to use (default: TalTechNLP/xls-r-300m-et)")
+    parser.add_argument("--frame-duration", type=int, default=25,
+                        help="Frame duration in milliseconds (default: 25ms as per paper)")
+    parser.add_argument("--frame-stride", type=int, default=20,
+                        help="Frame stride in milliseconds (default: 20ms as per paper)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", 
                         help="Device to use for computation")
     parser.add_argument("--prefix", type=str, default="et", 

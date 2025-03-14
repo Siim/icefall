@@ -70,8 +70,12 @@ def compute_xlsr_features(args):
             supervisions=m["supervisions"],
         )
         
-        # Check for non-16kHz files
-        non_16k_files = [(r.id, r.sampling_rate) for r in cut_set.recordings if r.sampling_rate != 16000]
+        # FIXED: Check for non-16kHz files by iterating through cuts
+        non_16k_files = []
+        for cut in cut_set:
+            if cut.sampling_rate != 16000:
+                non_16k_files.append((cut.id, cut.sampling_rate))
+        
         if non_16k_files:
             logging.warning(f"Found {len(non_16k_files)} files that are not sampled at 16kHz")
             logging.warning("XLSR models require 16kHz audio. Feature extraction may fail.")

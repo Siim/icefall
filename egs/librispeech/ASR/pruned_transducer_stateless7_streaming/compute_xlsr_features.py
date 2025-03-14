@@ -70,10 +70,29 @@ def compute_xlsr_features(args):
             supervisions=m["supervisions"],
         )
         
-        # Resample to 16kHz if needed
+        # Check for non-16kHz files
+        non_16k_files = [(r.id, r.sampling_rate) for r in cut_set.recordings if r.sampling_rate != 16000]
+        if non_16k_files:
+            logging.warning(f"Found {len(non_16k_files)} files that are not sampled at 16kHz")
+            logging.warning("XLSR models require 16kHz audio. Feature extraction may fail.")
+            if len(non_16k_files) > 5:
+                logging.warning(f"First 5 non-16kHz files: {non_16k_files[:5]}")
+            else:
+                logging.warning(f"Non-16kHz files: {non_16k_files}")
+        
+        # Resample to 16kHz if needed - FIXED: Ensure resampling happens
         if args.resample:
-            logging.info(f"Resampling audio to 16kHz")
+            logging.info(f"RESAMPLING: Converting all audio to 16kHz for XLSR compatibility")
             cut_set = cut_set.resample(16000)
+            logging.info(f"Resampling complete for {partition}")
+        else:
+            logging.error("CRITICAL: Resampling is disabled but non-16kHz files were found!")
+            logging.error("XLSR models require 16kHz audio. Feature extraction will likely fail.")
+            logging.error("Please enable resampling with --resample")
+            if not args.force_no_resample:
+                logging.info("Forcing resampling to prevent errors...")
+                cut_set = cut_set.resample(16000)
+                logging.info(f"Forced resampling complete for {partition}")
         
         # Check if we should use parallel processing
         if args.num_jobs > 1 and platform.system() == "Darwin":
@@ -98,6 +117,17 @@ def compute_xlsr_features(args):
     
     logging.info(f"Feature extraction complete! Saved to {output_dir}")
 
+def str2bool(v):
+    """Convert string to boolean"""
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
 def main():
     # Set multiprocessing start method to 'fork' on Unix systems
     if platform.system() != "Windows":
@@ -113,8 +143,8 @@ def main():
                         help="Directory containing the manifest files")
     parser.add_argument("--output-dir", type=str, default="data/ssl", 
                         help="Output directory for features")
-    parser.add_argument("--ssl-model", type=str, default="facebook/wav2vec2-large-xlsr-53", 
-                        help="SSL model to use (default: facebook/wav2vec2-large-xlsr-53)")
+    parser.add_argument("--ssl-model", type=str, default="facebook/wav2vec2-xls-r-2b", 
+                        help="SSL model to use (default: facebook/wav2vec2-xls-r-2b)")
     parser.add_argument("--frame-shift", type=float, default=0.02,
                         help="Frame shift in seconds (default: 0.02s = 20ms as per paper)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", 
@@ -127,8 +157,13 @@ def main():
                         help="Comma-separated list of dataset parts to process (e.g., 'train,dev,test')")
     parser.add_argument("--force", action="store_true", 
                         help="Force recomputation of features even if they already exist")
-    parser.add_argument("--resample", action="store_true", default=True,
+    
+    # FIXED: Changed from action="store_true" with default=True to type=str2bool with default=True
+    parser.add_argument("--resample", type=str2bool, default=True,
                         help="Resample audio to 16kHz if needed (required for XLSR models)")
+    parser.add_argument("--force-no-resample", action="store_true",
+                        help="Force disable resampling even if non-16kHz files are found (NOT RECOMMENDED)")
+    
     parser.add_argument("--num-jobs", type=int, default=3,
                         help="Number of parallel jobs to use for feature extraction")
     
@@ -141,6 +176,12 @@ def main():
             logging.StreamHandler(),
         ]
     )
+    
+    # ADDED: Print resampling status at startup
+    if args.resample:
+        logging.info("Resampling is ENABLED - Audio will be converted to 16kHz as required by XLSR")
+    else:
+        logging.warning("Resampling is DISABLED - This may cause errors if files are not 16kHz")
     
     compute_xlsr_features(args)
 

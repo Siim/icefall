@@ -116,13 +116,14 @@ def compute_xlsr_features(args):
                         filepath = cut.recording.sources[0].source
                         logging.info(f"Saving resampled audio to {filepath}")
                         torchaudio.save(
-                            filepath=filepath,
+                            filepath,
                             src=torch.tensor(resampled).unsqueeze(0),
                             sample_rate=16000,
                             format=os.path.splitext(filepath)[1][1:]  # Extract format from extension
                         )
                     except Exception as e:
                         logging.error(f"Failed to resample and save {cut.id}: {e}")
+                        logging.exception(e)  # Add full traceback for debugging
             
             # 2. Reload manifests to get updated sampling rates
             logging.info(f"Reloading manifests after resampling...")

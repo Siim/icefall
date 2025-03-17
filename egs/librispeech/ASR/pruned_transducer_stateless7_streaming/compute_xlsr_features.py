@@ -89,6 +89,9 @@ def compute_xlsr_features(args):
         if non_16k_files:
             logging.info(f"RESAMPLING: Converting all audio to 16kHz for XLSR compatibility")
             
+            # Minimum valid duration for XLS-R model (in samples at 16kHz)
+            min_valid_samples = 400  # Ensure at least 25ms (400 samples at 16kHz) for the convolution kernel
+            
             # 1. Persist resampled files by overwriting originals
             for cut in cut_set:
                 if cut.sampling_rate != 16000:
@@ -112,20 +115,26 @@ def compute_xlsr_features(args):
                                 new_freq=16000
                             )
                         
-                        # Save back to the original file
-                        filepath = cut.recording.sources[0].source
-                        logging.info(f"Saving resampled audio to {filepath}")
-                        
                         # Ensure tensor is 2D [channels, samples]
                         if resampled.dim() == 1:
                             # If 1D tensor (just samples), reshape to [1, samples]
                             resampled = resampled.unsqueeze(0)
                         
+                        # Check if audio is too short and pad if necessary
+                        if resampled.size(1) < min_valid_samples:
+                            logging.warning(f"Audio {cut.id} is too short ({resampled.size(1)} samples). Padding to {min_valid_samples} samples.")
+                            padding = torch.zeros(resampled.size(0), min_valid_samples - resampled.size(1), dtype=resampled.dtype)
+                            resampled = torch.cat([resampled, padding], dim=1)
+                        
+                        # Save back to the original file
+                        filepath = cut.recording.sources[0].source
+                        logging.info(f"Saving resampled audio to {filepath}")
+                        
                         # Save with proper format
                         file_ext = os.path.splitext(filepath)[1][1:]
                         torchaudio.save(
                             filepath,
-                            src=resampled,  # Already properly shaped
+                            src=resampled,
                             sample_rate=16000,
                             format=file_ext if file_ext else None
                         )
@@ -149,10 +158,22 @@ def compute_xlsr_features(args):
             )
             
             # Ensure all cuts are now at 16kHz
+            too_short_cuts = []
             for cut in cut_set:
                 if cut.sampling_rate != 16000:
                     # As a fallback, use lhotse's resample method
                     logging.warning(f"Cut {cut.id} still not at 16kHz, using lhotse resample")
+                # Check for cuts that might be too short
+                if cut.duration < 0.025:  # 25ms minimum for kernel size
+                    too_short_cuts.append((cut.id, cut.duration))
+            
+            if too_short_cuts:
+                logging.warning(f"Found {len(too_short_cuts)} cuts that might be too short for XLS-R model")
+                if len(too_short_cuts) > 5:
+                    logging.warning(f"First 5 too-short cuts: {too_short_cuts[:5]}")
+                else:
+                    logging.warning(f"Too-short cuts: {too_short_cuts}")
+                logging.warning("These cuts will be padded during feature extraction")
             
             # Final resample with lhotse
             cut_set = cut_set.resample(16000)
@@ -168,16 +189,52 @@ def compute_xlsr_features(args):
             logging.info(f"Using {args.num_jobs} parallel jobs for feature extraction")
             num_jobs = args.num_jobs
         
-        # Compute and store features
-        cut_set = cut_set.compute_and_store_features(
-            extractor=extractor,
-            storage_path=f"{output_dir}/{args.prefix}_feats_{partition}",
-            storage_type=NumpyFilesWriter,
-            num_jobs=num_jobs,
-        )
+        # Add custom pre-processing for short recordings before feature extraction
+        # Custom function to pad audio to minimum length if needed
+        def pad_short_recordings(cut):
+            if cut.duration < 0.025:  # 25ms minimum for kernel size
+                try:
+                    # Load audio
+                    audio = cut.load_audio()
+                    samples = audio[0] if isinstance(audio, tuple) else audio
+                    samples_tensor = torch.tensor(samples, dtype=torch.float32)
+                    
+                    # Ensure it's at least 400 samples (25ms at 16kHz)
+                    min_samples = 400
+                    if len(samples_tensor) < min_samples:
+                        # Pad with zeros to reach minimum length
+                        padding_length = min_samples - len(samples_tensor)
+                        padded_audio = torch.nn.functional.pad(samples_tensor, (0, padding_length))
+                        # Save back to file
+                        filepath = cut.recording.sources[0].source
+                        torchaudio.save(
+                            filepath,
+                            padded_audio.unsqueeze(0),
+                            sample_rate=16000
+                        )
+                        logging.info(f"Padded audio {cut.id} from {len(samples_tensor)} to {min_samples} samples")
+                except Exception as e:
+                    logging.error(f"Failed to pad short recording {cut.id}: {e}")
+            return cut
         
-        # Save the cuts with features
-        cut_set.to_file(output_dir / cuts_filename)
+        # Apply padding to short recordings
+        cut_set = CutSet.from_cuts(pad_short_recordings(cut) for cut in cut_set)
+        
+        # Compute and store features
+        try:
+            cut_set = cut_set.compute_and_store_features(
+                extractor=extractor,
+                storage_path=f"{output_dir}/{args.prefix}_feats_{partition}",
+                storage_type=NumpyFilesWriter,
+                num_jobs=num_jobs,
+            )
+            
+            # Save the cuts with features
+            cut_set.to_file(output_dir / cuts_filename)
+        except Exception as e:
+            logging.error(f"Error during feature extraction: {e}")
+            logging.exception(e)
+            raise
     
     logging.info(f"Feature extraction complete! Saved to {output_dir}")
 

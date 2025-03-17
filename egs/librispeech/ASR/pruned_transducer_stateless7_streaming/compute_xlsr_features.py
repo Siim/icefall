@@ -221,14 +221,17 @@ def compute_xlsr_features(args):
                 
                 # Verify file paths in updated manifest
                 logging.info(f"Verifying updated file paths in manifest for {partition}:")
-                sample_recordings = recording_set.to_list()[:3]
-                for rec in sample_recordings:
+                sample_count = 0
+                for rec in recording_set:
+                    if sample_count >= 3:  # Just check first 3 recordings
+                        break
                     for source in rec.sources:
                         if os.path.exists(source.source):
                             file_status = "exists"
                         else:
                             file_status = "MISSING"
                         logging.info(f"  - {source.source} (sampling rate: {rec.sampling_rate}) - {file_status}")
+                    sample_count += 1
             
             # Recreate CutSet with updated recordings
             cut_set = CutSet.from_manifests(

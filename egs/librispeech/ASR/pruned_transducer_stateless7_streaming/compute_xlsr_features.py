@@ -100,26 +100,34 @@ def compute_xlsr_features(args):
                             # Handle (samples, sampling_rate) tuple
                             samples, _ = audio
                             resampled = torchaudio.functional.resample(
-                                torch.tensor(samples), 
+                                torch.tensor(samples, dtype=torch.float32), 
                                 orig_freq=cut.sampling_rate, 
                                 new_freq=16000
-                            ).numpy()
+                            )
                         else:
                             # Handle just samples
                             resampled = torchaudio.functional.resample(
-                                torch.tensor(audio), 
+                                torch.tensor(audio, dtype=torch.float32), 
                                 orig_freq=cut.sampling_rate, 
                                 new_freq=16000
-                            ).numpy()
+                            )
                         
                         # Save back to the original file
                         filepath = cut.recording.sources[0].source
                         logging.info(f"Saving resampled audio to {filepath}")
+                        
+                        # Ensure tensor is 2D [channels, samples]
+                        if resampled.dim() == 1:
+                            # If 1D tensor (just samples), reshape to [1, samples]
+                            resampled = resampled.unsqueeze(0)
+                        
+                        # Save with proper format
+                        file_ext = os.path.splitext(filepath)[1][1:]
                         torchaudio.save(
                             filepath,
-                            src=torch.tensor(resampled).unsqueeze(0),
+                            src=resampled,  # Already properly shaped
                             sample_rate=16000,
-                            format=os.path.splitext(filepath)[1][1:]  # Extract format from extension
+                            format=file_ext if file_ext else None
                         )
                     except Exception as e:
                         logging.error(f"Failed to resample and save {cut.id}: {e}")

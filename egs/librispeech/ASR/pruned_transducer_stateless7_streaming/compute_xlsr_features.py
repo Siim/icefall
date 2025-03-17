@@ -182,6 +182,27 @@ def compute_xlsr_features(args):
                             source.source = resampled_file_map[source.source]
                             # Update the sampling rate in the recording metadata
                             recording.sampling_rate = 16000
+                
+                # Save the updated manifest back to disk with updated paths
+                manifest_path = Path(src_dir) / f"{args.prefix}_{partition}.{args.suffix}"
+                logging.info(f"Saving updated manifest to {manifest_path}")
+                from lhotse import RecordingSet, SupervisionSet
+                
+                # Create recording and supervision sets
+                recording_set = RecordingSet.from_recordings(m["recordings"])
+                supervision_set = SupervisionSet.from_segments(m["supervisions"])
+                
+                # Save them back to disk
+                recording_set.to_file(manifest_path.with_suffix(".recordings.jsonl.gz"))
+                supervision_set.to_file(manifest_path.with_suffix(".supervisions.jsonl.gz"))
+                
+                # Update our in-memory reference too
+                m = {
+                    "recordings": recording_set,
+                    "supervisions": supervision_set
+                }
+                
+                logging.info(f"Manifest updated and saved with resampled file paths")
             
             # Recreate CutSet with updated recordings
             cut_set = CutSet.from_manifests(
@@ -234,20 +255,29 @@ def compute_xlsr_features(args):
                         if padded_audio.dim() == 1:
                             padded_audio = padded_audio.unsqueeze(0)  # Add channel dimension
                         
-                        # Save back to file
+                        # Get current file path (which should now point to the resampled file)
                         filepath = cut.recording.sources[0].source
                         logging.info(f"Padded audio {cut.id} from {len(samples_tensor)} to {min_samples} samples")
                         
                         # Debug dimensions to ensure correctness
                         logging.info(f"Tensor shape before saving: {padded_audio.shape}")
                         
-                        file_ext = os.path.splitext(filepath)[1][1:]
+                        # Extract file extension or default to wav
+                        file_ext = os.path.splitext(filepath)[1][1:] or "wav"
+                        
+                        # Save with proper format
                         torchaudio.save(
                             filepath,
                             padded_audio,  # Already properly shaped as [channels, samples]
                             sample_rate=16000,
-                            format=file_ext if file_ext else None
+                            format=file_ext
                         )
+                        
+                        # Verify the file was saved correctly
+                        if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                            logging.info(f"Successfully padded and saved {filepath}")
+                        else:
+                            logging.error(f"Failed to save or empty file after padding: {filepath}")
                 except Exception as e:
                     logging.error(f"Failed to pad short recording {cut.id}: {e}")
                     logging.exception(e)  # Add full stack trace

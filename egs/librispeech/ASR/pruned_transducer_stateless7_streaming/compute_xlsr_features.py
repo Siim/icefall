@@ -24,6 +24,11 @@ def compute_xlsr_features(args):
     output_dir = Path(args.output_dir)
     os.makedirs(output_dir, exist_ok=True)
     
+    # Create directory for resampled audio files
+    resampled_dir = Path(args.output_dir) / "resampled_audio"
+    os.makedirs(resampled_dir, exist_ok=True)
+    logging.info(f"Resampled audio will be saved to {resampled_dir}")
+    
     # Determine which manifest parts to process
     if args.dataset_parts:
         dataset_parts = args.dataset_parts.split(',')
@@ -92,12 +97,16 @@ def compute_xlsr_features(args):
             # Minimum valid duration for XLS-R model (in samples at 16kHz)
             min_valid_samples = 400  # Ensure at least 25ms (400 samples at 16kHz) for the convolution kernel
             
-            # 1. Persist resampled files by overwriting originals
+            # Track resampled file paths
+            resampled_file_map = {}
+            
+            # 1. Create resampled copies instead of overwriting originals
             for cut in cut_set:
                 if cut.sampling_rate != 16000:
                     try:
                         # Load the audio
                         audio = cut.load_audio()
+                        
                         # Resample it
                         if isinstance(audio, tuple):
                             # Handle (samples, sampling_rate) tuple
@@ -126,30 +135,53 @@ def compute_xlsr_features(args):
                             padding = torch.zeros(resampled.size(0), min_valid_samples - resampled.size(1), dtype=resampled.dtype)
                             resampled = torch.cat([resampled, padding], dim=1)
                         
-                        # Save back to the original file
-                        filepath = cut.recording.sources[0].source
-                        logging.info(f"Saving resampled audio to {filepath}")
+                        # Create a new filename for the resampled audio instead of overwriting
+                        original_filepath = cut.recording.sources[0].source
+                        filename = os.path.basename(original_filepath)
+                        resampled_filepath = resampled_dir / f"resampled_{filename}"
                         
-                        # Save with proper format
-                        file_ext = os.path.splitext(filepath)[1][1:]
+                        logging.info(f"Saving resampled audio to {resampled_filepath}")
+                        
+                        # Verify tensor shape before saving
+                        if resampled.dim() != 2:
+                            logging.warning(f"Tensor shape is not 2D: {resampled.shape}. Reshaping...")
+                            if resampled.dim() == 1:
+                                resampled = resampled.unsqueeze(0)
+                            elif resampled.dim() > 2:
+                                # Take the first channel if multidimensional
+                                resampled = resampled[0:1]
+                        
+                        logging.info(f"Final tensor shape: {resampled.shape}")
+                        
+                        # Save with proper format - always use WAV for consistency
                         torchaudio.save(
-                            filepath,
+                            str(resampled_filepath),  # Convert Path to string
                             src=resampled,
                             sample_rate=16000,
-                            format=file_ext if file_ext else None
+                            format="wav"  # Use WAV format for maximum compatibility
                         )
+                        
+                        # Verify the file was saved correctly
+                        if os.path.exists(resampled_filepath) and os.path.getsize(resampled_filepath) > 0:
+                            logging.info(f"Successfully saved {resampled_filepath}")
+                            # Store the mapping from original to resampled file
+                            resampled_file_map[original_filepath] = str(resampled_filepath)
+                        else:
+                            logging.error(f"Failed to save or empty file: {resampled_filepath}")
+                            
                     except Exception as e:
                         logging.error(f"Failed to resample and save {cut.id}: {e}")
                         logging.exception(e)  # Add full traceback for debugging
             
-            # 2. Reload manifests to get updated sampling rates
-            logging.info(f"Reloading manifests after resampling...")
-            m = read_manifests_if_cached(
-                dataset_parts=[partition],
-                output_dir=src_dir,
-                prefix=args.prefix,
-                suffix=args.suffix,
-            )[partition]
+            # Modify the manifest to point to resampled files
+            if resampled_file_map:
+                logging.info(f"Updating manifest with {len(resampled_file_map)} resampled file paths")
+                for recording in m["recordings"]:
+                    for source in recording.sources:
+                        if source.source in resampled_file_map:
+                            source.source = resampled_file_map[source.source]
+                            # Update the sampling rate in the recording metadata
+                            recording.sampling_rate = 16000
             
             # Recreate CutSet with updated recordings
             cut_set = CutSet.from_manifests(
@@ -157,26 +189,18 @@ def compute_xlsr_features(args):
                 supervisions=m["supervisions"],
             )
             
-            # Ensure all cuts are now at 16kHz
-            too_short_cuts = []
+            # Verify all cuts are now at 16kHz
+            non_16k_after_resample = []
             for cut in cut_set:
                 if cut.sampling_rate != 16000:
-                    # As a fallback, use lhotse's resample method
-                    logging.warning(f"Cut {cut.id} still not at 16kHz, using lhotse resample")
-                # Check for cuts that might be too short
-                if cut.duration < 0.025:  # 25ms minimum for kernel size
-                    too_short_cuts.append((cut.id, cut.duration))
+                    non_16k_after_resample.append(cut.id)
             
-            if too_short_cuts:
-                logging.warning(f"Found {len(too_short_cuts)} cuts that might be too short for XLS-R model")
-                if len(too_short_cuts) > 5:
-                    logging.warning(f"First 5 too-short cuts: {too_short_cuts[:5]}")
-                else:
-                    logging.warning(f"Too-short cuts: {too_short_cuts}")
-                logging.warning("These cuts will be padded during feature extraction")
+            if non_16k_after_resample:
+                logging.warning(f"After resampling, {len(non_16k_after_resample)} cuts still not at 16kHz")
+                logging.warning("Using lhotse's resample method for these cuts")
+                # Final resample with lhotse
+                cut_set = cut_set.resample(16000)
             
-            # Final resample with lhotse
-            cut_set = cut_set.resample(16000)
             logging.info(f"Resampling complete for {partition}")
         
         # Check if we should use parallel processing

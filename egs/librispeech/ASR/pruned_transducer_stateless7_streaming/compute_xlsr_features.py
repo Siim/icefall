@@ -48,9 +48,23 @@ def compute_xlsr_features(args):
     
     assert manifests is not None, "Failed to read manifests"
     
-    # Create the SSL feature extractor with specific frame parameters
+    # After loading manifests, add a debug section
     logging.info(f"Creating feature extractor with model: {args.ssl_model}")
     logging.info(f"Frame shift: {args.frame_shift}s (matches paper's 20ms recommendation)")
+    
+    # Add debug summary of manifests
+    for part_name, manifest in manifests.items():
+        recordings_count = len(manifest["recordings"])
+        supervisions_count = len(manifest["supervisions"])
+        logging.info(f"Loaded manifest for {part_name}: {recordings_count} recordings, {supervisions_count} supervisions")
+        
+        # Sample a few recordings to verify paths
+        if recordings_count > 0:
+            sample_recordings = manifest["recordings"][:3]
+            logging.info(f"Sample recording paths for {part_name}:")
+            for rec in sample_recordings:
+                for source in rec.sources:
+                    logging.info(f"  - {source.source} (sampling rate: {rec.sampling_rate})")
     
     # Create config with correct frame_shift parameter
     ssl_config = S3PRLSSLConfig(
@@ -202,7 +216,19 @@ def compute_xlsr_features(args):
                     "supervisions": supervision_set
                 }
                 
+                # After resampling, add verification of file paths in the updated manifest
                 logging.info(f"Manifest updated and saved with resampled file paths")
+                
+                # Verify file paths in updated manifest
+                logging.info(f"Verifying updated file paths in manifest for {partition}:")
+                sample_recordings = recording_set.to_list()[:3]
+                for rec in sample_recordings:
+                    for source in rec.sources:
+                        if os.path.exists(source.source):
+                            file_status = "exists"
+                        else:
+                            file_status = "MISSING"
+                        logging.info(f"  - {source.source} (sampling rate: {rec.sampling_rate}) - {file_status}")
             
             # Recreate CutSet with updated recordings
             cut_set = CutSet.from_manifests(
@@ -285,6 +311,23 @@ def compute_xlsr_features(args):
         
         # Apply padding to short recordings
         cut_set = CutSet.from_cuts(pad_short_recordings(cut) for cut in cut_set)
+        
+        # Verify audio files exist before feature extraction
+        missing_files = []
+        sample_cuts = list(cut_set)[:5]
+        logging.info(f"Verifying audio files exist for {partition} before feature extraction:")
+        for cut in sample_cuts:
+            filepath = cut.recording.sources[0].source
+            if os.path.exists(filepath):
+                file_status = "exists"
+            else:
+                file_status = "MISSING"
+                missing_files.append(filepath)
+            logging.info(f"  - {cut.id}: {filepath} ({cut.sampling_rate}Hz) - {file_status}")
+        
+        if missing_files:
+            logging.warning(f"Found {len(missing_files)} missing audio files before feature extraction!")
+            logging.warning(f"Example missing files: {missing_files[:5]}")
         
         # Compute and store features
         try:

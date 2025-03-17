@@ -190,12 +190,39 @@ def compute_xlsr_features(args):
             # Modify the manifest to point to resampled files
             if resampled_file_map:
                 logging.info(f"Updating manifest with {len(resampled_file_map)} resampled file paths")
+                
+                # Store duration and num_samples updates
+                recording_updates = {}
+                
+                # First calculate the correct new num_samples for each resampled file
+                for filepath, resampled_filepath in resampled_file_map.items():
+                    try:
+                        # Load the audio to get actual info
+                        info = torchaudio.info(resampled_filepath)
+                        # Store the actual number of samples and duration for later update
+                        recording_updates[filepath] = {
+                            "num_samples": info.num_frames,
+                            "duration": info.num_frames / 16000  # Calculate duration from samples at 16kHz
+                        }
+                        logging.info(f"Updated metadata for {resampled_filepath}: {info.num_frames} samples, {info.num_frames/16000:.3f}s")
+                    except Exception as e:
+                        logging.error(f"Failed to get info for resampled file {resampled_filepath}: {e}")
+                
+                # Update recordings with new paths and corrected metadata
                 for recording in m["recordings"]:
                     for source in recording.sources:
-                        if source.source in resampled_file_map:
-                            source.source = resampled_file_map[source.source]
-                            # Update the sampling rate in the recording metadata
+                        original_path = source.source
+                        if original_path in resampled_file_map:
+                            # Update path
+                            source.source = resampled_file_map[original_path]
+                            # Update sampling rate
                             recording.sampling_rate = 16000
+                            
+                            # Update num_samples and duration if available
+                            if original_path in recording_updates:
+                                recording.num_samples = recording_updates[original_path]["num_samples"]
+                                recording.duration = recording_updates[original_path]["duration"]
+                                logging.info(f"Updated recording {recording.id}: {recording.num_samples} samples, {recording.duration:.3f}s")
                 
                 # Save the updated manifest back to disk with updated paths
                 manifest_path = Path(src_dir) / f"{args.prefix}_{partition}.{args.suffix}"

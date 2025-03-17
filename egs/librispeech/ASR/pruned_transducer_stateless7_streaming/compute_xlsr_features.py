@@ -224,6 +224,18 @@ def compute_xlsr_features(args):
                                 recording.duration = recording_updates[original_path]["duration"]
                                 logging.info(f"Updated recording {recording.id}: {recording.num_samples} samples, {recording.duration:.3f}s")
                 
+                # Update supervision segments to ensure they don't exceed recording durations
+                recording_durations = {rec.id: rec.duration for rec in m["recordings"]}
+                for supervision in m["supervisions"]:
+                    if supervision.recording_id in recording_durations:
+                        rec_duration = recording_durations[supervision.recording_id]
+                        
+                        # If supervision extends past recording end, adjust it
+                        if supervision.start + supervision.duration > rec_duration:
+                            old_duration = supervision.duration
+                            supervision.duration = max(0.001, rec_duration - supervision.start)
+                            logging.info(f"Adjusted supervision {supervision.id} duration from {old_duration:.3f}s to {supervision.duration:.3f}s to match recording duration {rec_duration:.3f}s")
+                
                 # Save the updated manifest back to disk with updated paths
                 manifest_path = Path(src_dir) / f"{args.prefix}_{partition}.{args.suffix}"
                 logging.info(f"Saving updated manifest to {manifest_path}")

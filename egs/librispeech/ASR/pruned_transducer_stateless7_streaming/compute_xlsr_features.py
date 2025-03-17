@@ -205,16 +205,28 @@ def compute_xlsr_features(args):
                         # Pad with zeros to reach minimum length
                         padding_length = min_samples - len(samples_tensor)
                         padded_audio = torch.nn.functional.pad(samples_tensor, (0, padding_length))
+                        
+                        # Ensure tensor is 2D [channels, samples] before saving
+                        if padded_audio.dim() == 1:
+                            padded_audio = padded_audio.unsqueeze(0)  # Add channel dimension
+                        
                         # Save back to file
                         filepath = cut.recording.sources[0].source
+                        logging.info(f"Padded audio {cut.id} from {len(samples_tensor)} to {min_samples} samples")
+                        
+                        # Debug dimensions to ensure correctness
+                        logging.info(f"Tensor shape before saving: {padded_audio.shape}")
+                        
+                        file_ext = os.path.splitext(filepath)[1][1:]
                         torchaudio.save(
                             filepath,
-                            padded_audio.unsqueeze(0),
-                            sample_rate=16000
+                            padded_audio,  # Already properly shaped as [channels, samples]
+                            sample_rate=16000,
+                            format=file_ext if file_ext else None
                         )
-                        logging.info(f"Padded audio {cut.id} from {len(samples_tensor)} to {min_samples} samples")
                 except Exception as e:
                     logging.error(f"Failed to pad short recording {cut.id}: {e}")
+                    logging.exception(e)  # Add full stack trace
             return cut
         
         # Apply padding to short recordings

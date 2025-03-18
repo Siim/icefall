@@ -10,6 +10,7 @@ import torchaudio
 from lhotse import S3PRLSSL, CutSet, NumpyFilesWriter, S3PRLSSLConfig
 from lhotse.recipes.utils import read_manifests_if_cached
 import platform
+import subprocess
 
 # Torch's multithreaded behavior needs to be disabled or
 # it wastes a lot of CPU and slows things down.
@@ -118,74 +119,45 @@ def compute_xlsr_features(args):
             for cut in cut_set:
                 if cut.sampling_rate != 16000:
                     try:
-                        # Load the audio
-                        audio = cut.load_audio()
-                        
-                        # Resample it
-                        if isinstance(audio, tuple):
-                            # Handle (samples, sampling_rate) tuple
-                            samples, _ = audio
-                            resampled = torchaudio.functional.resample(
-                                torch.tensor(samples, dtype=torch.float32), 
-                                orig_freq=cut.sampling_rate, 
-                                new_freq=16000
-                            )
-                        else:
-                            # Handle just samples
-                            resampled = torchaudio.functional.resample(
-                                torch.tensor(audio, dtype=torch.float32), 
-                                orig_freq=cut.sampling_rate, 
-                                new_freq=16000
-                            )
-                        
-                        # Ensure tensor is 2D [channels, samples]
-                        if resampled.dim() == 1:
-                            # If 1D tensor (just samples), reshape to [1, samples]
-                            resampled = resampled.unsqueeze(0)
-                        
-                        # Check if audio is too short and pad if necessary
-                        if resampled.size(1) < min_valid_samples:
-                            logging.warning(f"Audio {cut.id} is too short ({resampled.size(1)} samples). Padding to {min_valid_samples} samples.")
-                            padding = torch.zeros(resampled.size(0), min_valid_samples - resampled.size(1), dtype=resampled.dtype)
-                            resampled = torch.cat([resampled, padding], dim=1)
-                        
-                        # Create a new filename for the resampled audio instead of overwriting
+                        # Get original filepath
                         original_filepath = cut.recording.sources[0].source
                         filename = os.path.basename(original_filepath)
                         resampled_filepath = resampled_dir / f"resampled_{filename}"
                         
-                        logging.info(f"Saving resampled audio to {resampled_filepath}")
+                        # Use ffmpeg for resampling - much more robust than torchaudio
                         
-                        # Verify tensor shape before saving
-                        if resampled.dim() != 2:
-                            logging.warning(f"Tensor shape is not 2D: {resampled.shape}. Reshaping...")
-                            if resampled.dim() == 1:
-                                resampled = resampled.unsqueeze(0)
-                            elif resampled.dim() > 2:
-                                # Take the first channel if multidimensional
-                                resampled = resampled[0:1]
+                        # Ensure output directory exists
+                        os.makedirs(os.path.dirname(resampled_filepath), exist_ok=True)
                         
-                        logging.info(f"Final tensor shape: {resampled.shape}")
+                        # Construct and run ffmpeg command
+                        cmd = [
+                            "ffmpeg",
+                            "-y",  # Overwrite output files without asking
+                            "-i", original_filepath,  # Input file
+                            "-ar", "16000",  # Target sample rate
+                            "-ac", "1",      # Mono audio
+                            "-sample_fmt", "s16",  # 16-bit PCM
+                            str(resampled_filepath)  # Output file
+                        ]
                         
-                        # Save with proper format - always use WAV for consistency
-                        torchaudio.save(
-                            str(resampled_filepath),  # Convert Path to string
-                            src=resampled,
-                            sample_rate=16000,
-                            format="wav"  # Use WAV format for maximum compatibility
-                        )
+                        logging.info(f"Resampling with ffmpeg: {' '.join(cmd)}")
+                        result = subprocess.run(cmd, capture_output=True, text=True)
                         
-                        # Verify the file was saved correctly
+                        if result.returncode != 0:
+                            logging.error(f"ffmpeg error: {result.stderr}")
+                            raise RuntimeError(f"ffmpeg failed with return code {result.returncode}")
+                        
+                        # Verify the file was created successfully
                         if os.path.exists(resampled_filepath) and os.path.getsize(resampled_filepath) > 0:
-                            logging.info(f"Successfully saved {resampled_filepath}")
+                            logging.info(f"Successfully resampled to {resampled_filepath}")
                             # Store the mapping from original to resampled file
                             resampled_file_map[original_filepath] = str(resampled_filepath)
                         else:
-                            logging.error(f"Failed to save or empty file: {resampled_filepath}")
-                            
+                            logging.error(f"Failed to create or empty file: {resampled_filepath}")
+                    
                     except Exception as e:
-                        logging.error(f"Failed to resample and save {cut.id}: {e}")
-                        logging.exception(e)  # Add full traceback for debugging
+                        logging.error(f"Failed to resample {cut.id}: {e}")
+                        logging.exception(e)
             
             # Modify the manifest to point to resampled files
             if resampled_file_map:

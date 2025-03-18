@@ -11,11 +11,49 @@ from lhotse import S3PRLSSL, CutSet, NumpyFilesWriter, S3PRLSSLConfig
 from lhotse.recipes.utils import read_manifests_if_cached
 import platform
 import subprocess
+from concurrent.futures import ProcessPoolExecutor
+from tqdm import tqdm
+import multiprocessing
 
 # Torch's multithreaded behavior needs to be disabled or
 # it wastes a lot of CPU and slows things down.
 torch.set_num_threads(1)
 torch.set_num_interop_threads(1)
+
+# Function to resample a single file using ffmpeg
+def resample_file_with_ffmpeg(args):
+    original_filepath, resampled_filepath, cut_id = args
+    try:
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(resampled_filepath), exist_ok=True)
+        
+        # Construct and run ffmpeg command with higher thread count for better CPU utilization
+        cmd = [
+            "ffmpeg",
+            "-y",  # Overwrite output files without asking
+            "-i", original_filepath,  # Input file
+            "-ar", "16000",  # Target sample rate
+            "-ac", "1",      # Mono audio
+            "-sample_fmt", "s16",  # 16-bit PCM
+            "-threads", "4",  # Use more threads
+            str(resampled_filepath)  # Output file
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            logging.error(f"ffmpeg error for {cut_id}: {result.stderr}")
+            return None
+        
+        # Verify the file was created successfully
+        if os.path.exists(resampled_filepath) and os.path.getsize(resampled_filepath) > 0:
+            return (original_filepath, str(resampled_filepath))
+        else:
+            logging.error(f"Failed to create or empty file: {resampled_filepath}")
+            return None
+    except Exception as e:
+        logging.error(f"Failed to resample {cut_id}: {e}")
+        return None
 
 def compute_xlsr_features(args):
     """
@@ -115,49 +153,37 @@ def compute_xlsr_features(args):
             # Track resampled file paths
             resampled_file_map = {}
             
-            # 1. Create resampled copies instead of overwriting originals
+            # Prepare list of files to resample
+            resample_tasks = []
             for cut in cut_set:
                 if cut.sampling_rate != 16000:
-                    try:
-                        # Get original filepath
-                        original_filepath = cut.recording.sources[0].source
-                        filename = os.path.basename(original_filepath)
-                        resampled_filepath = resampled_dir / f"resampled_{filename}"
-                        
-                        # Use ffmpeg for resampling - much more robust than torchaudio
-                        
-                        # Ensure output directory exists
-                        os.makedirs(os.path.dirname(resampled_filepath), exist_ok=True)
-                        
-                        # Construct and run ffmpeg command
-                        cmd = [
-                            "ffmpeg",
-                            "-y",  # Overwrite output files without asking
-                            "-i", original_filepath,  # Input file
-                            "-ar", "16000",  # Target sample rate
-                            "-ac", "1",      # Mono audio
-                            "-sample_fmt", "s16",  # 16-bit PCM
-                            str(resampled_filepath)  # Output file
-                        ]
-                        
-                        logging.info(f"Resampling with ffmpeg: {' '.join(cmd)}")
-                        result = subprocess.run(cmd, capture_output=True, text=True)
-                        
-                        if result.returncode != 0:
-                            logging.error(f"ffmpeg error: {result.stderr}")
-                            raise RuntimeError(f"ffmpeg failed with return code {result.returncode}")
-                        
-                        # Verify the file was created successfully
-                        if os.path.exists(resampled_filepath) and os.path.getsize(resampled_filepath) > 0:
-                            logging.info(f"Successfully resampled to {resampled_filepath}")
-                            # Store the mapping from original to resampled file
-                            resampled_file_map[original_filepath] = str(resampled_filepath)
-                        else:
-                            logging.error(f"Failed to create or empty file: {resampled_filepath}")
-                    
-                    except Exception as e:
-                        logging.error(f"Failed to resample {cut.id}: {e}")
-                        logging.exception(e)
+                    original_filepath = cut.recording.sources[0].source
+                    filename = os.path.basename(original_filepath)
+                    resampled_filepath = resampled_dir / f"resampled_{filename}"
+                    resample_tasks.append((original_filepath, resampled_filepath, cut.id))
+            
+            # Set up parallel processing
+            num_workers = min(args.num_jobs, multiprocessing.cpu_count())
+            logging.info(f"Using {num_workers} parallel processes for resampling")
+            
+            # Process files in parallel with progress bar
+            successful_resamplings = []
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                # Map tasks to executor with progress bar
+                for result in tqdm(
+                    executor.map(resample_file_with_ffmpeg, resample_tasks),
+                    total=len(resample_tasks),
+                    desc="Resampling audio files",
+                    unit="file"
+                ):
+                    if result:
+                        successful_resamplings.append(result)
+            
+            # Convert results to map
+            for original_path, resampled_path in successful_resamplings:
+                resampled_file_map[original_path] = resampled_path
+            
+            logging.info(f"Successfully resampled {len(resampled_file_map)} of {len(resample_tasks)} files")
             
             # Modify the manifest to point to resampled files
             if resampled_file_map:

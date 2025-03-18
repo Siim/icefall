@@ -163,8 +163,10 @@ def compute_xlsr_features(args):
                     resample_tasks.append((original_filepath, resampled_filepath, cut.id))
             
             # Set up parallel processing
-            num_workers = min(args.num_jobs, multiprocessing.cpu_count())
-            logging.info(f"Using {num_workers} parallel processes for resampling")
+            total_cores = multiprocessing.cpu_count()
+            min_cores_to_use = max(int(total_cores * 2/3), 2)  # Use at least 2/3 of cores, minimum 2
+            num_workers = max(min(args.num_jobs, total_cores), min_cores_to_use)
+            logging.info(f"Using {num_workers} parallel processes for resampling (out of {total_cores} available cores)")
             
             # Process files in parallel with progress bar
             successful_resamplings = []

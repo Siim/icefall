@@ -371,6 +371,77 @@ def compute_xlsr_features(args):
             logging.warning(f"Found {len(missing_files)} missing audio files before feature extraction!")
             logging.warning(f"Example missing files: {missing_files[:5]}")
         
+        # Before the compute_and_store_features call, add validation check
+        # Verify consistency of audio files and lengths
+        logging.info(f"Validating cuts for consistent dimensions")
+        
+        # First, ensure all cuts are at the same sampling rate (16kHz)
+        for cut in cut_set:
+            if cut.sampling_rate != 16000:
+                logging.warning(f"Cut {cut.id} has sampling rate {cut.sampling_rate}, forcing to 16000")
+                cut.sampling_rate = 16000
+        
+        # Second, validate that the duration in metadata matches actual audio
+        for i, cut in enumerate(cut_set):
+            try:
+                # Check that the audio file exists
+                if not os.path.exists(cut.recording.sources[0].source):
+                    logging.warning(f"Audio file doesn't exist: {cut.recording.sources[0].source}")
+                    continue
+                
+                # Get audio info from the actual file
+                info = torchaudio.info(cut.recording.sources[0].source)
+                file_duration = info.num_frames / info.sample_rate
+                
+                # Compare with metadata
+                if abs(file_duration - cut.duration) > 0.1:  # Allow small rounding differences
+                    logging.warning(f"Mismatch in cut {cut.id}: metadata duration {cut.duration}s vs actual {file_duration}s")
+                    # Update metadata to match actual data
+                    cut.recording.duration = file_duration
+                    cut.recording.num_samples = info.num_frames
+                    # Also update supervision if needed
+                    for supervision in cut.supervisions:
+                        if supervision.duration > file_duration:
+                            supervision.duration = file_duration
+            except Exception as e:
+                logging.error(f"Error validating cut {cut.id}: {e}")
+        
+        # After validating cuts, recreate the CutSet to ensure updates are properly applied
+        logging.info(f"Recreating CutSet after validation")
+        
+        # Create RecordingSet and SupervisionSet from current cuts
+        recordings = []
+        supervisions = []
+        
+        for cut in cut_set:
+            recordings.append(cut.recording)
+            supervisions.extend(cut.supervisions)
+        
+        recording_set = RecordingSet.from_recordings(recordings)
+        supervision_set = SupervisionSet.from_segments(supervisions)
+        
+        # Save temporary manifests - this ensures metadata is consistent
+        tmp_manifest_path = Path(output_dir) / f"tmp_{args.prefix}_{partition}"
+        recording_set.to_file(tmp_manifest_path.with_suffix(".recordings.jsonl.gz"))
+        supervision_set.to_file(tmp_manifest_path.with_suffix(".supervisions.jsonl.gz"))
+        
+        # Reload the manifests to get a clean CutSet
+        tmp_manifests = read_manifests_if_cached(
+            dataset_parts=[f"tmp_{partition}"],
+            output_dir=output_dir,
+            prefix=args.prefix,
+            suffix=args.suffix,
+        )
+        
+        # Create a fresh CutSet
+        cut_set = CutSet.from_manifests(
+            recordings=tmp_manifests[f"tmp_{partition}"]["recordings"],
+            supervisions=tmp_manifests[f"tmp_{partition}"]["supervisions"],
+        )
+        
+        # One more check - ensure all cuts are at 16kHz
+        cut_set = cut_set.resample(16000)
+        
         # Compute and store features
         try:
             cut_set = cut_set.compute_and_store_features(

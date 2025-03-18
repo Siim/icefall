@@ -452,11 +452,21 @@ def compute_xlsr_features(args):
         
         # Compute and store features
         try:
+            # Determine whether to use single process for feature extraction
+            if args.single_process_s3prl:
+                logging.warning(f"Setting feature extraction to use 1 process due to S3PRL pickling limitations")
+                logging.warning(f"This is normal - the model objects can't be serialized between processes")
+                logging.warning(f"Resampling will still use parallel processing with {num_jobs} jobs")
+                feature_extraction_jobs = 1
+            else:
+                logging.info(f"Using {num_jobs} processes for feature extraction (may fail with pickling errors)")
+                feature_extraction_jobs = num_jobs
+            
             cut_set = cut_set.compute_and_store_features(
                 extractor=extractor,
                 storage_path=f"{output_dir}/{args.prefix}_feats_{partition}",
                 storage_type=NumpyFilesWriter,
-                num_jobs=num_jobs,
+                num_jobs=feature_extraction_jobs,
             )
             
             # Save the cuts with features
@@ -517,6 +527,9 @@ def main():
     
     parser.add_argument("--num-jobs", type=int, default=3,
                         help="Number of parallel jobs to use for feature extraction")
+    
+    parser.add_argument("--single-process-s3prl", action="store_true", default=True,
+                        help="Force single process for S3PRL feature extraction to avoid pickling errors")
     
     args = parser.parse_args()
     

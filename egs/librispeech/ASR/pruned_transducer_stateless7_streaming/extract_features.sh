@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # Script to extract XLSR features from the Estonian dataset
-# Usage: ./extract_features.sh [--force] [--single-process]
+# Usage: ./extract_features.sh [--force] [--no-single-process-s3prl]
 
 set -e  # Exit on error
 
 # Check for flags
 FORCE_FLAG=""
-SINGLE_PROCESS=0
+SINGLE_PROCESS_S3PRL="--single-process-s3prl"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -16,33 +16,35 @@ while [[ $# -gt 0 ]]; do
             echo "Will force overwrite existing features"
             shift
             ;;
+        --no-single-process-s3prl)
+            SINGLE_PROCESS_S3PRL=""
+            echo "Will attempt to use multiple processes for S3PRL feature extraction (may cause pickling errors)"
+            shift
+            ;;
         --single-process)
-            SINGLE_PROCESS=1
-            echo "Will use single process for feature extraction"
+            echo "WARNING: --single-process is deprecated, use --no-single-process-s3prl instead"
+            SINGLE_PROCESS_S3PRL="--single-process-s3prl"
             shift
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: ./extract_features.sh [--force] [--single-process]"
+            echo "Usage: ./extract_features.sh [--force] [--no-single-process-s3prl]"
             exit 1
             ;;
     esac
 done
 
 # Auto-detect macOS and recommend single process
-if [[ "$(uname)" == "Darwin" && $SINGLE_PROCESS -eq 0 ]]; then
-    echo "MacOS detected. Parallel processing may cause issues with the wav2vec model."
-    echo "Consider using --single-process if you encounter errors."
+if [[ "$(uname)" == "Darwin" && -z "$SINGLE_PROCESS_S3PRL" ]]; then
+    echo "MacOS detected. Parallel processing will likely cause pickling issues with S3PRL."
+    echo "Forcing --single-process-s3prl for macOS compatibility"
+    SINGLE_PROCESS_S3PRL="--single-process-s3prl"
 fi
 
-# Number of parallel jobs to use (adjust based on CPU cores available)
-if [[ $SINGLE_PROCESS -eq 1 ]]; then
-    NUM_JOBS=1
-    echo "Using single process for feature extraction"
-else
-    NUM_JOBS=10
-    echo "Using $NUM_JOBS parallel jobs for feature extraction"
-fi
+# Number of parallel jobs to use for resampling (adjust based on CPU cores available)
+NUM_JOBS=10
+echo "Using $NUM_JOBS parallel jobs for feature extraction"
+echo "S3PRL feature extraction will use single process by default to avoid pickling errors"
 
 # Create output directories
 mkdir -p data/manifests
@@ -65,6 +67,7 @@ python compute_xlsr_features.py \
     --prefix et \
     --dataset-parts train \
     --num-jobs $NUM_JOBS \
+    $SINGLE_PROCESS_S3PRL \
     $FORCE_FLAG
 
 # Step 3: Extract features for validation set
@@ -76,6 +79,7 @@ python compute_xlsr_features.py \
     --prefix et \
     --dataset-parts val \
     --num-jobs $NUM_JOBS \
+    $SINGLE_PROCESS_S3PRL \
     $FORCE_FLAG
 
 echo "Feature extraction complete!"

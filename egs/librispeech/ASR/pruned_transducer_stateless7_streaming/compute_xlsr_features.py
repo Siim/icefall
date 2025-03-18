@@ -529,7 +529,7 @@ def main():
                         help="Number of parallel jobs to use for feature extraction")
     
     parser.add_argument("--single-process-s3prl", action="store_true", default=True,
-                        help="Force single process for S3PRL feature extraction to avoid pickling errors")
+                        help="Force single process for S3PRL feature extraction to avoid pickling errors (default: True)")
     
     args = parser.parse_args()
     

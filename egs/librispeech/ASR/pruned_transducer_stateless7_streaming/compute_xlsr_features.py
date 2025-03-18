@@ -23,6 +23,11 @@ torch.set_num_interop_threads(1)
 # Function to resample a single file using ffmpeg
 def resample_file_with_ffmpeg(args):
     original_filepath, resampled_filepath, cut_id = args
+    # Check if the resampled file already exists
+    if os.path.exists(resampled_filepath) and os.path.getsize(resampled_filepath) > 0:
+        logging.info(f"Resampled file already exists: {resampled_filepath}")
+        return (original_filepath, str(resampled_filepath))
+    
     try:
         # Ensure output directory exists
         os.makedirs(os.path.dirname(resampled_filepath), exist_ok=True)
@@ -158,8 +163,23 @@ def compute_xlsr_features(args):
             for cut in cut_set:
                 if cut.sampling_rate != 16000:
                     original_filepath = cut.recording.sources[0].source
+                    # Create a 16k version of the filename by replacing the 24k suffix
+                    # First get the original directory and filename
+                    orig_dir = os.path.dirname(original_filepath)
                     filename = os.path.basename(original_filepath)
-                    resampled_filepath = resampled_dir / f"resampled_{filename}"
+                    
+                    # Replace the suffix if it exists (e.g., _24k.wav -> _16k.wav)
+                    if "_24k." in filename:
+                        resampled_filename = filename.replace("_24k.", "_16k.")
+                    else:
+                        # If no _24k suffix, insert _16k before the extension
+                        base, ext = os.path.splitext(filename)
+                        resampled_filename = f"{base}_16k{ext}"
+                    
+                    # Generate the resampled file path using the original directory
+                    # This keeps files in their original location but with 16k suffix
+                    resampled_filepath = os.path.join(orig_dir, resampled_filename)
+                    
                     resample_tasks.append((original_filepath, resampled_filepath, cut.id))
             
             # Set up parallel processing
@@ -420,23 +440,11 @@ def compute_xlsr_features(args):
         recording_set = RecordingSet.from_recordings(recordings)
         supervision_set = SupervisionSet.from_segments(supervisions)
         
-        # Save temporary manifests - this ensures metadata is consistent
-        tmp_manifest_path = Path(output_dir) / f"tmp_{args.prefix}_{partition}"
-        recording_set.to_file(tmp_manifest_path.with_suffix(".recordings.jsonl.gz"))
-        supervision_set.to_file(tmp_manifest_path.with_suffix(".supervisions.jsonl.gz"))
-        
-        # Reload the manifests to get a clean CutSet
-        tmp_manifests = read_manifests_if_cached(
-            dataset_parts=[f"tmp_{partition}"],
-            output_dir=output_dir,
-            prefix=args.prefix,
-            suffix=args.suffix,
-        )
-        
-        # Create a fresh CutSet
+        # Instead of using temporary files, directly create the CutSet from the updated sets
+        logging.info(f"Creating fresh CutSet from updated metadata")
         cut_set = CutSet.from_manifests(
-            recordings=tmp_manifests[f"tmp_{partition}"]["recordings"],
-            supervisions=tmp_manifests[f"tmp_{partition}"]["supervisions"],
+            recordings=recording_set,
+            supervisions=supervision_set,
         )
         
         # One more check - ensure all cuts are at 16kHz
